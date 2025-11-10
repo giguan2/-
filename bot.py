@@ -54,7 +54,8 @@ def main():
     app.post_init = set_webhook
 
     port = int(os.environ.get("PORT", "10000"))
-    app.run_webhook(listen="0.0.0.0", port=port, url_path=TOKEN)
+    app.run_webhook(listen="0.0.0.0", port=port, url_path=TOKEN,webhook_url=f"{APP_URL}/{TOKEN}".strip())
 
 if __name__ == "__main__":
     main()
+
