@@ -56,6 +56,44 @@ def main():
     port = int(os.environ.get("PORT", "10000"))
     app.run_webhook(listen="0.0.0.0", port=port, url_path=TOKEN,webhook_url=f"{APP_URL}/{TOKEN}".strip())
 
+# --- 기존 코드 (on_callback, set_webhook, main 등) ---
+
+# 여기부터 추가
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import CommandHandler
+import os
+
+CHANNEL_ID = os.getenv("CHANNEL_ID")  # 채널 ID 불러오기
+
+async def publish(update, context):
+    buttons = [
+        [InlineKeyboardButton("📺 라이브 보기", url="https://example.com/live")],
+        [InlineKeyboardButton("📰 뉴스", url="https://example.com/news")],
+        [InlineKeyboardButton("🎯 분석", url="https://example.com/analysis")]
+    ]
+    await context.bot.send_message(
+        chat_id=CHANNEL_ID,
+        text="빠른 메뉴:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+    await update.message.reply_text("채널로 메뉴를 보냈어요 ✅")
+
+
+def main():
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(CommandHandler("publish", publish))  # ← 이 줄이 새로 추가된 부분
+
+    port = int(os.environ.get("PORT", "10000"))
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=TOKEN,
+        webhook_url=f"{APP_URL}/{TOKEN}".strip()
+    )
+
+
 if __name__ == "__main__":
     main()
-
