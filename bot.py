@@ -443,6 +443,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ✅ 분석픽 – 개별 경기 선택 → 채팅창에 분석글 메시지로 보내기
+    # ✅ 분석픽 – 개별 경기 선택 → 채팅창에 분석글 메시지로 보내기
     if data.startswith("match:"):
         _, sport, match_id = data.split(":", 2)
         items = ANALYSIS_DATA.get(sport, [])
@@ -458,8 +459,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         text = f"📌 경기 분석 – {title}\n\n{summary}"
 
-        # 분석 글 아래에 버튼 2개 달기
+        # 분석 글 아래에 버튼 3개 달기 (무료중계 추가)
         buttons = [
+            [InlineKeyboardButton("📺 스포츠 무료 중계", url="https://goat-tv.com")],
             [InlineKeyboardButton("📝 분석글 더 보기", callback_data="analysis_root")],
             [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
         ]
@@ -469,6 +471,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(buttons),
         )
         return
+
 
     # 스포츠 뉴스 요약 루트: 뉴스 리스트
     if data == "news_root":
@@ -524,3 +527,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
