@@ -19,9 +19,6 @@ TOKEN = os.getenv("BOT_TOKEN")
 APP_URL = (os.getenv("APP_URL") or "").strip()
 CHANNEL_ID = (os.getenv("CHANNEL_ID") or "").strip()  # 예: @sportpicck 또는 -100xxxxxxxxxxxx
 
-# 채널/미리보기 공통으로 사용할 이미지 URL
-MENU_IMAGE_URL = "https://example.com/your-menu-image.jpg"  # 원하는 이미지 URL로 변경
-
 # 채널/미리보기 공통으로 사용할 설명 텍스트
 MENU_CAPTION = (
     "📌 스포츠 정보&분석 공유방 메뉴 안내\n\n"
@@ -88,7 +85,7 @@ NEWS_ITEMS = [
 # ───────────────── 키보드/메뉴 구성 ─────────────────
 
 def build_reply_keyboard() -> ReplyKeyboardMarkup:
-    """봇 1:1 테스트용 간단 하단 키보드 (선택 사항)"""
+    """봇 1:1 테스트용 간단 하단 키보드"""
     menu = [
         ["메뉴 미리보기", "도움말"],
     ]
@@ -142,31 +139,19 @@ def build_news_list_menu() -> InlineKeyboardMarkup:
 
 async def send_main_menu(chat_id: int | str, context: ContextTypes.DEFAULT_TYPE, preview: bool = False):
     """
-    채널/DM 공통으로 '메인 메뉴' 전송.
-    MENU_IMAGE_URL 이 있으면 사진+캡션, 없으면 텍스트만 보냄.
+    채널/DM 공통으로 '텍스트 + 메인 메뉴 버튼' 전송.
+    (이미지는 사용하지 않음)
     """
-    if MENU_IMAGE_URL:
-        # 이미지가 있을 때
-        msg = await context.bot.send_photo(
-            chat_id=chat_id,
-            photo=MENU_IMAGE_URL,
-            caption=MENU_CAPTION,
-            reply_markup=build_main_inline_menu(),
-        )
-    else:
-        # 이미지가 없을 때: 텍스트 + 버튼만
-        msg = await context.bot.send_message(
-            chat_id=chat_id,
-            text=MENU_CAPTION,
-            reply_markup=build_main_inline_menu(),
-        )
-
+    msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=MENU_CAPTION,
+        reply_markup=build_main_inline_menu(),
+    )
     return msg
-
 
 # ───────────────── 핸들러들 ─────────────────
 
-# 1) /start – DM에서 채널과 똑같은 레이아웃 미리보기
+# 1) /start – DM에서 채널과 동일한 레이아웃 미리보기
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
@@ -178,7 +163,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=build_reply_keyboard(),
     )
 
-    # 채널과 똑같은 이미지 + 설명 + 메인 메뉴 미리보기
+    # 채널과 똑같은 텍스트 + 메인 메뉴 미리보기
     await send_main_menu(chat_id, context, preview=True)
 
 
@@ -208,7 +193,7 @@ async def publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    # 채널에 채널/미리보기와 동일한 메뉴 전송
+    # 채널에 DM과 동일한 메뉴 전송
     msg = await send_main_menu(CHANNEL_ID, context, preview=False)
 
     # 방금 보낸 메뉴 메시지 상단 고정
@@ -296,4 +281,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
