@@ -227,7 +227,7 @@ def build_main_inline_menu() -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton("실시간 무료 중계", url="https://goat-tv.com")],
         [InlineKeyboardButton("11.14 경기 분석픽", callback_data="analysis_root")],
-        [InlineKeyboardButton("금일 스포츠 정보", callback_data="news_root")],
+        [InlineKeyboardButton("스포츠 뉴스 요약", callback_data="news_root")],
     ]
     return InlineKeyboardMarkup(buttons)
 
@@ -257,7 +257,7 @@ def build_analysis_match_menu(sport: str) -> InlineKeyboardMarkup:
 
 
 def build_news_list_menu() -> InlineKeyboardMarkup:
-    """금일 스포츠 정보 → 뉴스 제목 리스트 메뉴"""
+    """스포츠 뉴스 요약 → 뉴스 제목 리스트 메뉴"""
     buttons = []
     for idx, item in enumerate(NEWS_ITEMS):
         cb = f"news_item:{idx}"
@@ -443,6 +443,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
