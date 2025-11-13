@@ -479,6 +479,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ✅ 뉴스 제목 클릭 → 채팅창에 요약 메시지로 보내기
+    # ✅ 뉴스 제목 클릭 → 채팅창에 요약 메시지로 보내기
     if data.startswith("news_item:"):
         try:
             idx = int(data.split(":", 1)[1])
@@ -492,6 +493,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = f"📰 뉴스 요약 – {title}\n\n{summary}"
 
         buttons = [
+            [InlineKeyboardButton("📺 스포츠무료중계", url="https://goat-tv.com")],
             [InlineKeyboardButton("📰 다른 뉴스 보기", callback_data="news_root")],
             [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
         ]
@@ -501,6 +503,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(buttons),
         )
         return
+
 
 
 # ───────────────── 실행부 ─────────────────
@@ -527,4 +530,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
