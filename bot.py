@@ -1,100 +1,287 @@
 import os
-from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
 
+# ───────────────── 기본 설정 ─────────────────
 TOKEN = os.getenv("BOT_TOKEN")
-APP_URL = os.getenv("APP_URL")
+APP_URL = (os.getenv("APP_URL") or "").strip()
+CHANNEL_ID = (os.getenv("CHANNEL_ID") or "").strip()  # 예: @sportpicck 또는 -100xxxxxxxxxxxx
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# 채널/미리보기 공통으로 사용할 이미지 URL
+MENU_IMAGE_URL = "https://example.com/your-menu-image.jpg"  # 원하는 이미지 URL로 변경
+
+# 채널/미리보기 공통으로 사용할 설명 텍스트
+MENU_CAPTION = (
+    "📌 스포츠 정보&분석 공유방 메뉴 안내\n\n"
+    "1️⃣ 실시간 무료 중계 - GOAT-TV 라이브 중계 바로가기\n"
+    "2️⃣ 오늘 경기 분석픽 - 종목별로 오늘 경기 분석을 확인하세요\n"
+    "3️⃣ 금일 스포츠 정보 - 주요 이슈 & 뉴스 요약 정리\n\n"
+    "아래 버튼을 눌러 원하는 메뉴를 선택하세요 👇"
+)
+
+# ───────────────── 분석/뉴스 데이터 (예시) ─────────────────
+
+ANALYSIS_DATA = {
+    "축구": [
+        {
+            "id": "soccer_1",
+            "title": "EPL - 아스널 vs 토트넘",
+            "summary": "아스널은 홈에서 공격 전개가 매끄럽고, 토트넘은 역습이 위협적인 매치업. "
+                       "중원 장악 여부가 승부를 가를 가능성이 크다."
+        },
+        {
+            "id": "soccer_2",
+            "title": "라리가 - 바르셀로나 vs 레알 마드리드",
+            "summary": "양 팀 모두 측면 공격이 날카롭고, 슈팅 수 싸움이 중요해 보이는 경기."
+        },
+    ],
+    "농구": [
+        {
+            "id": "basket_1",
+            "title": "NBA - 레이커스 vs 셀틱스",
+            "summary": "레이커스는 인사이드 공략, 셀틱스는 외곽이 강점인 만큼 3점슛 성공률이 관건."
+        },
+    ],
+    "야구": [
+        {
+            "id": "base_1",
+            "title": "KBO - LG 트윈스 vs 롯데 자이언츠",
+            "summary": "선발 투수의 컨디션 차이가 큰 경기. 초반 실점 관리가 중요하다."
+        },
+    ],
+    "배구": [
+        {
+            "id": "vball_1",
+            "title": "V-리그 - 대한항공 vs 현대캐피탈",
+            "summary": "서브와 리시브 싸움이 강조되는 매치업. 블로킹 싸움에서도 차이가 날 수 있다."
+        },
+    ],
+}
+
+NEWS_ITEMS = [
+    {
+        "id": "news_1",
+        "title": "손흥민, 리그 15호 골 폭발",
+        "summary": "손흥민이 리그 15호 골을 기록하며 팀의 승리를 이끌었다. "
+                   "최근 5경기 연속 공격포인트로 폼이 절정에 이르렀다는 평가."
+    },
+    {
+        "id": "news_2",
+        "title": "NBA 파이널 1차전 리뷰",
+        "summary": "양 팀 모두 수비 집중력이 높았던 경기. 클러치 타임 3점슛 한 방이 승패를 가르며 "
+                   "파이널다운 긴장감이 이어졌다."
+    },
+]
+
+# ───────────────── 키보드/메뉴 구성 ─────────────────
+
+def build_reply_keyboard() -> ReplyKeyboardMarkup:
+    """봇 1:1 테스트용 간단 하단 키보드 (선택 사항)"""
     menu = [
-        ["라이브 보기", "뉴스"],
-        ["분석 보기", "고객센터"]
+        ["메뉴 미리보기", "도움말"],
     ]
+    return ReplyKeyboardMarkup(menu, resize_keyboard=True)
+
+
+def build_main_inline_menu() -> InlineKeyboardMarkup:
+    """메인 인라인 메뉴 (채널/미리보기 공통)"""
+    buttons = [
+        [InlineKeyboardButton("실시간 무료 중계", url="https://goat-tv.com")],
+        [InlineKeyboardButton("오늘 경기 분석픽", callback_data="analysis_root")],
+        [InlineKeyboardButton("금일 스포츠 정보", callback_data="news_root")],
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_analysis_category_menu() -> InlineKeyboardMarkup:
+    """오늘 경기 분석픽 → 종목 선택 메뉴"""
+    buttons = [
+        [InlineKeyboardButton("축구", callback_data="analysis_cat:축구")],
+        [InlineKeyboardButton("농구", callback_data="analysis_cat:농구")],
+        [InlineKeyboardButton("야구", callback_data="analysis_cat:야구")],
+        [InlineKeyboardButton("배구", callback_data="analysis_cat:배구")],
+        [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_analysis_match_menu(sport: str) -> InlineKeyboardMarkup:
+    """종목 선택 후 → 해당 종목 경기 리스트 메뉴"""
+    items = ANALYSIS_DATA.get(sport, [])
+    buttons = []
+    for item in items:
+        cb = f"match:{sport}:{item['id']}"
+        buttons.append([InlineKeyboardButton(item["title"], callback_data=cb)])
+    buttons.append([InlineKeyboardButton("◀ 종목 선택으로", callback_data="analysis_root")])
+    buttons.append([InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_news_list_menu() -> InlineKeyboardMarkup:
+    """금일 스포츠 정보 → 뉴스 제목 리스트 메뉴"""
+    buttons = []
+    for idx, item in enumerate(NEWS_ITEMS):
+        cb = f"news_item:{idx}"
+        buttons.append([InlineKeyboardButton(item["title"], callback_data=cb)])
+    buttons.append([InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")])
+    return InlineKeyboardMarkup(buttons)
+
+# ───────────────── 공통: 메인 메뉴 보내는 함수 ─────────────────
+
+async def send_main_menu(chat_id: int | str, context: ContextTypes.DEFAULT_TYPE, preview: bool = False):
+    """
+    채널/DM 공통으로 '이미지 + 설명 + 메인 메뉴' 전송.
+    preview=True면 상단 고정 없이 단순 전송만.
+    """
+    msg = await context.bot.send_photo(
+        chat_id=chat_id,
+        photo=MENU_IMAGE_URL,
+        caption=MENU_CAPTION,
+        reply_markup=build_main_inline_menu(),
+    )
+    return msg
+
+# ───────────────── 핸들러들 ─────────────────
+
+# 1) /start – DM에서 채널과 똑같은 레이아웃 미리보기
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
+    # 안내 + 하단 테스트 키보드
     await update.message.reply_text(
-        "원하시는 메뉴를 선택하세요:",
-        reply_markup=ReplyKeyboardMarkup(menu, resize_keyboard=True)
+        "스포츠봇입니다.\n"
+        "아래에는 채널에 올라갈 메뉴와 동일한 레이아웃 미리보기를 보여줄게.\n"
+        "실제 채널 배포는 /publish 명령으로 진행하면 돼.",
+        reply_markup=build_reply_keyboard(),
     )
 
-    buttons = [
-        [InlineKeyboardButton("라이브 보기", url="https://example.com/live")],
-        [InlineKeyboardButton("뉴스", callback_data="news")],
-        [InlineKeyboardButton("분석", callback_data="analysis")]
-    ]
-    await update.message.reply_text("빠른 메뉴:", reply_markup=InlineKeyboardMarkup(buttons))
+    # 채널과 똑같은 이미지 + 설명 + 메인 메뉴 미리보기
+    await send_main_menu(chat_id, context, preview=True)
 
+
+# 2) DM 텍스트 처리 – 간단 테스트용
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if "라이브" in text:
-        await update.message.reply_text("라이브 보기: https://example.com/live")
-    elif "뉴스" in text:
-        await update.message.reply_text("뉴스 보기: https://example.com/news")
-    elif "분석" in text:
-        await update.message.reply_text("분석 보기: https://example.com/analysis")
-    elif "고객센터" in text:
-        await update.message.reply_text("문의: @your_admin")
+    text = (update.message.text or "").strip()
+    if "메뉴 미리보기" in text:
+        await start(update, context)
+    elif "도움말" in text:
+        await update.message.reply_text(
+            "/start : 메뉴 미리보기\n"
+            "/publish : 채널에 메뉴 전송 + 상단 고정"
+        )
     else:
-        await update.message.reply_text("메뉴에서 선택해주세요. (/start 입력으로 다시 보기)")
+        await update.message.reply_text("메뉴 미리보기는 /start 또는 '메뉴 미리보기' 버튼을 눌러주세요.")
 
+
+# 3) /publish – 채널로 메뉴 보내고 상단 고정
+async def publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not CHANNEL_ID:
+        await update.message.reply_text("CHANNEL_ID가 비어 있습니다. Render 환경변수에 CHANNEL_ID를 설정하세요.")
+        return
+
+    # 기존 고정 메시지 해제 (선택)
+    try:
+        await context.bot.unpin_all_chat_messages(CHANNEL_ID)
+    except Exception:
+        pass
+
+    # 채널에 채널/미리보기와 동일한 메뉴 전송
+    msg = await send_main_menu(CHANNEL_ID, context, preview=False)
+
+    # 방금 보낸 메뉴 메시지 상단 고정
+    await context.bot.pin_chat_message(
+        chat_id=CHANNEL_ID,
+        message_id=msg.message_id,
+        disable_notification=True,
+    )
+
+    await update.message.reply_text("채널에 메뉴를 올리고 상단에 고정했습니다 ✅")
+
+
+# 4) 인라인 버튼 콜백 처리 (분석/뉴스 팝업)
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
-    if q.data == "news":
-        await q.edit_message_text("최신 뉴스: https://example.com/news")
-    elif q.data == "analysis":
-        await q.edit_message_text("분석 모음: https://example.com/analysis")
+    data = q.data or ""
+    await q.answer()  # 기본 로딩표시 제거
 
-async def set_webhook(app):
-    await app.bot.set_webhook(url=f"{APP_URL}/{TOKEN}")
+    # 메인 메뉴로 돌아가기
+    if data == "back_main":
+        await q.edit_message_reply_markup(reply_markup=build_main_inline_menu())
+        return
+
+    # 분석픽 루트: 종목 리스트
+    if data == "analysis_root":
+        await q.edit_message_reply_markup(reply_markup=build_analysis_category_menu())
+        return
+
+    # 분석픽 – 종목 선택
+    if data.startswith("analysis_cat:"):
+        sport = data.split(":", 1)[1]
+        await q.edit_message_reply_markup(reply_markup=build_analysis_match_menu(sport))
+        return
+
+    # 분석픽 – 개별 경기 선택 → 팝업으로 분석글
+    if data.startswith("match:"):
+        _, sport, match_id = data.split(":", 2)
+        items = ANALYSIS_DATA.get(sport, [])
+        summary = "해당 경기 분석을 찾을 수 없습니다."
+        for item in items:
+            if item["id"] == match_id:
+                summary = item["summary"]
+                break
+        await q.answer(summary, show_alert=True)
+        return
+
+    # 금일 스포츠 정보 루트: 뉴스 리스트
+    if data == "news_root":
+        await q.edit_message_reply_markup(reply_markup=build_news_list_menu())
+        return
+
+    # 뉴스 제목 클릭 → 팝업으로 요약
+    if data.startswith("news_item:"):
+        try:
+            idx = int(data.split(":", 1)[1])
+            item = NEWS_ITEMS[idx]
+            summary = item["summary"]
+        except Exception:
+            summary = "해당 뉴스 정보를 찾을 수 없습니다."
+        await q.answer(summary, show_alert=True)
+        return
+
+
+# ───────────────── 실행부 ─────────────────
 
 def main():
     app = ApplicationBuilder().token(TOKEN).build()
+
+    # 1:1 테스트용
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+
+    # 채널 메뉴용
+    app.add_handler(CommandHandler("publish", publish))
     app.add_handler(CallbackQueryHandler(on_callback))
-    app.post_init = set_webhook
-
-    port = int(os.environ.get("PORT", "10000"))
-    app.run_webhook(listen="0.0.0.0", port=port, url_path=TOKEN,webhook_url=f"{APP_URL}/{TOKEN}".strip())
-
-# --- 기존 코드 (on_callback, set_webhook, main 등) ---
-
-# 여기부터 추가
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import CommandHandler
-import os
-
-CHANNEL_ID = os.getenv("CHANNEL_ID")  # 채널 ID 불러오기
-
-async def publish(update, context):
-    buttons = [
-        [InlineKeyboardButton("📺 라이브 보기", url="https://example.com/live")],
-        [InlineKeyboardButton("📰 뉴스", url="https://example.com/news")],
-        [InlineKeyboardButton("🎯 분석", url="https://example.com/analysis")]
-    ]
-    await context.bot.send_message(
-        chat_id=CHANNEL_ID,
-        text="빠른 메뉴:",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
-    await update.message.reply_text("채널로 메뉴를 보냈어요 ✅")
-
-
-def main():
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(CommandHandler("publish", publish))  # ← 이 줄이 새로 추가된 부분
 
     port = int(os.environ.get("PORT", "10000"))
     app.run_webhook(
         listen="0.0.0.0",
         port=port,
         url_path=TOKEN,
-        webhook_url=f"{APP_URL}/{TOKEN}".strip()
+        webhook_url=f"{APP_URL}/{TOKEN}",
     )
 
 
 if __name__ == "__main__":
     main()
-
