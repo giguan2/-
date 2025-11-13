@@ -142,16 +142,27 @@ def build_news_list_menu() -> InlineKeyboardMarkup:
 
 async def send_main_menu(chat_id: int | str, context: ContextTypes.DEFAULT_TYPE, preview: bool = False):
     """
-    채널/DM 공통으로 '이미지 + 설명 + 메인 메뉴' 전송.
-    preview=True면 상단 고정 없이 단순 전송만.
+    채널/DM 공통으로 '메인 메뉴' 전송.
+    MENU_IMAGE_URL 이 있으면 사진+캡션, 없으면 텍스트만 보냄.
     """
-    msg = await context.bot.send_photo(
-        chat_id=chat_id,
-        photo=MENU_IMAGE_URL,
-        caption=MENU_CAPTION,
-        reply_markup=build_main_inline_menu(),
-    )
+    if MENU_IMAGE_URL:
+        # 이미지가 있을 때
+        msg = await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=MENU_IMAGE_URL,
+            caption=MENU_CAPTION,
+            reply_markup=build_main_inline_menu(),
+        )
+    else:
+        # 이미지가 없을 때: 텍스트 + 버튼만
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=MENU_CAPTION,
+            reply_markup=build_main_inline_menu(),
+        )
+
     return msg
+
 
 # ───────────────── 핸들러들 ─────────────────
 
@@ -285,3 +296,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
