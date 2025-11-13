@@ -301,8 +301,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 break
 
         text = f"📌 경기 분석 – {title}\n\n{summary}"
-        await q.message.reply_text(text)
+
+        # 분석 글 아래에 버튼 2개 달기
+        buttons = [
+            [InlineKeyboardButton("📝 분석글 더 보기", callback_data="analysis_root")],
+            [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
+        ]
+
+        await q.message.reply_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
         return
+
 
     # 금일 스포츠 정보 루트: 뉴스 리스트
     if data == "news_root":
@@ -321,8 +332,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             summary = "해당 뉴스 정보를 찾을 수 없습니다."
 
         text = f"📰 뉴스 요약 – {title}\n\n{summary}"
-        await q.message.reply_text(text)
+
+        buttons = [
+            [InlineKeyboardButton("📰 다른 뉴스 보기", callback_data="news_root")],
+            [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
+        ]
+
+        await q.message.reply_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
         return
+
 
 
 
@@ -350,6 +371,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
