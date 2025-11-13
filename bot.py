@@ -23,7 +23,7 @@ CHANNEL_ID = (os.getenv("CHANNEL_ID") or "").strip()  # 예: @sportpicck 또는 
 MENU_CAPTION = (
     "📌 스포츠 정보&분석 공유방 메뉴 안내\n\n"
     "1️⃣ 실시간 무료 중계 - GOAT-TV 라이브 중계 바로가기\n"
-    "2️⃣ 오늘 경기 분석픽 - 종목별로 오늘 경기 분석을 확인하세요\n"
+    "2️⃣ 11.14 경기 분석픽 - 종목별로 오늘 경기 분석을 확인하세요\n"
     "3️⃣ 금일 스포츠 정보 - 주요 이슈 & 뉴스 요약 정리\n\n"
     "아래 버튼을 눌러 원하는 메뉴를 선택하세요 👇"
 )
@@ -226,14 +226,14 @@ def build_main_inline_menu() -> InlineKeyboardMarkup:
     """메인 인라인 메뉴 (채널/미리보기 공통)"""
     buttons = [
         [InlineKeyboardButton("실시간 무료 중계", url="https://goat-tv.com")],
-        [InlineKeyboardButton("오늘 경기 분석픽", callback_data="analysis_root")],
+        [InlineKeyboardButton("11.14 경기 분석픽", callback_data="analysis_root")],
         [InlineKeyboardButton("금일 스포츠 정보", callback_data="news_root")],
     ]
     return InlineKeyboardMarkup(buttons)
 
 
 def build_analysis_category_menu() -> InlineKeyboardMarkup:
-    """오늘 경기 분석픽 → 종목 선택 메뉴"""
+    """11.14 경기 분석픽 → 종목 선택 메뉴"""
     buttons = [
         [InlineKeyboardButton("축구", callback_data="analysis_cat:축구")],
         [InlineKeyboardButton("농구", callback_data="analysis_cat:농구")],
@@ -443,6 +443,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
