@@ -228,16 +228,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_reply_markup(reply_markup=build_analysis_match_menu(sport))
         return
 
-    # 분석픽 – 개별 경기 선택 → 팝업으로 분석글
+    # ✅ 분석픽 – 개별 경기 선택 → 채팅창에 분석글 메시지로 보내기
     if data.startswith("match:"):
         _, sport, match_id = data.split(":", 2)
         items = ANALYSIS_DATA.get(sport, [])
+
+        title = "선택한 경기"
         summary = "해당 경기 분석을 찾을 수 없습니다."
+
         for item in items:
             if item["id"] == match_id:
+                title = item["title"]
                 summary = item["summary"]
                 break
-        await q.answer(summary, show_alert=True)
+
+        text = f"📌 경기 분석 – {title}\n\n{summary}"
+        await q.message.reply_text(text)
         return
 
     # 금일 스포츠 정보 루트: 뉴스 리스트
@@ -245,16 +251,21 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_reply_markup(reply_markup=build_news_list_menu())
         return
 
-    # 뉴스 제목 클릭 → 팝업으로 요약
+    # ✅ 뉴스 제목 클릭 → 채팅창에 요약 메시지로 보내기
     if data.startswith("news_item:"):
         try:
             idx = int(data.split(":", 1)[1])
             item = NEWS_ITEMS[idx]
+            title = item["title"]
             summary = item["summary"]
         except Exception:
+            title = "뉴스 정보 없음"
             summary = "해당 뉴스 정보를 찾을 수 없습니다."
-        await q.answer(summary, show_alert=True)
+
+        text = f"📰 뉴스 요약 – {title}\n\n{summary}"
+        await q.message.reply_text(text)
         return
+
 
 
 # ───────────────── 실행부 ─────────────────
@@ -281,3 +292,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
