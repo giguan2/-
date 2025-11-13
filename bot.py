@@ -292,13 +292,22 @@ def build_reply_keyboard() -> ReplyKeyboardMarkup:
 
 
 def build_main_inline_menu() -> InlineKeyboardMarkup:
-    """메인 인라인 메뉴 (채널/미리보기 공통)"""
+BOT_USERNAME = "castlive_bot"  # @빼고 적어두기
+
+def build_main_inline_menu() -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton("실시간 무료 중계", url="https://goat-tv.com")],
-        [InlineKeyboardButton("11.14 경기 분석픽", callback_data="analysis_root")],
-        [InlineKeyboardButton("스포츠 뉴스 요약", callback_data="news_root")],
+        [InlineKeyboardButton(
+            "11.14 경기 분석픽",
+            url=f"https://t.me/{BOT_USERNAME}?start=analysis"
+        )],
+        [InlineKeyboardButton(
+            "스포츠 뉴스 요약",
+            url=f"https://t.me/{BOT_USERNAME}?start=news"
+        )],
     ]
     return InlineKeyboardMarkup(buttons)
+
 
 
 def build_analysis_category_menu() -> InlineKeyboardMarkup:
@@ -352,18 +361,35 @@ async def send_main_menu(chat_id: int | str, context: ContextTypes.DEFAULT_TYPE,
 
 # 1) /start – DM에서 채널과 동일한 레이아웃 미리보기
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    mode = context.args[0] if context.args else None  # /start analysis 이런 식으로 올 때
 
-    # 안내 + 하단 테스트 키보드
+    # 채널에서 버튼 눌러서 온 경우
+    if mode == "analysis":
+        # 바로 분석픽 메뉴 열어주기
+        await update.message.reply_text(
+            "11.14 경기 분석픽 메뉴입니다. 종목을 선택하세요 👇",
+            reply_markup=build_analysis_category_menu(),
+        )
+        return
+
+    if mode == "news":
+        await update.message.reply_text(
+            "스포츠 뉴스 요약 리스트입니다 👇",
+            reply_markup=build_news_list_menu(),
+        )
+        return
+
+    # 그 외(테스트용 /start) – 지금 쓰던 미리보기 그대로 유지
     await update.message.reply_text(
         "스포츠봇입니다.\n"
         "아래에는 채널에 올라갈 메뉴와 동일한 레이아웃 미리보기를 보여줄게.\n"
         "실제 채널 배포는 /publish 명령으로 진행하면 돼.",
         reply_markup=build_reply_keyboard(),
     )
-
-    # 채널과 똑같은 텍스트 + 메인 메뉴 미리보기
     await send_main_menu(chat_id, context, preview=True)
+
 
 
 # 2) DM 텍스트 처리 – 간단 테스트용
@@ -512,6 +538,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
