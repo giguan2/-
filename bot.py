@@ -47,7 +47,7 @@ ANALYSIS_DATA = {
     "농구": [
         {
             "id": "basket_1",
-            "title": "NBA - 클리블랜드 vs 토론토",
+            "title": "NBA - 11.14 클리블랜드 vs 토론토",
             "summary": """📌 클리블랜드 vs 토론토 분석 요약
 
 ✔️ 팀 분위기 & 최근 흐름
@@ -79,7 +79,7 @@ ANALYSIS_DATA = {
         },
         {
             "id": "basket_2",
-            "title": "NBA - 피닉스 vs 인디애나",
+            "title": "NBA - 11.14 피닉스 vs 인디애나",
             "summary": """📌 피닉스 vs 인디애나 분석 요약
 
 ✔️ 팀 분위기 & 최근 흐름
@@ -350,6 +350,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
