@@ -27,13 +27,14 @@ MENU_CAPTION = (
     "📌 스포츠 정보&분석 공유방 메뉴 안내\n\n"
     "1️⃣ 실시간 무료 중계 - GOAT-TV 라이브 중계 바로가기\n"
     "2️⃣ 11.14 경기 분석픽 - 종목별로 11월 14일 경기 분석을 확인하세요\n"
+    "2️⃣ 11.15 경기 분석픽 - 종목별로 11월 15일 경기 분석을 확인하세요\n"    
     "3️⃣ 스포츠 뉴스 요약 - 주요 이슈 & 뉴스 요약 정리\n\n"
     "아래 버튼을 눌러 원하는 메뉴를 선택하세요 👇"
 )
 
 # ───────────────── 분석/뉴스 데이터 (예시) ─────────────────
 
-ANALYSIS_DATA = {
+ANALYSIS_TODAY = {
     "축구": [
         {
             "id": "soccer_1",
@@ -231,7 +232,23 @@ IBK기업은행: 김하경 인대 파열, 이소영 시즌 아웃
         },
     ],
 }
+ANALYSIS_TOMORROW = {
+    "축구": [
+        # 내일 경기들
+    ],
+    "농구": [
+        # 내일 경기들
+    ],
+    "야구": [
+    ],
+    "배구": [
+    ],
+}
 
+ANALYSIS_DATA_MAP = {
+    "today": ANALYSIS_TODAY,
+    "tomorrow": ANALYSIS_TOMORROW,
+}
 NEWS_DATA = {
     "야구": [
         {
@@ -810,9 +827,15 @@ def build_main_inline_menu() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(
                 "11.14 경기 분석픽",
-                url=f"https://t.me/{BOT_USERNAME}?start=analysis",
+                url=f"https://t.me/{BOT_USERNAME}?start=today",
             )
         ],
+        [
+            InlineKeyboardButton(
+                "11.15 경기 분석픽",
+                url=f"https://t.me/{BOT_USERNAME}?start=tomorrow",
+            )
+        ],        
         [
             InlineKeyboardButton(
                 "스포츠 뉴스 요약",
@@ -823,26 +846,28 @@ def build_main_inline_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
-def build_analysis_category_menu() -> InlineKeyboardMarkup:
-    """11.14 경기 분석픽 → 종목 선택 메뉴"""
+def build_analysis_category_menu(key: str) -> InlineKeyboardMarkup:
+    # key = "today" or "tomorrow"
     buttons = [
-        [InlineKeyboardButton("⚽️축구⚽️", callback_data="analysis_cat:축구")],
-        [InlineKeyboardButton("🏀농구🏀", callback_data="analysis_cat:농구")],
-        [InlineKeyboardButton("⚾️야구⚾️", callback_data="analysis_cat:야구")],
-        [InlineKeyboardButton("🏐배구🏐", callback_data="analysis_cat:배구")],
+        [InlineKeyboardButton("⚽️축구⚽️", callback_data=f"analysis_cat:{key}:축구")],
+        [InlineKeyboardButton("🏀농구🏀", callback_data=f"analysis_cat:{key}:농구")],
+        [InlineKeyboardButton("⚾️야구⚾️", callback_data=f"analysis_cat:{key}:야구")],
+        [InlineKeyboardButton("🏐배구🏐", callback_data=f"analysis_cat:{key}:배구")],
         [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
     ]
     return InlineKeyboardMarkup(buttons)
 
 
-def build_analysis_match_menu(sport: str) -> InlineKeyboardMarkup:
+
+def build_analysis_match_menu(key: str, sport: str) -> InlineKeyboardMarkup:
     """종목 선택 후 → 해당 종목 경기 리스트 메뉴"""
-    items = ANALYSIS_DATA.get(sport, [])
+    items = ANALYSIS_DATA_MAP.get(key, {}).get(sport, [])
     buttons = []
     for item in items:
-        cb = f"match:{sport}:{item['id']}"
+        cb = f"match:{key}:{sport}:{item['id']}"
         buttons.append([InlineKeyboardButton(item["title"], callback_data=cb)])
-    buttons.append([InlineKeyboardButton("◀ 종목 선택으로", callback_data="analysis_root")])
+
+    buttons.append([InlineKeyboardButton("◀ 종목 선택으로", callback_data=f"analysis_root:{key}")])
     buttons.append([InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")])
     return InlineKeyboardMarkup(buttons)
 
@@ -894,18 +919,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     mode = args[0] if args else None
 
-    # 채널에서 버튼 눌러서 온 경우: 바로 해당 메뉴 열기
-    if mode == "analysis":
+    # 오늘 분석 버튼
+    if mode == "today":
         await update.message.reply_text(
-            "11.14 경기 분석픽 메뉴입니다. 종목을 선택하세요 👇",
-            reply_markup=build_analysis_category_menu(),
+            "11.15 경기 분석픽 메뉴입니다. 종목을 선택하세요 👇",
+            reply_markup=build_analysis_category_menu("today"),
+        )
+        return
+
+    # 내일 분석 버튼
+    if mode == "tomorrow":
+        await update.message.reply_text(
+            "11.16 경기 분석픽 메뉴입니다. 종목을 선택하세요 👇",
+            reply_markup=build_analysis_category_menu("tomorrow"),
         )
         return
 
     if mode == "news":
         await update.message.reply_text(
             "스포츠 뉴스 요약입니다. 종목을 선택하세요 👇",
-            reply_markup=build_news_category_menu(),  # ← 리스트 말고 '종목 선택' 메뉴
+            reply_markup=build_news_category_menu(),
         )
         return
 
@@ -972,21 +1005,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # 분석픽 루트: 종목 리스트
-    if data == "analysis_root":
-        await q.edit_message_reply_markup(reply_markup=build_analysis_category_menu())
+    if data.startswith("analysis_root:"):
+        _, key = data.split(":", 1)          # today / tomorrow
+        await q.edit_message_reply_markup(reply_markup=build_analysis_category_menu(key))
         return
 
     # 분석픽 – 종목 선택
     if data.startswith("analysis_cat:"):
-        sport = data.split(":", 1)[1]
-        await q.edit_message_reply_markup(reply_markup=build_analysis_match_menu(sport))
+        _, key, sport = data.split(":", 2)
+        await q.edit_message_reply_markup(reply_markup=build_analysis_match_menu(key, sport))
         return
 
     # ✅ 분석픽 – 개별 경기 선택 → 채팅창에 분석글 메시지로 보내기
     # ✅ 분석픽 – 개별 경기 선택 → 채팅창에 분석글 메시지로 보내기
     if data.startswith("match:"):
-        _, sport, match_id = data.split(":", 2)
-        items = ANALYSIS_DATA.get(sport, [])
+        _, key, sport, match_id = data.split(":", 3)
+        items = ANALYSIS_DATA_MAP.get(key, {}).get(sport, [])
 
         title = "선택한 경기"
         summary = "해당 경기 분석을 찾을 수 없습니다."
@@ -999,17 +1033,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         text = f"📌 경기 분석 – {title}\n\n{summary}"
 
-        # 분석 글 아래에 버튼 3개 달기 (무료중계 추가)
         buttons = [
             [InlineKeyboardButton("📺 스포츠 무료 중계", url="https://goat-tv.com")],
-            [InlineKeyboardButton("📝 분석글 더 보기", callback_data="analysis_root")],
+            [InlineKeyboardButton("📝 분석글 더 보기", callback_data=f"analysis_root:{key}")],
             [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
         ]
 
-        await q.message.reply_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
+        await q.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
         return
 
 
@@ -1083,6 +1113,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
