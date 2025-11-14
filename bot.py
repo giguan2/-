@@ -826,10 +826,10 @@ def build_main_inline_menu() -> InlineKeyboardMarkup:
 def build_analysis_category_menu() -> InlineKeyboardMarkup:
     """11.14 경기 분석픽 → 종목 선택 메뉴"""
     buttons = [
-        [InlineKeyboardButton("축구", callback_data="analysis_cat:축구")],
-        [InlineKeyboardButton("농구", callback_data="analysis_cat:농구")],
-        [InlineKeyboardButton("야구", callback_data="analysis_cat:야구")],
-        [InlineKeyboardButton("배구", callback_data="analysis_cat:배구")],
+        [InlineKeyboardButton("⚽️축구⚽️", callback_data="analysis_cat:축구")],
+        [InlineKeyboardButton("🏀농구🏀", callback_data="analysis_cat:농구")],
+        [InlineKeyboardButton("⚾️야구⚾️", callback_data="analysis_cat:야구")],
+        [InlineKeyboardButton("🏐배구🏐", callback_data="analysis_cat:배구")],
         [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
     ]
     return InlineKeyboardMarkup(buttons)
@@ -850,10 +850,10 @@ def build_analysis_match_menu(sport: str) -> InlineKeyboardMarkup:
 def build_news_category_menu() -> InlineKeyboardMarkup:
     """스포츠 뉴스 요약 → 종목 선택 메뉴"""
     buttons = [
-        [InlineKeyboardButton("축구 뉴스", callback_data="news_cat:축구")],
-        [InlineKeyboardButton("농구 뉴스", callback_data="news_cat:농구")],
-        [InlineKeyboardButton("야구 뉴스", callback_data="news_cat:야구")],
-        [InlineKeyboardButton("배구 뉴스", callback_data="news_cat:배구")],
+        [InlineKeyboardButton("⚽️축구 뉴스⚽️", callback_data="news_cat:축구")],
+        [InlineKeyboardButton("🏀농구 뉴스🏀", callback_data="news_cat:농구")],
+        [InlineKeyboardButton("⚾️야구 뉴스⚾️", callback_data="news_cat:야구")],
+        [InlineKeyboardButton("🏐배구 뉴스🏐", callback_data="news_cat:배구")],
         [InlineKeyboardButton("기타종목 뉴스", callback_data="news_cat:기타종")],
         [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
     ]
@@ -1083,6 +1083,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
