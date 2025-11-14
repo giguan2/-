@@ -336,6 +336,15 @@ MVP 300만원
 관람은 KBL 통합 홈페이지 D리그 직관 신청자 무료 입장이며, 중계는 KBL 유튜브·네이버 치지직 생중계로 진행된다."""
 },
 ]
+# 종목별 뉴스 데이터로 재구성
+NEWS_DATA = {
+    "야구": [NEWS_ITEMS[0]],   # 벤 로트버트
+    "축구": [NEWS_ITEMS[1]],   # 니코 파스
+    "배구": [NEWS_ITEMS[2]],   # 한국도로공사 이지윤
+    "농구": [NEWS_ITEMS[5]],   # KBL D리그
+    "기타종": [NEWS_ITEMS[3], NEWS_ITEMS[4]],  # 배드민턴, 격투기
+}
+
 
 # ───────────────── 키보드/메뉴 구성 ─────────────────
 
@@ -449,12 +458,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if mode == "news":
-        await update.message.reply_text(
-            "스포츠 뉴스 요약 리스트입니다 👇",
-            reply_markup=build_news_list_menu(),
-        )
-        return
+if mode == "news":
+    await update.message.reply_text(
+        "스포츠 뉴스 요약 메뉴입니다. 종목을 선택하세요 👇",
+        reply_markup=build_news_category_menu(),
+    )
+    return
+
 
     # 그 외: DM에서 전체 레이아웃 미리보기
     await update.message.reply_text(
@@ -629,6 +639,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
