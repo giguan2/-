@@ -394,14 +394,31 @@ def build_analysis_match_menu(sport: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
-def build_news_list_menu() -> InlineKeyboardMarkup:
-    """스포츠 뉴스 요약 → 뉴스 제목 리스트 메뉴"""
+def build_news_category_menu() -> InlineKeyboardMarkup:
+    """스포츠 뉴스 요약 → 종목 선택 메뉴"""
+    buttons = [
+        [InlineKeyboardButton("축구 뉴스", callback_data="news_cat:축구")],
+        [InlineKeyboardButton("농구 뉴스", callback_data="news_cat:농구")],
+        [InlineKeyboardButton("야구 뉴스", callback_data="news_cat:야구")],
+        [InlineKeyboardButton("배구 뉴스", callback_data="news_cat:배구")],
+        [InlineKeyboardButton("기타종목 뉴스", callback_data="news_cat:기타종")],
+        [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_news_list_menu(sport: str) -> InlineKeyboardMarkup:
+    """종목 선택 후 → 해당 종목 뉴스 제목 리스트 메뉴"""
+    items = NEWS_DATA.get(sport, [])
     buttons = []
-    for idx, item in enumerate(NEWS_ITEMS):
-        cb = f"news_item:{idx}"
+    for item in items:
+        cb = f"news_item:{sport}:{item['id']}"
         buttons.append([InlineKeyboardButton(item["title"], callback_data=cb)])
+
+    buttons.append([InlineKeyboardButton("◀ 종목 선택으로", callback_data="news_root")])
     buttons.append([InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")])
     return InlineKeyboardMarkup(buttons)
+
 
 # ───────────────── 공통: 메인 메뉴 보내는 함수 ─────────────────
 
@@ -543,18 +560,30 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
     # 스포츠 뉴스 요약 루트: 뉴스 리스트
+    # 금일 스포츠 정보 루트: 뉴스 종목 선택
     if data == "news_root":
-        await q.edit_message_reply_markup(reply_markup=build_news_list_menu())
+        await q.edit_message_reply_markup(reply_markup=build_news_category_menu())
+        return
+
+    # 뉴스 – 종목 선택
+    if data.startswith("news_cat:"):
+        sport = data.split(":", 1)[1]
+        await q.edit_message_reply_markup(reply_markup=build_news_list_menu(sport))
         return
 
     # ✅ 뉴스 제목 클릭 → 채팅창에 요약 메시지로 보내기
-    # ✅ 뉴스 제목 클릭 → 채팅창에 요약 메시지로 보내기
     if data.startswith("news_item:"):
         try:
-            idx = int(data.split(":", 1)[1])
-            item = NEWS_ITEMS[idx]
-            title = item["title"]
-            summary = item["summary"]
+            _, sport, news_id = data.split(":", 2)
+            items = NEWS_DATA.get(sport, [])
+            title = "뉴스 정보 없음"
+            summary = "해당 뉴스 정보를 찾을 수 없습니다."
+
+            for item in items:
+                if item["id"] == news_id:
+                    title = item["title"]
+                    summary = item["summary"]
+                    break
         except Exception:
             title = "뉴스 정보 없음"
             summary = "해당 뉴스 정보를 찾을 수 없습니다."
@@ -572,6 +601,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(buttons),
         )
         return
+
 
 
 
@@ -599,6 +629,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
