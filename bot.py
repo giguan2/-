@@ -458,13 +458,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-if mode == "news":
-    await update.message.reply_text(
-        "스포츠 뉴스 요약 메뉴입니다. 종목을 선택하세요 👇",
-        reply_markup=build_news_category_menu(),
-    )
-    return
-
+    if mode == "news":
+        await update.message.reply_text(
+            "스포츠 뉴스 요약입니다. 종목을 선택하세요 👇",
+            reply_markup=build_news_category_menu(),  # ← 리스트 말고 '종목 선택' 메뉴
+        )
+        return
 
     # 그 외: DM에서 전체 레이아웃 미리보기
     await update.message.reply_text(
@@ -475,6 +474,7 @@ if mode == "news":
     )
 
     await send_main_menu(chat_id, context, preview=True)
+
 
 
 # 2) DM 텍스트 처리 – 간단 테스트용
@@ -639,6 +639,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
