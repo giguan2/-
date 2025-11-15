@@ -7,6 +7,9 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+
+from datetime import datetime, timedelta
+
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -24,15 +27,39 @@ CHANNEL_ID = (os.getenv("CHANNEL_ID") or "").strip()  # 예: @채널아이디 �
 # 🔴 여기만 네 봇 유저네임으로 수정하면 됨 (@ 빼고)
 BOT_USERNAME = "castlive_bot"  # 예: @castlive_bot 이라면 "castlive_bot"
 
-# 채널/미리보기 공통으로 사용할 설명 텍스트
-MENU_CAPTION = (
-    "📌 스포츠 정보&분석 공유방 메뉴 안내\n\n"
-    "1️⃣ 실시간 무료 중계 - GOAT-TV 라이브 중계 바로가기\n"
-    "2️⃣ 11.14 경기 분석픽 - 종목별로 11월 14일 경기 분석을 확인하세요\n"
-    "2️⃣ 11.15 경기 분석픽 - 종목별로 11월 15일 경기 분석을 확인하세요\n"    
-    "3️⃣ 스포츠 뉴스 요약 - 주요 이슈 & 뉴스 요약 정리\n\n"
-    "아래 버튼을 눌러 원하는 메뉴를 선택하세요 👇"
-)
+# ───────────────── 날짜 헬퍼 ─────────────────
+
+def get_kst_now() -> datetime:
+    """한국 시간 기준 현재 시각 (UTC+9)"""
+    return datetime.utcnow() + timedelta(hours=9)
+
+
+def get_date_labels():
+    """
+    오늘 / 내일 날짜를 'M.DD' 형식으로 돌려줌
+    예: ( '11.14', '11.15' )
+    """
+    now_kst = get_kst_now().date()
+    today = now_kst
+    tomorrow = now_kst + timedelta(days=1)
+
+    today_str = f"{today.month}.{today.day:02d}"
+    tomorrow_str = f"{tomorrow.month}.{tomorrow.day:02d}"
+    return today_str, tomorrow_str
+
+
+def get_menu_caption() -> str:
+    """메인 메뉴 설명 텍스트 (오늘/내일 날짜 자동 반영)"""
+    today_str, tomorrow_str = get_date_labels()
+    return (
+        "📌 스포츠 정보&분석 공유방 메뉴 안내\n\n"
+        "1️⃣ 실시간 무료 중계 - GOAT-TV 라이브 중계 바로가기\n"
+        f"2️⃣ {today_str} 경기 분석픽 - 종목별로 {today_str} 경기 분석을 확인하세요\n"
+        f"3️⃣ {tomorrow_str} 경기 분석픽 - 종목별로 {tomorrow_str} 경기 분석을 확인하세요\n"
+        "4️⃣ 스포츠 뉴스 요약 - 주요 이슈 & 뉴스 요약 정리\n\n"
+        "아래 버튼을 눌러 원하는 메뉴를 선택하세요 👇"
+    )
+
 
 # ───────────────── 분석/뉴스 데이터 (예시) ─────────────────
 
@@ -1500,20 +1527,22 @@ def build_main_inline_menu() -> InlineKeyboardMarkup:
     메인 인라인 메뉴 (채널/미리보기 공통)
     채널에서는 이 버튼을 눌러 각자 봇 DM으로 이동하게 함.
     """
+    today_str, tomorrow_str = get_date_labels()
+
     buttons = [
         [InlineKeyboardButton("실시간 무료 중계", url="https://goat-tv.com")],
         [
             InlineKeyboardButton(
-                "11.15 경기 분석픽",
+                f"{today_str} 경기 분석픽",
                 url=f"https://t.me/{BOT_USERNAME}?start=today",
             )
         ],
         [
             InlineKeyboardButton(
-                "11.16 경기 분석픽",
+                f"{tomorrow_str} 경기 분석픽",
                 url=f"https://t.me/{BOT_USERNAME}?start=tomorrow",
             )
-        ],        
+        ],
         [
             InlineKeyboardButton(
                 "스포츠 뉴스 요약",
@@ -1584,7 +1613,7 @@ async def send_main_menu(chat_id: int | str, context: ContextTypes.DEFAULT_TYPE,
     """
     msg = await context.bot.send_message(
         chat_id=chat_id,
-        text=MENU_CAPTION,
+        text=get_menu_caption(),
         reply_markup=build_main_inline_menu(),
     )
     return msg
@@ -1597,10 +1626,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     mode = args[0] if args else None
 
+    today_str, tomorrow_str = get_date_labels()
+
     # 오늘 분석 버튼
     if mode == "today":
         await update.message.reply_text(
-            "11.15 경기 분석픽 메뉴입니다. 종목을 선택하세요 👇",
+            f"{today_str} 경기 분석픽 메뉴입니다. 종목을 선택하세요 👇",
             reply_markup=build_analysis_category_menu("today"),
         )
         return
@@ -1608,7 +1639,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 내일 분석 버튼
     if mode == "tomorrow":
         await update.message.reply_text(
-            "11.16 경기 분석픽 메뉴입니다. 종목을 선택하세요 👇",
+            f"{tomorrow_str} 경기 분석픽 메뉴입니다. 종목을 선택하세요 👇",
             reply_markup=build_analysis_category_menu("tomorrow"),
         )
         return
@@ -1817,6 +1848,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
