@@ -1504,13 +1504,13 @@ def build_main_inline_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("실시간 무료 중계", url="https://goat-tv.com")],
         [
             InlineKeyboardButton(
-                "11.14 경기 분석픽",
+                "11.15 경기 분석픽",
                 url=f"https://t.me/{BOT_USERNAME}?start=today",
             )
         ],
         [
             InlineKeyboardButton(
-                "11.15 경기 분석픽",
+                "11.16 경기 분석픽",
                 url=f"https://t.me/{BOT_USERNAME}?start=tomorrow",
             )
         ],        
@@ -1817,6 +1817,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
