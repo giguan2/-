@@ -1,4 +1,6 @@
 import os
+from copy import deepcopy
+
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
@@ -1645,6 +1647,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # 3) /publish – 채널로 메뉴 보내고 상단 고정
+# 3) /publish – 채널로 메뉴 보내고 상단 고정
 async def publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not CHANNEL_ID:
         await update.message.reply_text("CHANNEL_ID가 비어 있습니다. Render 환경변수에 CHANNEL_ID를 설정하세요.")
@@ -1667,6 +1670,27 @@ async def publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await update.message.reply_text("채널에 메뉴를 올리고 상단에 고정했습니다 ✅")
+
+
+# 🔹 4) /rollover – 내일 분석 → 오늘 분석으로 복사
+async def rollover(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global ANALYSIS_TODAY, ANALYSIS_TOMORROW, ANALYSIS_DATA_MAP
+
+    # 1) 내일(TOMORROW) 데이터를 통째로 복사해서 오늘(TODAY)에 덮어쓰기
+    ANALYSIS_TODAY = deepcopy(ANALYSIS_TOMORROW)
+
+    # 2) 내일(TOMORROW)는 빈 틀로 초기화 (스포츠 키는 유지)
+    ANALYSIS_TOMORROW = {sport: [] for sport in ANALYSIS_TODAY.keys()}
+
+    # 3) 매핑도 다시 연결
+    ANALYSIS_DATA_MAP["today"] = ANALYSIS_TODAY
+    ANALYSIS_DATA_MAP["tomorrow"] = ANALYSIS_TOMORROW
+
+    await update.message.reply_text(
+        "✅ 롤오버 완료!\n"
+        "이제 '오늘 경기 분석픽' 메뉴에는 기존 '내일 경기 분석픽' 내용이 들어가 있고,\n"
+        "'내일 경기 분석픽'은 새로 작성할 수 있도록 비워뒀어."
+    )
 
 
 # 4) 인라인 버튼 콜백 처리 (분석/뉴스 팝업)
@@ -1776,6 +1800,10 @@ def main():
 
     # 채널 메뉴용
     app.add_handler(CommandHandler("publish", publish))
+    
+    # 🔹 오늘 ← 내일 복사용 롤오버 명령
+    app.add_handler(CommandHandler("rollover", rollover))
+    
     app.add_handler(CallbackQueryHandler(on_callback))
 
     port = int(os.environ.get("PORT", "10000"))
@@ -1789,6 +1817,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
