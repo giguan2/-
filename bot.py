@@ -1,4 +1,5 @@
 import os
+import json
 from copy import deepcopy
 
 from telegram import (
@@ -18,6 +19,9 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
 # ───────────────── 기본 설정 ─────────────────
 TOKEN = os.getenv("BOT_TOKEN")
@@ -954,6 +958,163 @@ ANALYSIS_DATA_MAP = {
     "today": ANALYSIS_TODAY,
     "tomorrow": ANALYSIS_TOMORROW,
 }
+
+# ───────────────── 구글 시트 연동 설정 ─────────────────
+
+# GOOGLE_SERVICE_KEY  : 서비스계정 JSON 전체 (Render 환경변수)
+# SPREADSHEET_ID      : 구글시트 ID (환경변수)
+# SHEET_TODAY_NAME    : 오늘 탭 이름 (기본값 "today")
+# SHEET_TOMORROW_NAME : 내일 탭 이름 (기본값 "tomorrow")
+
+_gs_client = None  # gspread 클라이언트 캐시용
+
+
+def get_gs_client():
+    """환경변수에서 서비스계정 JSON 읽어서 gspread 클라이언트 생성"""
+    global _gs_client
+    if _gs_client is not None:
+        return _gs_client
+
+    key_raw = os.getenv("GOOGLE_SERVICE_KEY")
+    if not key_raw:
+        print("[GSHEET] GOOGLE_SERVICE_KEY 환경변수가 없습니다. 시트 연동 건너뜀.")
+        return None
+
+    try:
+        key_data = json.loads(key_raw)
+    except Exception as e:
+        print(f"[GSHEET] GOOGLE_SERVICE_KEY JSON 파싱 오류: {e}")
+        return None
+
+    scope = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(key_data, scope)
+    _gs_client = gspread.authorize(creds)
+    print("[GSHEET] gspread 인증 완료")
+    return _gs_client
+
+
+def _load_analysis_sheet(sh, sheet_name: str) -> dict:
+    """
+    구글시트에서 한 탭(today / tomorrow)을 읽어서
+    { sport: [ {id,title,summary}, ... ] } 구조로 변환
+
+    시트 컬럼 구조 (1행 헤더 기준):
+    A열: sport   (예: 축구/농구/야구/배구)
+    B열: id      (bot에서 쓸 고유 id, 비워두면 자동 생성)
+    C열: title   (버튼에 보이는 제목)
+    D열: summary (분석 본문)
+    """
+    try:
+        ws = sh.worksheet(sheet_name)
+    except Exception as e:
+        print(f"[GSHEET] 시트 '{sheet_name}' 열기 실패: {e}")
+        return {}
+
+    rows = ws.get_all_values()
+    if not rows:
+        return {}
+
+    # 헤더 파싱 (첫 행)
+    header = rows[0]
+    # 기본 인덱스
+    idx_sport = 0
+    idx_id = 1
+    idx_title = 2
+    idx_summary = 3
+
+    def safe_index(name, default):
+        try:
+            return header.index(name)
+        except ValueError:
+            return default
+
+    # 헤더에 'sport', 'id', 'title', 'summary' 글자가 있으면 그 위치 사용
+    idx_sport = safe_index("sport", idx_sport)
+    idx_id = safe_index("id", idx_id)
+    idx_title = safe_index("title", idx_title)
+    idx_summary = safe_index("summary", idx_summary)
+
+    data: dict[str, list[dict]] = {}
+
+    for row in rows[1:]:  # 데이터 행
+        if len(row) <= idx_title:
+            continue
+
+        sport = (row[idx_sport] if len(row) > idx_sport else "").strip()
+        if not sport:
+            continue
+
+        item_id = (row[idx_id] if len(row) > idx_id else "").strip()
+        title = (row[idx_title] if len(row) > idx_title else "").strip()
+        summary = (row[idx_summary] if len(row) > idx_summary else "").strip()
+
+        if not title:
+            continue
+
+        # id 없으면 자동 생성
+        if not item_id:
+            cur_len = len(data.get(sport, []))
+            item_id = f"{sport}_{cur_len + 1}"
+
+        entry = {
+            "id": item_id,
+            "title": title,
+            "summary": summary,
+        }
+        data.setdefault(sport, []).append(entry)
+
+    return data
+
+
+def reload_analysis_from_sheet():
+    """
+    구글시트에서 today / tomorrow 탭을 읽어서
+    ANALYSIS_TODAY / ANALYSIS_TOMORROW / ANALYSIS_DATA_MAP 갱신
+    """
+    global ANALYSIS_TODAY, ANALYSIS_TOMORROW, ANALYSIS_DATA_MAP
+
+    client = get_gs_client()
+    spreadsheet_id = os.getenv("SPREADSHEET_ID")
+
+    if not client or not spreadsheet_id:
+        print("[GSHEET] 시트 클라이언트 또는 SPREADSHEET_ID 없음 → 기존 하드코딩 데이터 사용")
+        return
+
+    try:
+        sh = client.open_by_key(spreadsheet_id)
+    except Exception as e:
+        print(f"[GSHEET] 스프레드시트 열기 실패: {e}")
+        return
+
+    sheet_today_name = os.getenv("SHEET_TODAY_NAME", "today")
+    sheet_tomorrow_name = os.getenv("SHEET_TOMORROW_NAME", "tomorrow")
+
+    print(f"[GSHEET] '{sheet_today_name}' / '{sheet_tomorrow_name}' 탭에서 분석 데이터 로딩 시도")
+
+    try:
+        today_data = _load_analysis_sheet(sh, sheet_today_name)
+        tomorrow_data = _load_analysis_sheet(sh, sheet_tomorrow_name)
+    except Exception as e:
+        print(f"[GSHEET] 시트 데이터 로딩 중 오류: {e}")
+        return
+
+    # 비어 있으면 기존 데이터 유지
+    if today_data:
+        ANALYSIS_TODAY = today_data
+    if tomorrow_data:
+        ANALYSIS_TOMORROW = tomorrow_data
+
+    ANALYSIS_DATA_MAP = {
+        "today": ANALYSIS_TODAY,
+        "tomorrow": ANALYSIS_TOMORROW,
+    }
+
+    print("[GSHEET] ANALYSIS_TODAY / ANALYSIS_TOMORROW 갱신 완료")
+    
 NEWS_DATA = {
     "야구": [
         {
@@ -1702,6 +1863,13 @@ async def publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("채널에 메뉴를 올리고 상단에 고정했습니다 ✅")
 
+# 5) /syncsheet – 구글시트에서 분석 데이터 다시 로딩
+async def syncsheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        reload_analysis_from_sheet()
+        await update.message.reply_text("구글시트에서 분석 데이터를 다시 불러왔습니다 ✅")
+    except Exception as e:
+        await update.message.reply_text(f"구글시트 로딩 중 오류가 발생했습니다: {e}")
 
 # 🔹 4) /rollover – 내일 분석 → 오늘 분석으로 복사
 async def rollover(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1823,6 +1991,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ───────────────── 실행부 ─────────────────
 
 def main():
+    # 서버 시작할 때 한 번 시트에서 데이터 읽어오기
+    reload_analysis_from_sheet()
+    
     app = ApplicationBuilder().token(TOKEN).build()
 
     # 1:1 테스트용
@@ -1831,6 +2002,9 @@ def main():
 
     # 채널 메뉴용
     app.add_handler(CommandHandler("publish", publish))
+
+    # 구글시트 수동 새로고침
+    app.add_handler(CommandHandler("syncsheet", syncsheet))    
     
     # 🔹 오늘 ← 내일 복사용 롤오버 명령
     app.add_handler(CommandHandler("rollover", rollover))
@@ -1848,6 +2022,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
