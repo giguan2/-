@@ -1,6 +1,5 @@
 import os
 import json
-from copy import deepcopy
 
 from telegram import (
     Update,
@@ -2050,6 +2049,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
