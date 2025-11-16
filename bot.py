@@ -1873,22 +1873,50 @@ async def syncsheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # 🔹 4) /rollover – 내일 분석 → 오늘 분석으로 복사
 async def rollover(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global ANALYSIS_TODAY, ANALYSIS_TOMORROW, ANALYSIS_DATA_MAP
+    # 1) 구글시트 today ← tomorrow 롤오버
+    client = get_gs_client()
+    spreadsheet_id = os.getenv("SPREADSHEET_ID")
 
-    # 1) 내일(TOMORROW) 데이터를 통째로 복사해서 오늘(TODAY)에 덮어쓰기
-    ANALYSIS_TODAY = deepcopy(ANALYSIS_TOMORROW)
+    if client and spreadsheet_id:
+        try:
+            sh = client.open_by_key(spreadsheet_id)
 
-    # 2) 내일(TOMORROW)는 빈 틀로 초기화 (스포츠 키는 유지)
-    ANALYSIS_TOMORROW = {sport: [] for sport in ANALYSIS_TODAY.keys()}
+            sheet_today_name = os.getenv("SHEET_TODAY_NAME", "today")
+            sheet_tomorrow_name = os.getenv("SHEET_TOMORROW_NAME", "tomorrow")
 
-    # 3) 매핑도 다시 연결
-    ANALYSIS_DATA_MAP["today"] = ANALYSIS_TODAY
-    ANALYSIS_DATA_MAP["tomorrow"] = ANALYSIS_TOMORROW
+            ws_today = sh.worksheet(sheet_today_name)
+            ws_tomorrow = sh.worksheet(sheet_tomorrow_name)
 
+            # tomorrow 탭 전체 데이터 가져오기
+            rows = ws_tomorrow.get_all_values()
+
+            if rows:
+                # 1-1) today 탭을 tomorrow 내용으로 통째로 덮어쓰기
+                ws_today.clear()
+                ws_today.update("A1", rows)
+
+                # 1-2) tomorrow 탭은 헤더만 남기고 비우기
+                header = rows[0]
+                ws_tomorrow.clear()
+                ws_tomorrow.update("A1", [header])
+            else:
+                print("[GSHEET] tomorrow 탭에 데이터가 없어 시트 롤오버는 생략합니다.")
+
+        except Exception as e:
+            print(f"[GSHEET] 롤오버 중 시트 복사 실패: {e}")
+
+    else:
+        print("[GSHEET] 클라이언트 또는 SPREADSHEET_ID 없음 → 시트 롤오버는 건너뜀.")
+
+    # 2) 메모리(ANALYSIS_TODAY / ANALYSIS_TOMORROW)도 시트 기준으로 다시 로딩
+    reload_analysis_from_sheet()
+
+    # 3) 안내 메시지
     await update.message.reply_text(
         "✅ 롤오버 완료!\n"
-        "이제 '오늘 경기 분석픽' 메뉴에는 기존 '내일 경기 분석픽' 내용이 들어가 있고,\n"
-        "'내일 경기 분석픽'은 새로 작성할 수 있도록 비워뒀어."
+        "구글시트 'tomorrow' 탭 내용을 'today' 탭으로 복사했고,\n"
+        "'tomorrow' 탭은 헤더만 남기고 초기화했어.\n\n"
+        "이제 오늘 경기 분석은 'today' 탭에서, 내일 경기는 'tomorrow' 탭에서 작성하면 돼."
     )
 
 
@@ -2022,6 +2050,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
