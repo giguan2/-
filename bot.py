@@ -30,6 +30,22 @@ CHANNEL_ID = (os.getenv("CHANNEL_ID") or "").strip()  # 예: @채널아이디 �
 # 🔴 여기만 네 봇 유저네임으로 수정하면 됨 (@ 빼고)
 BOT_USERNAME = "castlive_bot"  # 예: @castlive_bot 이라면 "castlive_bot"
 
+# 🔹 관리자 ID 목록 (쉼표로 여러 명 가능) 예: "123456789,987654321"
+_admin_ids_raw = os.getenv("ADMIN_IDS", "")
+ADMIN_IDS = [
+    int(x.strip())
+    for x in _admin_ids_raw.split(",")
+    if x.strip().isdigit()
+]
+
+def is_admin(update: Update) -> bool:
+    """이 명령어를 누가 호출했는지 확인해서, 관리자면 True 리턴"""
+    if not ADMIN_IDS:
+        # ADMIN_IDS를 안 넣었으면 그냥 모두 허용 (테스트용)
+        return True
+    user = update.effective_user
+    return bool(user and user.id in ADMIN_IDS)
+    
 # ───────────────── 날짜 헬퍼 ─────────────────
 
 def get_kst_now() -> datetime:
@@ -1840,6 +1856,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # 3) /publish – 채널로 메뉴 보내고 상단 고정
 # 3) /publish – 채널로 메뉴 보내고 상단 고정
 async def publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+    
     if not CHANNEL_ID:
         await update.message.reply_text("CHANNEL_ID가 비어 있습니다. Render 환경변수에 CHANNEL_ID를 설정하세요.")
         return
@@ -1864,6 +1884,10 @@ async def publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # 5) /syncsheet – 구글시트에서 분석 데이터 다시 로딩
 async def syncsheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+        
     try:
         reload_analysis_from_sheet()
         await update.message.reply_text("구글시트에서 분석 데이터를 다시 불러왔습니다 ✅")
@@ -1872,6 +1896,10 @@ async def syncsheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # 🔹 4) /rollover – 내일 분석 → 오늘 분석으로 복사
 async def rollover(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+        
     # 1) 구글시트 today ← tomorrow 롤오버
     client = get_gs_client()
     spreadsheet_id = os.getenv("SPREADSHEET_ID")
@@ -2049,6 +2077,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
