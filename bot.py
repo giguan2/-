@@ -1707,6 +1707,7 @@ def build_main_inline_menu() -> InlineKeyboardMarkup:
 
     buttons = [
         [InlineKeyboardButton("실시간 무료 중계", url="https://goat-tv.com")],
+        [InlineKeyboardButton("유저 로얄픽 공유방", url="https://goat-tv.com")],
         [
             InlineKeyboardButton(
                 f"{today_str} 경기 분석픽",
@@ -2080,6 +2081,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
