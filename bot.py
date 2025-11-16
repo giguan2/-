@@ -1798,6 +1798,8 @@ async def send_main_menu(chat_id: int | str, context: ContextTypes.DEFAULT_TYPE,
 
 # 1) /start – DM에서 채널과 동일한 레이아웃 or 바로 메뉴 진입
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print(update.effective_user.id)
+
     chat_id = update.effective_chat.id
     args = context.args
     mode = args[0] if args else None
@@ -2077,6 +2079,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
