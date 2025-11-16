@@ -1798,8 +1798,6 @@ async def send_main_menu(chat_id: int | str, context: ContextTypes.DEFAULT_TYPE,
 
 # 1) /start – DM에서 채널과 동일한 레이아웃 or 바로 메뉴 진입
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print(update.effective_user.id)
-
     chat_id = update.effective_chat.id
     args = context.args
     mode = args[0] if args else None
@@ -1839,7 +1837,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await send_main_menu(chat_id, context, preview=True)
 
-
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    await update.message.reply_text(f"당신의 텔레그램 ID: {uid}")
 
 # 2) DM 텍스트 처리 – 간단 테스트용
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2055,6 +2055,7 @@ def main():
 
     # 1:1 테스트용
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("myid", myid))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     # 채널 메뉴용
@@ -2079,6 +2080,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
