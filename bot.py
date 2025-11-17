@@ -1117,11 +1117,10 @@ def reload_analysis_from_sheet():
         print(f"[GSHEET] 시트 데이터 로딩 중 오류: {e}")
         return
 
-    # 비어 있으면 기존 데이터 유지
-    if today_data:
-        ANALYSIS_TODAY = today_data
-    if tomorrow_data:
-        ANALYSIS_TOMORROW = tomorrow_data
+    # 시트에서 읽어온 내용이 비어 있어도 그대로 반영
+    # (today / tomorrow 탭이 헤더만 있어도, 내일 버튼에는 아무 것도 안 뜨게)
+    ANALYSIS_TODAY = today_data
+    ANALYSIS_TOMORROW = tomorrow_data
 
     ANALYSIS_DATA_MAP = {
         "today": ANALYSIS_TODAY,
@@ -2081,6 +2080,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
