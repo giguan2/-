@@ -3,7 +3,9 @@ import json
 import time
 import re
 import requests
+import httpx
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 
 from telegram import (
     Update,
@@ -734,66 +736,101 @@ async def rollover(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    네이버 해외축구 뉴스 → 크롤링 → 구글시트 news 탭에 저장
-    (sport = '축구')
-    """
+    # 관리자만 사용
     if not is_admin(update):
         await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
         return
 
-    await update.message.reply_text("해외축구 최신 뉴스 크롤링을 시작합니다...")
+    await update.message.reply_text("축구 뉴스를 크롤링합니다. 잠시만 기다려 주세요...")
 
-    articles = crawl_naver_soccer(max_count=5)
-    if not articles:
-        await update.message.reply_text("크롤링 결과가 없습니다. (selector나 페이지 구조를 확인해야 할 수 있습니다)")
+    url = "https://sports.naver.com/wfootball/news/index"
+
+    # 1) 네이버 페이지 가져오기
+    try:
+        async with httpx.AsyncClient(
+            headers={"User-Agent": "Mozilla/5.0"}
+        ) as client:
+            resp = await client.get(url, timeout=10.0)
+        resp.raise_for_status()
+    except Exception as e:
+        await update.message.reply_text(f"요청 오류가 발생했습니다: {e}")
         return
 
-    client = get_gs_client()
+    soup = BeautifulSoup(resp.text, "html.parser")
+    base = str(resp.url)
+
+    # 2) 기사 링크 뽑기 (CSS 셀렉터 대신 href 패턴으로)
+    articles = []
+    seen = set()
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        text = a.get_text(strip=True)
+
+        # 해외축구 기사 링크 패턴 (대충 이런 느낌으로 필터)
+        if "wfootball/news" not in href:
+            continue
+        if not text:
+            continue
+
+        full_url = urljoin(base, href)
+
+        if full_url in seen:
+            continue
+        seen.add(full_url)
+
+        articles.append({"title": text, "link": full_url})
+
+        # 테스트니까 10개만
+        if len(articles) >= 10:
+            break
+
+    if not articles:
+        # Render 로그에서 HTML 일부 확인할 수 있게 찍어두기
+        print("[CRAWL][SOCCER] HTML snippet:\n", resp.text[:2000])
+        await update.message.reply_text(
+            "크롤링 결과가 없습니다.\n"
+            "네이버 페이지 구조가 바뀐 것 같아서, Render 로그에서 [CRAWL][SOCCER] 부분을 보고 셀렉터를 다시 잡아야 해."
+        )
+        return
+
+    # 3) 구글 시트 열기
+    client_gs = get_gs_client()
     spreadsheet_id = os.getenv("SPREADSHEET_ID")
-    if not client or not spreadsheet_id:
-        await update.message.reply_text("구글시트 설정이 없어 저장할 수 없습니다. SPREADSHEET_ID / GOOGLE_SERVICE_KEY를 확인해 주세요.")
+
+    if not (client_gs and spreadsheet_id):
+        await update.message.reply_text(
+            "구글시트 설정(GOOGLE_SERVICE_KEY 또는 SPREADSHEET_ID)이 없어 시트에 저장하지 못했습니다."
+        )
         return
 
     try:
-        sh = client.open_by_key(spreadsheet_id)
+        sh = client_gs.open_by_key(spreadsheet_id)
         sheet_news_name = os.getenv("SHEET_NEWS_NAME", "news")
         ws = sh.worksheet(sheet_news_name)
-
-        # 기존 제목 목록 불러와서 중복 방지
-        existing_titles = []
-        try:
-            existing_titles = ws.col_values(3)  # C열 title
-        except Exception:
-            pass
-
-        all_rows = ws.get_all_values()
-        next_index = len(all_rows)  # 헤더 포함 행 수
-
-        new_rows = []
-        add_count = 0
-        for i, art in enumerate(articles, start=1):
-            if art["title"] in existing_titles:
-                # 이미 있는 제목이면 건너뛰기
-                continue
-            row_id = f"soccer_{int(time.time())}_{i}"  # 간단한 고유 id
-            new_rows.append(
-                ["축구", row_id, art["title"], art["summary"]]
-            )
-            add_count += 1
-
-        if not new_rows:
-            await update.message.reply_text("추가할 새 뉴스가 없습니다. (모두 시트에 이미 있는 제목입니다)")
-            return
-
-        ws.append_rows(new_rows, value_input_option="RAW")
-
-        await update.message.reply_text(
-            f"해외축구 뉴스 {add_count}건을 'news' 시트에 저장했습니다.\n"
-            "구글시트에서 내용 확인 후, /syncsheet 명령으로 봇에 반영하세요."
-        )
     except Exception as e:
-        await update.message.reply_text(f"시트 저장 중 오류가 발생했습니다: {e}")
+        await update.message.reply_text(f"뉴스 시트를 열지 못했습니다: {e}")
+        return
+
+    # 4) 시트에 한 번에 append
+    # news 탭 구조: sport | id | title | summary
+    rows_to_append = []
+    for art in articles:
+        title = art["title"]
+        link = art["link"]
+        # 요약은 아직 안 붙이고, summary 칸에 링크만 넣어두자 (나중에 수동 편집)
+        rows_to_append.append(["축구", "", title, link])
+
+    try:
+        ws.append_rows(rows_to_append, value_input_option="RAW")
+    except Exception as e:
+        await update.message.reply_text(f"시트 쓰기 중 오류가 발생했습니다: {e}")
+        return
+
+    await update.message.reply_text(
+        f"축구 뉴스 {len(rows_to_append)}건을 'news' 탭에 추가했습니다.\n"
+        "구글시트에서 내용 확인하고, 텔레그램 메뉴에 반영하려면 /syncsheet 명령을 실행하면 돼."
+    )
 
 # 4) 인라인 버튼 콜백 처리 (분석/뉴스 팝업)
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -930,6 +967,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
