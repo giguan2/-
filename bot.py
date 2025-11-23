@@ -1,5 +1,9 @@
 import os
 import json
+import time
+import re
+import requests
+from bs4 import BeautifulSoup
 
 from telegram import (
     Update,
@@ -145,6 +149,105 @@ def get_gs_client():
     print("[GSHEET] gspread 인증 완료")
     return _gs_client
 
+def summarize_text(text: str, max_len: int = 400) -> str:
+    """
+    아주 단순한 요약: 문장을 잘라서 앞에서부터 max_len까지 자르는 방식.
+    """
+    text = text.replace("\n", " ").strip()
+    # 문장 단위로 대충 자르기 (한국어라 대충 마침표/다/요 기준)
+    sentences = re.split(r'(?<=[\.!?다요])\s+', text)
+    result = ""
+    for s in sentences:
+        s = s.strip()
+        if not s:
+            continue
+        if not result:
+            candidate = s
+        else:
+            candidate = result + " " + s
+        if len(candidate) > max_len:
+            break
+        result = candidate
+    # 너무 짧으면 그냥 원문 한 번 더 잘라줌
+    if not result:
+        result = text[:max_len]
+    return result
+
+def crawl_naver_soccer(max_count: int = 5) -> list[dict]:
+    """
+    네이버 해외축구 최신 뉴스 일부를 크롤링해서
+    [ {title, summary}, ... ] 리스트로 반환
+    """
+    BASE_URL = "https://sports.news.naver.com/wfootball/news/index?isphoto=N"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    }
+
+    articles: list[dict] = []
+
+    try:
+        resp = requests.get(BASE_URL, headers=headers, timeout=10)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"[CRAWLER] 목록 페이지 요청 실패: {e}")
+        return articles
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # ⚠️ 네이버 스포츠 구조가 조금씩 바뀔 수 있어서, 일단 대표적인 selector 기준으로 작성
+    # 필요하면 나중에 selector만 수정하면 됨
+    link_elems = soup.select("div#_newsList a.title")
+
+    links: list[str] = []
+    for a in link_elems:
+        href = a.get("href", "")
+        if not href:
+            continue
+        # 상대 경로면 붙여주기
+        if href.startswith("/"):
+            href = "https://sports.news.naver.com" + href
+        links.append(href)
+        if len(links) >= max_count:
+            break
+
+    for link in links:
+        try:
+            resp2 = requests.get(link, headers=headers, timeout=10)
+            resp2.raise_for_status()
+            s2 = BeautifulSoup(resp2.text, "html.parser")
+
+            # 제목
+            title_el = s2.select_one("h4.title, h2.news_tit, h2#title_area")
+            if not title_el:
+                print(f"[CRAWLER] 제목 태그 못 찾음: {link}")
+                continue
+            title = title_el.get_text(strip=True)
+
+            # 본문
+            body_el = (
+                s2.select_one("div#newsEndContents")
+                or s2.select_one("div.news_end")
+                or s2.select_one("div#newsEndBody")
+            )
+            if not body_el:
+                print(f"[CRAWLER] 본문 태그 못 찾음: {link}")
+                continue
+
+            body_text = body_el.get_text(" ", strip=True)
+            summary = summarize_text(body_text, max_len=400)
+
+            articles.append(
+                {
+                    "title": title,
+                    "summary": summary,
+                    "url": link,
+                }
+            )
+        except Exception as e:
+            print(f"[CRAWLER] 기사 파싱 실패 ({link}): {e}")
+            continue
+
+    return articles
 
 def _load_analysis_sheet(sh, sheet_name: str) -> dict:
     """
@@ -573,6 +676,7 @@ async def syncsheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     try:
         reload_analysis_from_sheet()
+        reload_news_from_sheet()         
         await update.message.reply_text("구글시트에서 분석 데이터를 다시 불러왔습니다 ✅")
     except Exception as e:
         await update.message.reply_text(f"구글시트 로딩 중 오류가 발생했습니다: {e}")
@@ -629,6 +733,67 @@ async def rollover(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "이제 오늘 경기 분석은 'today' 탭에서, 내일 경기는 'tomorrow' 탭에서 작성하면 돼."
     )
 
+async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    네이버 해외축구 뉴스 → 크롤링 → 구글시트 news 탭에 저장
+    (sport = '축구')
+    """
+    if not is_admin(update):
+        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+
+    await update.message.reply_text("해외축구 최신 뉴스 크롤링을 시작합니다...")
+
+    articles = crawl_naver_soccer(max_count=5)
+    if not articles:
+        await update.message.reply_text("크롤링 결과가 없습니다. (selector나 페이지 구조를 확인해야 할 수 있습니다)")
+        return
+
+    client = get_gs_client()
+    spreadsheet_id = os.getenv("SPREADSHEET_ID")
+    if not client or not spreadsheet_id:
+        await update.message.reply_text("구글시트 설정이 없어 저장할 수 없습니다. SPREADSHEET_ID / GOOGLE_SERVICE_KEY를 확인해 주세요.")
+        return
+
+    try:
+        sh = client.open_by_key(spreadsheet_id)
+        sheet_news_name = os.getenv("SHEET_NEWS_NAME", "news")
+        ws = sh.worksheet(sheet_news_name)
+
+        # 기존 제목 목록 불러와서 중복 방지
+        existing_titles = []
+        try:
+            existing_titles = ws.col_values(3)  # C열 title
+        except Exception:
+            pass
+
+        all_rows = ws.get_all_values()
+        next_index = len(all_rows)  # 헤더 포함 행 수
+
+        new_rows = []
+        add_count = 0
+        for i, art in enumerate(articles, start=1):
+            if art["title"] in existing_titles:
+                # 이미 있는 제목이면 건너뛰기
+                continue
+            row_id = f"soccer_{int(time.time())}_{i}"  # 간단한 고유 id
+            new_rows.append(
+                ["축구", row_id, art["title"], art["summary"]]
+            )
+            add_count += 1
+
+        if not new_rows:
+            await update.message.reply_text("추가할 새 뉴스가 없습니다. (모두 시트에 이미 있는 제목입니다)")
+            return
+
+        ws.append_rows(new_rows, value_input_option="RAW")
+
+        await update.message.reply_text(
+            f"해외축구 뉴스 {add_count}건을 'news' 시트에 저장했습니다.\n"
+            "구글시트에서 내용 확인 후, /syncsheet 명령으로 봇에 반영하세요."
+        )
+    except Exception as e:
+        await update.message.reply_text(f"시트 저장 중 오류가 발생했습니다: {e}")
 
 # 4) 인라인 버튼 콜백 처리 (분석/뉴스 팝업)
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -748,6 +913,9 @@ def main():
     
     # 🔹 오늘 ← 내일 복사용 롤오버 명령
     app.add_handler(CommandHandler("rollover", rollover))
+
+    # 🔹 해외축구 뉴스 크롤링 명령
+    app.add_handler(CommandHandler("crawlsoccer", crawlsoccer))    
     
     app.add_handler(CallbackQueryHandler(on_callback))
 
@@ -762,6 +930,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
