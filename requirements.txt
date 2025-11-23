@@ -1,4 +1,6 @@
 python-telegram-bot[webhooks]==20.7
 gspread
 oauth2client
+beautifulsoup4
+
 
