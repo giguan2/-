@@ -743,12 +743,14 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("축구 뉴스를 크롤링합니다. 잠시만 기다려 주세요...")
 
-    url = "https://sports.naver.com/wfootball/news/index"
+    # 네이버가 302로 보내는 PC 버전 대신, 바로 모바일 버전 사용
+    url = "https://m.sports.naver.com/wfootball/news"
 
-    # 1) 네이버 페이지 가져오기
+    # 1) 네이버 페이지 가져오기 (리다이렉트 자동 처리)
     try:
         async with httpx.AsyncClient(
-            headers={"User-Agent": "Mozilla/5.0"}
+            headers={"User-Agent": "Mozilla/5.0"},
+            follow_redirects=True,
         ) as client:
             resp = await client.get(url, timeout=10.0)
         resp.raise_for_status()
@@ -759,7 +761,7 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     soup = BeautifulSoup(resp.text, "html.parser")
     base = str(resp.url)
 
-    # 2) 기사 링크 뽑기 (CSS 셀렉터 대신 href 패턴으로)
+    # 2) 기사 링크 뽑기 (href 패턴으로 필터링)
     articles = []
     seen = set()
 
@@ -767,8 +769,9 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         href = a["href"]
         text = a.get_text(strip=True)
 
-        # 해외축구 기사 링크 패턴 (대충 이런 느낌으로 필터)
-        if "wfootball/news" not in href:
+        # 해외축구 뉴스 링크 대충 필터링
+        # (모바일 페이지에서 뉴스 상세는 보통 news.naver.com / sports.news.naver.com 로 넘어감)
+        if "news" not in href:
             continue
         if not text:
             continue
@@ -781,7 +784,7 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         articles.append({"title": text, "link": full_url})
 
-        # 테스트니까 10개만
+        # 테스트라 10개만
         if len(articles) >= 10:
             break
 
@@ -790,7 +793,7 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print("[CRAWL][SOCCER] HTML snippet:\n", resp.text[:2000])
         await update.message.reply_text(
             "크롤링 결과가 없습니다.\n"
-            "네이버 페이지 구조가 바뀐 것 같아서, Render 로그에서 [CRAWL][SOCCER] 부분을 보고 셀렉터를 다시 잡아야 해."
+            "모바일 페이지 구조가 바뀐 것 같아. Render 로그의 [CRAWL][SOCCER] HTML을 보고 다시 셀렉터를 잡아야 해."
         )
         return
 
@@ -818,7 +821,7 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for art in articles:
         title = art["title"]
         link = art["link"]
-        # 요약은 아직 안 붙이고, summary 칸에 링크만 넣어두자 (나중에 수동 편집)
+        # 일단 summary엔 링크만 넣어두고, 시트에서 네가 편집해도 되고
         rows_to_append.append(["축구", "", title, link])
 
     try:
@@ -831,6 +834,7 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"축구 뉴스 {len(rows_to_append)}건을 'news' 탭에 추가했습니다.\n"
         "구글시트에서 내용 확인하고, 텔레그램 메뉴에 반영하려면 /syncsheet 명령을 실행하면 돼."
     )
+
 
 # 4) 인라인 버튼 콜백 처리 (분석/뉴스 팝업)
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -967,6 +971,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
