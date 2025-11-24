@@ -796,73 +796,85 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
         return
 
-    await update.message.reply_text("축구 뉴스를 크롤링합니다. 잠시만 기다려 주세요...")
+    await update.message.reply_text("다음스포츠 해외축구 뉴스를 크롤링합니다. 잠시만 기다려 주세요...")
 
-    # ✅ PC 버전 네이버 해외축구 뉴스 리스트 URL 사용
-    list_url = "https://sports.news.naver.com/wfootball/news/index?isphoto=N"
+    list_url = "https://sports.daum.net/worldsoccer/news"
 
     try:
         async with httpx.AsyncClient(
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            headers={"User-Agent": "Mozilla/5.0"},
             follow_redirects=True,
         ) as client:
-            # 1) 리스트 페이지 가져오기
+            # 1) 리스트 페이지 요청
             resp = await client.get(list_url, timeout=10.0)
             resp.raise_for_status()
 
             soup = BeautifulSoup(resp.text, "html.parser")
+            base = str(resp.url)
 
             articles = []
+            seen = set()
 
-            # ── 1단계: 리스트에서 제목 + 링크 뽑기 (PC 네이버 스포츠 구조) ──
-            # 예전 sync 함수에서 사용한 것과 동일한 셀렉터
-            link_elems = soup.select("div#_newsList a.title")
-
-            for a in link_elems:
-                href = a.get("href", "").strip()
+            # ── 1단계: 뉴스 리스트에서 제목 + 링크 추출 ──
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
                 title = a.get_text(strip=True)
 
-                if not href or not title:
+                # 다음 뉴스는 v.daum.net/v/ 로 시작하는 것만 기사
+                if not href:
                     continue
 
-                # 상대경로 처리
-                if href.startswith("/"):
-                    href = "https://sports.news.naver.com" + href
+                if "v.daum.net/v/" not in href and not href.startswith("/v/"):
+                    continue
 
-                articles.append(
-                    {
-                        "title": title,
-                        "link": href,
-                    }
-                )
+                if not title or len(title) < 3:
+                    continue
 
-                # 너무 많이 가져올 필요 없으면 상위 10개 정도만
+                full_url = urljoin(base, href)
+
+                if full_url in seen:
+                    continue
+                seen.add(full_url)
+
+                articles.append({"title": title, "link": full_url})
+
                 if len(articles) >= 10:
                     break
 
             if not articles:
-                # 디버깅용으로 앞부분 로그 찍어볼 수 있음
-                print("[CRAWL][SOCCER] 리스트에서 기사를 찾지 못했습니다.")
-                print("[CRAWL][SOCCER] HTML snippet:\n", resp.text[:2000])
-                await update.message.reply_text(
-                    "축구 뉴스 리스트에서 기사를 찾지 못했습니다.\n"
-                    "네이버 스포츠 페이지 구조가 바뀐 것 같으니, div#_newsList a.title 셀렉터를 다시 확인해봐야 합니다."
-                )
+                await update.message.reply_text("해외축구 뉴스 리스트에서 기사를 찾지 못했습니다.")
                 return
 
-            # ── 2단계: 각 기사 상세 페이지에 들어가서 본문 크롤링 + 요약 ──
+            # ── 2단계: 각 기사 상세 페이지 크롤링 ──
             for art in articles:
-                body_text = await fetch_article_body(client, art["link"])
-                if not body_text:
-                    art["summary"] = "(본문을 불러오지 못했습니다)"
-                else:
-                    art["summary"] = simple_summarize(body_text)
+                try:
+                    r2 = await client.get(art["link"], timeout=10.0)
+                    r2.raise_for_status()
+                    s2 = BeautifulSoup(r2.text, "html.parser")
+
+                    # 기사 본문
+                    body_el = (
+                        s2.select_one("div#mArticle")
+                        or s2.find("article")
+                        or s2.body
+                    )
+
+                    if body_el:
+                        body_text = body_el.get_text("\n", strip=True)
+                    else:
+                        body_text = ""
+
+                    art["summary"] = simple_summarize(body_text, max_chars=400)
+
+                except Exception as e:
+                    print(f"[CRAWL][DAUM] 기사 파싱 실패 ({art['link']}): {e}")
+                    art["summary"] = "(본문 크롤링 실패)"
 
     except Exception as e:
         await update.message.reply_text(f"요청 오류가 발생했습니다: {e}")
         return
 
-    # 3) 구글 시트 열기
+    # ── 3) 구글 시트 저장 ──
     client_gs = get_gs_client()
     spreadsheet_id = os.getenv("SPREADSHEET_ID")
 
@@ -874,35 +886,31 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         sh = client_gs.open_by_key(spreadsheet_id)
-        sheet_news_name = os.getenv("SHEET_NEWS_NAME", "news")
-        ws = sh.worksheet(sheet_news_name)
+        ws = sh.worksheet(os.getenv("SHEET_NEWS_NAME", "news"))
     except Exception as e:
         await update.message.reply_text(f"뉴스 시트를 열지 못했습니다: {e}")
         return
 
-    # 4) 시트에 한 번에 append
-    # news 탭 구조: sport | id | title | summary
     rows_to_append = []
     for art in articles:
-        rows_to_append.append(
-            [
-                "축구",            # sport
-                "",               # id (비워두면 나중에 자동 생성)
-                art["title"],     # title
-                art["summary"],   # summary = 기사 요약
-            ]
-        )
+        rows_to_append.append([
+            "축구",
+            "",
+            art["title"],
+            art["summary"],
+        ])
 
     try:
         ws.append_rows(rows_to_append, value_input_option="RAW")
     except Exception as e:
-        await update.message.reply_text(f"시트 쓰기 중 오류가 발생했습니다: {e}")
+        await update.message.reply_text(f"시트 쓰기 오류: {e}")
         return
 
     await update.message.reply_text(
-        f"축구 뉴스 {len(rows_to_append)}건을 '{sheet_news_name}' 탭에 추가했습니다.\n"
-        "구글시트에서 내용 확인하고, 텔레그램 메뉴에 반영하려면 /syncsheet 명령을 실행하면 돼."
+        f"다음스포츠 해외축구 뉴스 {len(rows_to_append)}건을 저장했습니다.\n"
+        "/syncsheet 로 텔레그램 메뉴를 갱신할 수 있습니다."
     )
+
 
 
 # 4) 인라인 버튼 콜백 처리 (분석/뉴스 팝업)
@@ -1040,6 +1048,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
