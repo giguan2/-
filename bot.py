@@ -178,16 +178,24 @@ def clean_daum_body_text(text: str) -> str:
     if not text:
         return ""
 
-    # 1단계: 번역/요약 안내 문구가 나오기 전까지만 사용
-    cut_markers = [
-        "번역 설정 번역 beta",  # 번역 위젯 시작
-        "요약본이 자동요약 기사 제목과 주요 문장을 기반으로 자동요약한 결과입니다.",
+    # 1단계: 번역/요약/언어선택 블록이 시작되기 전까지만 사용
+    cut_keywords = [
+        "번역 설정",                      # 번역 설정 ...
+        "번역 beta",                     # 번역 beta ...
+        "Translated by",                # Translated by kakao ...
+        "Now in translation",           # Now in translation ...
+        "요약본이 자동요약",             # 요약 안내문
+        "기사 제목과 주요 문장을 기반으로 자동요약한 결과입니다",
     ]
-    for m in cut_markers:
-        idx = text.find(m)
+    cut_pos = None
+    for kw in cut_keywords:
+        idx = text.find(kw)
         if idx != -1:
-            text = text[:idx]
-            break
+            if cut_pos is None or idx < cut_pos:
+                cut_pos = idx
+
+    if cut_pos is not None:
+        text = text[:cut_pos]
 
     # 2단계: 줄 단위로 나눈 뒤 언어 목록 등 불필요한 줄 제거
     lines = [l.strip() for l in text.splitlines() if l.strip()]
@@ -198,9 +206,7 @@ def clean_daum_body_text(text: str) -> str:
         "번역 설정",
         "번역 beta",
         "Translated by",
-        "요약본이 자동요약 기사 제목과 주요 문장을 기반으로 자동요약한 결과입니다.",
         "전체 맥락을 이해하기 위해서는 본문 보기를 권장합니다.",
-        "기사 제목과 주요 문장을 기반으로 자동요약한 결과입니다.",
         "요약문이므로 일부 내용이 생략될 수 있습니다.",
         # 언어 목록 키워드
         "한국어 - English",
@@ -224,7 +230,6 @@ def clean_daum_body_text(text: str) -> str:
         clean_lines.append(l)
 
     return " ".join(clean_lines)
-
 
 def crawl_naver_soccer(max_count: int = 5) -> list[dict]:
     """
@@ -1212,3 +1217,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
