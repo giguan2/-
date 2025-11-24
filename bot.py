@@ -182,44 +182,59 @@ def crawl_naver_soccer(max_count: int = 5) -> list[dict]:
     """
 
     # 내부에서만 쓸 본문 정리 함수
-    def _clean_daum_body_text(text: str) -> str:
-        """
-        다음 뉴스 본문에서 '음성으로 듣기', 번역 언어 목록 등
-        UI 텍스트를 최대한 제거.
-        """
-        if not text:
-            return ""
+   def clean_daum_body_text(text: str) -> str:
+    """
+    다음 뉴스 본문에서 '음성으로 듣기', 번역/요약 UI 텍스트를 최대한 제거.
+    """
+    if not text:
+        return ""
 
-        lines = [l.strip() for l in text.splitlines() if l.strip()]
-        blacklist = [
-            "음성으로 듣기",
-            "음성 재생",
-            "음성재생 설정",
-            "번역 설정",
-            "번역 beta",
-            "Translated by",
-            "번역 ",
-            "한국어 - English",
-            "한국어 - 영어",
-            "English",
-            "日本語",
-            "简体中文",
-            "Deutsch",
-            "Русский",
-            "Español",
-            "العربية",
-            "bahasa Indonesia",
-            "ภาษาไทย",
-            "Türkçe",
-        ]
+    # 1단계: 번역/요약 안내 문구가 나오기 전까지만 사용
+    cut_markers = [
+        "번역 설정 번역 beta",  # 번역 위젯 시작
+        "요약본이 자동요약 기사 제목과 주요 문장을 기반으로 자동요약한 결과입니다.",
+    ]
+    for m in cut_markers:
+        idx = text.find(m)
+        if idx != -1:
+            text = text[:idx]
+            break
 
-        clean_lines = []
-        for l in lines:
-            if any(b in l for b in blacklist):
-                continue
-            clean_lines.append(l)
+    # 2단계: 줄 단위로 나눈 뒤 언어 목록 등 불필요한 줄 제거
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    blacklist = [
+        "음성으로 듣기",
+        "음성 재생",
+        "음성재생 설정",
+        "번역 설정",
+        "번역 beta",
+        "Translated by",
+        "요약본이 자동요약 기사 제목과 주요 문장을 기반으로 자동요약한 결과입니다.",
+        "전체 맥락을 이해하기 위해서는 본문 보기를 권장합니다.",
+        "기사 제목과 주요 문장을 기반으로 자동요약한 결과입니다.",
+        "요약문이므로 일부 내용이 생략될 수 있습니다.",
+        # 언어 목록 키워드
+        "한국어 - English",
+        "한국어 - 영어",
+        "English",
+        "日本語",
+        "简体中文",
+        "Deutsch",
+        "Русский",
+        "Español",
+        "العربية",
+        "bahasa Indonesia",
+        "ภาษาไทย",
+        "Türkçe",
+    ]
 
-        return " ".join(clean_lines)
+    clean_lines = []
+    for l in lines:
+        if any(b in l for b in blacklist):
+            continue
+        clean_lines.append(l)
+
+    return " ".join(clean_lines)
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
@@ -333,21 +348,27 @@ def crawl_naver_soccer(max_count: int = 5) -> list[dict]:
             resp2.raise_for_status()
             s2 = BeautifulSoup(resp2.text, "html.parser")
 
-            body_el = (
-                s2.select_one("div#harmonyContainer")
-                or s2.select_one("div#mArticle div#harmonyContainer")
-                or s2.select_one("div#mArticle")
-                or s2.find("article")
-                or s2.body
-            )
+body_el = (
+    s2.select_one("div#harmonyContainer")
+    or s2.select_one("div#mArticle div#harmonyContainer")
+    or s2.select_one("div#mArticle")
+    or s2.find("article")
+    or s2.body
+)
 
-            if not body_el:
-                print(f"[CRAWLER] 본문 태그 못 찾음: {link}")
-                continue
+if not body_el:
+    print(f"[CRAWLER] 본문 태그 못 찾음: {link}")
+    continue
 
-            raw_body_text = body_el.get_text("\n", strip=True)
-            clean_body_text = _clean_daum_body_text(raw_body_text)
-            summary = summarize_text(clean_body_text, max_len=400)
+# 본문 텍스트 추출
+raw_body_text = body_el.get_text("\n", strip=True)
+
+# 다음 특유 번역/요약 블록 제거
+clean_body_text = clean_daum_body_text(raw_body_text)
+
+# 길이 400자 정도로 요약
+summary = summarize_text(clean_body_text, max_len=400)
+
 
             articles.append(
                 {
@@ -1214,6 +1235,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
