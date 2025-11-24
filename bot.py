@@ -177,66 +177,177 @@ def summarize_text(text: str, max_len: int = 400) -> str:
 
 def crawl_naver_soccer(max_count: int = 5) -> list[dict]:
     """
-    네이버 해외축구 최신 뉴스 일부를 크롤링해서
-    [ {title, summary}, ... ] 리스트로 반환
+    (다음 스포츠 해외축구) 최신 뉴스 일부를 크롤링해서
+    [ {title, summary, url}, ... ] 리스트로 반환
     """
-    BASE_URL = "https://sports.news.naver.com/wfootball/news/index?isphoto=N"
+
+    # 내부에서만 쓸 본문 정리 함수
+    def _clean_daum_body_text(text: str) -> str:
+        """
+        다음 뉴스 본문에서 '음성으로 듣기', 번역 언어 목록 등
+        UI 텍스트를 최대한 제거.
+        """
+        if not text:
+            return ""
+
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        blacklist = [
+            "음성으로 듣기",
+            "음성 재생",
+            "음성재생 설정",
+            "번역 설정",
+            "번역 beta",
+            "Translated by",
+            "번역 ",
+            "한국어 - English",
+            "한국어 - 영어",
+            "English",
+            "日本語",
+            "简体中文",
+            "Deutsch",
+            "Русский",
+            "Español",
+            "العربية",
+            "bahasa Indonesia",
+            "ภาษาไทย",
+            "Türkçe",
+        ]
+
+        clean_lines = []
+        for l in lines:
+            if any(b in l for b in blacklist):
+                continue
+            clean_lines.append(l)
+
+        return " ".join(clean_lines)
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
     }
 
     articles: list[dict] = []
 
+    # ── 1) 다음 harmony JSON API에서 해외축구 리스트 가져오기 ──
+    base_url = "https://sports.daum.net/media-api/harmony/contents.json"
+
+    # 한국 시간 기준 오늘 날짜
+    today_kst = get_kst_now().date()
+    ymd = today_kst.strftime("%Y%m%d")
+    create_dt = f"{ymd}000000~{ymd}235959"
+
+    # discoveryTag[0] 값 (해외축구 카테고리 ID: 100032)
+    discovery_tag_value = json.dumps(
+        {
+            "group": "media",
+            "key": "defaultCategoryId3",
+            "value": "100032",
+        },
+        ensure_ascii=False,
+    )
+
+    params = {
+        "page": 0,
+        "consumerType": "HARMONY",
+        "status": "SERVICE",
+        "createDt": create_dt,
+        "size": max_count if max_count > 0 else 5,
+        "discoveryTag[0]": discovery_tag_value,
+        # "after": ""  # 첫 페이지면 보통 불필요
+    }
+
     try:
-        resp = requests.get(BASE_URL, headers=headers, timeout=10)
+        resp = requests.get(base_url, headers=headers, params=params, timeout=10)
         resp.raise_for_status()
     except Exception as e:
-        print(f"[CRAWLER] 목록 페이지 요청 실패: {e}")
+        print(f"[CRAWLER] 다음 harmony API 요청 실패: {e}")
         return articles
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    try:
+        data = resp.json()
+    except Exception as e:
+        print(f"[CRAWLER] JSON 파싱 실패: {e}")
+        return articles
 
-    # ⚠️ 네이버 스포츠 구조가 조금씩 바뀔 수 있어서, 일단 대표적인 selector 기준으로 작성
-    # 필요하면 나중에 selector만 수정하면 됨
-    link_elems = soup.select("div#_newsList a.title")
+    # contents 리스트 찾기 (구조 변화에 대비한 방어 코드)
+    contents = None
+    if isinstance(data, dict):
+        contents = data.get("contents")
+        if contents is None:
+            inner = data.get("data") or data.get("result") or data.get("body")
+            if isinstance(inner, dict):
+                contents = inner.get("contents") or inner.get("list") or inner.get("items")
+    elif isinstance(data, list):
+        contents = data
 
-    links: list[str] = []
-    for a in link_elems:
-        href = a.get("href", "")
-        if not href:
+    if not contents:
+        print("[CRAWLER] JSON에서 contents 리스트를 찾지 못했습니다.",
+              f"type={type(data)}, keys={list(data.keys()) if isinstance(data, dict) else 'N/A'}")
+        return articles
+
+    # ── 2) JSON에서 제목 + 링크 추출 ──
+    link_items: list[dict] = []
+    for item in contents:
+        if not isinstance(item, dict):
             continue
-        # 상대 경로면 붙여주기
-        if href.startswith("/"):
-            href = "https://sports.news.naver.com" + href
-        links.append(href)
-        if len(links) >= max_count:
+
+        title = (
+            item.get("title")
+            or item.get("contentTitle")
+            or item.get("headline")
+            or item.get("name")
+        )
+
+        url = (
+            item.get("contentUrl")
+            or item.get("permalink")
+            or item.get("url")
+            or item.get("link")
+        )
+
+        if not title or not url:
+            continue
+
+        title = str(title).strip()
+        url = str(url).strip()
+
+        # 상대경로면 절대경로로 변환
+        if url.startswith("/"):
+            url = urljoin("https://sports.daum.net", url)
+
+        link_items.append({"title": title, "url": url})
+
+        if len(link_items) >= max_count:
             break
 
-    for link in links:
+    if not link_items:
+        print("[CRAWLER] 제목/URL 추출 실패 (contents 구조 변경 가능성)")
+        return articles
+
+    # ── 3) 각 기사 페이지에서 본문 긁고 요약 ──
+    for it in link_items:
+        link = it["url"]
+        title = it["title"]
+
         try:
             resp2 = requests.get(link, headers=headers, timeout=10)
             resp2.raise_for_status()
             s2 = BeautifulSoup(resp2.text, "html.parser")
 
-            # 제목
-            title_el = s2.select_one("h4.title, h2.news_tit, h2#title_area")
-            if not title_el:
-                print(f"[CRAWLER] 제목 태그 못 찾음: {link}")
-                continue
-            title = title_el.get_text(strip=True)
-
-            # 본문
             body_el = (
-                s2.select_one("div#newsEndContents")
-                or s2.select_one("div.news_end")
-                or s2.select_one("div#newsEndBody")
+                s2.select_one("div#harmonyContainer")
+                or s2.select_one("div#mArticle div#harmonyContainer")
+                or s2.select_one("div#mArticle")
+                or s2.find("article")
+                or s2.body
             )
+
             if not body_el:
                 print(f"[CRAWLER] 본문 태그 못 찾음: {link}")
                 continue
 
-            body_text = body_el.get_text(" ", strip=True)
-            summary = summarize_text(body_text, max_len=400)
+            raw_body_text = body_el.get_text("\n", strip=True)
+            clean_body_text = _clean_daum_body_text(raw_body_text)
+            summary = summarize_text(clean_body_text, max_len=400)
 
             articles.append(
                 {
@@ -245,6 +356,7 @@ def crawl_naver_soccer(max_count: int = 5) -> list[dict]:
                     "url": link,
                 }
             )
+
         except Exception as e:
             print(f"[CRAWLER] 기사 파싱 실패 ({link}): {e}")
             continue
@@ -1102,6 +1214,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
