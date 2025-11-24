@@ -44,6 +44,7 @@ ADMIN_IDS = [
     if x.strip().isdigit()
 ]
 
+
 def is_admin(update: Update) -> bool:
     """이 명령어를 누가 호출했는지 확인해서, 관리자면 True 리턴"""
     if not ADMIN_IDS:
@@ -51,7 +52,8 @@ def is_admin(update: Update) -> bool:
         return True
     user = update.effective_user
     return bool(user and user.id in ADMIN_IDS)
-    
+
+
 # ───────────────── 날짜 헬퍼 ─────────────────
 
 def get_kst_now() -> datetime:
@@ -89,24 +91,16 @@ def get_menu_caption() -> str:
 # ───────────────── 분석/뉴스 데이터 (예시) ─────────────────
 
 ANALYSIS_TODAY = {
-    "축구": [
-            ],
-    "농구": [
-         ],
-    "야구": [
-      ],
-    "배구": [
-    ],
+    "축구": [],
+    "농구": [],
+    "야구": [],
+    "배구": [],
 }
 ANALYSIS_TOMORROW = {
-    "축구": [
-    ],
-    "농구": [
-    ],
-    "야구": [
-    ],
-    "배구": [
-    ],
+    "축구": [],
+    "농구": [],
+    "야구": [],
+    "배구": [],
 }
 
 ANALYSIS_DATA_MAP = {
@@ -151,6 +145,7 @@ def get_gs_client():
     print("[GSHEET] gspread 인증 완료")
     return _gs_client
 
+
 def summarize_text(text: str, max_len: int = 400) -> str:
     """
     아주 단순한 요약: 문장을 잘라서 앞에서부터 max_len까지 자르는 방식.
@@ -175,14 +170,8 @@ def summarize_text(text: str, max_len: int = 400) -> str:
         result = text[:max_len]
     return result
 
-def crawl_naver_soccer(max_count: int = 5) -> list[dict]:
-    """
-    (다음 스포츠 해외축구) 최신 뉴스 일부를 크롤링해서
-    [ {title, summary, url}, ... ] 리스트로 반환
-    """
 
-    # 내부에서만 쓸 본문 정리 함수
-   def clean_daum_body_text(text: str) -> str:
+def clean_daum_body_text(text: str) -> str:
     """
     다음 뉴스 본문에서 '음성으로 듣기', 번역/요약 UI 텍스트를 최대한 제거.
     """
@@ -236,6 +225,12 @@ def crawl_naver_soccer(max_count: int = 5) -> list[dict]:
 
     return " ".join(clean_lines)
 
+
+def crawl_naver_soccer(max_count: int = 5) -> list[dict]:
+    """
+    (다음 스포츠 해외축구) 최신 뉴스 일부를 크롤링해서
+    [ {title, summary, url}, ... ] 리스트로 반환
+    """
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
     }
@@ -267,7 +262,6 @@ def crawl_naver_soccer(max_count: int = 5) -> list[dict]:
         "createDt": create_dt,
         "size": max_count if max_count > 0 else 5,
         "discoveryTag[0]": discovery_tag_value,
-        # "after": ""  # 첫 페이지면 보통 불필요
     }
 
     try:
@@ -295,8 +289,10 @@ def crawl_naver_soccer(max_count: int = 5) -> list[dict]:
         contents = data
 
     if not contents:
-        print("[CRAWLER] JSON에서 contents 리스트를 찾지 못했습니다.",
-              f"type={type(data)}, keys={list(data.keys()) if isinstance(data, dict) else 'N/A'}")
+        print(
+            "[CRAWLER] JSON에서 contents 리스트를 찾지 못했습니다.",
+            f"type={type(data)}, keys={list(data.keys()) if isinstance(data, dict) else 'N/A'}",
+        )
         return articles
 
     # ── 2) JSON에서 제목 + 링크 추출 ──
@@ -348,27 +344,21 @@ def crawl_naver_soccer(max_count: int = 5) -> list[dict]:
             resp2.raise_for_status()
             s2 = BeautifulSoup(resp2.text, "html.parser")
 
-body_el = (
-    s2.select_one("div#harmonyContainer")
-    or s2.select_one("div#mArticle div#harmonyContainer")
-    or s2.select_one("div#mArticle")
-    or s2.find("article")
-    or s2.body
-)
+            body_el = (
+                s2.select_one("div#harmonyContainer")
+                or s2.select_one("div#mArticle div#harmonyContainer")
+                or s2.select_one("div#mArticle")
+                or s2.find("article")
+                or s2.body
+            )
 
-if not body_el:
-    print(f"[CRAWLER] 본문 태그 못 찾음: {link}")
-    continue
+            if not body_el:
+                print(f"[CRAWLER] 본문 태그 못 찾음: {link}")
+                continue
 
-# 본문 텍스트 추출
-raw_body_text = body_el.get_text("\n", strip=True)
-
-# 다음 특유 번역/요약 블록 제거
-clean_body_text = clean_daum_body_text(raw_body_text)
-
-# 길이 400자 정도로 요약
-summary = summarize_text(clean_body_text, max_len=400)
-
+            raw_body_text = body_el.get_text("\n", strip=True)
+            clean_body_text = clean_daum_body_text(raw_body_text)
+            summary = summarize_text(clean_body_text, max_len=400)
 
             articles.append(
                 {
@@ -383,6 +373,7 @@ summary = summarize_text(clean_body_text, max_len=400)
             continue
 
     return articles
+
 
 def _load_analysis_sheet(sh, sheet_name: str) -> dict:
     """
@@ -489,8 +480,6 @@ def reload_analysis_from_sheet():
         print(f"[GSHEET] 시트 데이터 로딩 중 오류: {e}")
         return
 
-    # 시트에서 읽어온 내용이 비어 있어도 그대로 반영
-    # (today / tomorrow 탭이 헤더만 있어도, 내일 버튼에는 아무 것도 안 뜨게)
     ANALYSIS_TODAY = today_data
     ANALYSIS_TOMORROW = tomorrow_data
 
@@ -500,8 +489,10 @@ def reload_analysis_from_sheet():
     }
 
     print("[GSHEET] ANALYSIS_TODAY / ANALYSIS_TOMORROW 갱신 완료")
-    
+
+
 NEWS_DATA = {}
+
 
 def _load_news_sheet(sh, sheet_name: str) -> dict:
     """
@@ -577,6 +568,7 @@ def _load_news_sheet(sh, sheet_name: str) -> dict:
 
     return data
 
+
 def reload_news_from_sheet():
     """구글시트에서 뉴스 탭을 읽어서 NEWS_DATA 갱신"""
     global NEWS_DATA
@@ -604,7 +596,6 @@ def reload_news_from_sheet():
 
     NEWS_DATA = news_data
     print("[GSHEET] NEWS_DATA 갱신 완료")
-
 
 
 # ───────────────── 키보드/메뉴 구성 ─────────────────
@@ -660,7 +651,6 @@ def build_analysis_category_menu(key: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
-
 def build_analysis_match_menu(key: str, sport: str) -> InlineKeyboardMarkup:
     """종목 선택 후 → 해당 종목 경기 리스트 메뉴"""
     items = ANALYSIS_DATA_MAP.get(key, {}).get(sport, [])
@@ -713,6 +703,7 @@ async def send_main_menu(chat_id: int | str, context: ContextTypes.DEFAULT_TYPE,
     )
     return msg
 
+
 # ───────────────── 핸들러들 ─────────────────
 
 # 1) /start – DM에서 채널과 동일한 레이아웃 or 바로 메뉴 진입
@@ -756,9 +747,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await send_main_menu(chat_id, context, preview=True)
 
+
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     await update.message.reply_text(f"당신의 텔레그램 ID: {uid}")
+
 
 # 2) DM 텍스트 처리 – 간단 테스트용
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -775,12 +768,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # 3) /publish – 채널로 메뉴 보내고 상단 고정
-# 3) /publish – 채널로 메뉴 보내고 상단 고정
 async def publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
         return
-    
+
     if not CHANNEL_ID:
         await update.message.reply_text("CHANNEL_ID가 비어 있습니다. Render 환경변수에 CHANNEL_ID를 설정하세요.")
         return
@@ -803,26 +795,27 @@ async def publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("채널에 메뉴를 올리고 상단에 고정했습니다 ✅")
 
+
 # 5) /syncsheet – 구글시트에서 분석 데이터 다시 로딩
 async def syncsheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
         return
-        
+
     try:
         reload_analysis_from_sheet()
-        reload_news_from_sheet()         
+        reload_news_from_sheet()
         await update.message.reply_text("구글시트에서 분석 데이터를 다시 불러왔습니다 ✅")
     except Exception as e:
         await update.message.reply_text(f"구글시트 로딩 중 오류가 발생했습니다: {e}")
+
 
 # 🔹 4) /rollover – 내일 분석 → 오늘 분석으로 복사
 async def rollover(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
         return
-        
-    # 1) 구글시트 today ← tomorrow 롤오버
+
     client = get_gs_client()
     spreadsheet_id = os.getenv("SPREADSHEET_ID")
 
@@ -857,16 +850,15 @@ async def rollover(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         print("[GSHEET] 클라이언트 또는 SPREADSHEET_ID 없음 → 시트 롤오버는 건너뜀.")
 
-    # 2) 메모리(ANALYSIS_TODAY / ANALYSIS_TOMORROW)도 시트 기준으로 다시 로딩
     reload_analysis_from_sheet()
 
-    # 3) 안내 메시지
     await update.message.reply_text(
         "✅ 롤오버 완료!\n"
         "구글시트 'tomorrow' 탭 내용을 'today' 탭으로 복사했고,\n"
         "'tomorrow' 탭은 헤더만 남기고 초기화했어.\n\n"
         "이제 오늘 경기 분석은 'today' 탭에서, 내일 경기는 'tomorrow' 탭에서 작성하면 돼."
     )
+
 
 def simple_summarize(text: str, max_chars: int = 400) -> str:
     """
@@ -876,20 +868,17 @@ def simple_summarize(text: str, max_chars: int = 400) -> str:
     if not text:
         return ""
 
-    # 공백 정리
     text = re.sub(r"\s+", " ", text).strip()
 
     if len(text) <= max_chars:
         return text
 
-    # '다.' 기준으로 적당히 끊기
     cut = text.rfind("다.", 0, max_chars)
     if cut != -1:
         return text[: cut + 2]
 
     return text[:max_chars] + "..."
 
-import urllib.parse  # 파일 상단 import 부분에 추가
 
 async def fetch_daum_worldsoccer_json(client: httpx.AsyncClient) -> list[dict]:
     """
@@ -898,13 +887,10 @@ async def fetch_daum_worldsoccer_json(client: httpx.AsyncClient) -> list[dict]:
     """
     base_url = "https://sports.daum.net/media-api/harmony/contents.json"
 
-    # KST 오늘 날짜 기준으로 createDt 범위 생성
     today_kst = get_kst_now().date()
     ymd = today_kst.strftime("%Y%m%d")
     create_dt = f"{ymd}000000~{ymd}235959"
 
-    # discoveryTag[0] 는 네가 캡처한 URL에서 두 번 인코딩된 값이었음.
-    # 실제 값은 {"group":"media","key":"defaultCategoryId3","value":"100032"}
     discovery_tag_value = json.dumps({
         "group": "media",
         "key": "defaultCategoryId3",
@@ -917,16 +903,13 @@ async def fetch_daum_worldsoccer_json(client: httpx.AsyncClient) -> list[dict]:
         "status": "SERVICE",
         "createDt": create_dt,
         "size": 20,
-        # discoveryTag[0] 형식 그대로 사용
         "discoveryTag[0]": discovery_tag_value,
-        # "after": ""  # 첫 페이지면 보통 없어도 됨. 필요하면 채워넣을 수 있음.
     }
 
     r = await client.get(base_url, params=params, timeout=10.0)
     r.raise_for_status()
     data = r.json()
 
-    # 방어적으로 contents 리스트를 찾아본다.
     contents = None
     if isinstance(data, dict):
         contents = data.get("contents")
@@ -943,10 +926,11 @@ async def fetch_daum_worldsoccer_json(client: httpx.AsyncClient) -> list[dict]:
 
     return contents
 
+
 async def fetch_article_body(client: httpx.AsyncClient, url: str) -> str:
     """
-    네이버 뉴스 상세 페이지에서 본문 텍스트만 추출.
-    (모바일/PC 둘 다 시도)
+    (예전 네이버용) 뉴스 상세 페이지에서 본문 텍스트만 추출.
+    현재는 사용하지 않지만 남겨둠.
     """
     try:
         r = await client.get(url, timeout=10.0, headers={"User-Agent": "Mozilla/5.0"})
@@ -957,24 +941,21 @@ async def fetch_article_body(client: httpx.AsyncClient, url: str) -> str:
 
     soup = BeautifulSoup(r.text, "html.parser")
 
-    # 1) 모바일 스포츠 뉴스 (m.sports.naver.com) 쪽 구조
     body = soup.select_one("#newsEndContents")
     if body:
         return body.get_text("\n", strip=True)
 
-    # 2) PC 스포츠 뉴스 (sports.news.naver.com) 쪽 구조
     body = soup.select_one("#newsEndBody")
     if body:
         return body.get_text("\n", strip=True)
 
-    # 3) 일반 네이버 뉴스 구조 (혹시 몰라서)
     body = soup.select_one("#dic_area")
     if body:
         return body.get_text("\n", strip=True)
 
-    # 그래도 못 찾으면 로그만 찍고 빈 문자열
     print(f"[CRAWL][ARTICLE] 본문 셀렉터 매치 실패: {url}")
     return ""
+
 
 async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 관리자만 사용
@@ -990,7 +971,6 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             follow_redirects=True,
         ) as client:
 
-            # 1) 다음 harmony API에서 해외축구 JSON 리스트 가져오기
             contents = await fetch_daum_worldsoccer_json(client)
 
             if not contents:
@@ -1001,7 +981,6 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # 2) JSON에서 제목 + 기사 URL 추출
             for item in contents:
-                # 가능한 키 후보들을 순서대로 시도
                 title = (
                     item.get("title")
                     or item.get("contentTitle")
@@ -1022,9 +1001,8 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 title = str(title).strip()
                 url = str(url).strip()
 
-                # 상대경로면 절대경로로
                 if url.startswith("/"):
-                    url = urllib.parse.urljoin("https://sports.daum.net", url)
+                    url = urljoin("https://sports.daum.net", url)
 
                 articles.append({"title": title, "link": url})
 
@@ -1043,7 +1021,9 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     s2 = BeautifulSoup(r2.text, "html.parser")
 
                     body_el = (
-                        s2.select_one("div#mArticle")
+                        s2.select_one("div#harmonyContainer")
+                        or s2.select_one("div#mArticle div#harmonyContainer")
+                        or s2.select_one("div#mArticle")
                         or s2.find("article")
                         or s2.body
                     )
@@ -1053,7 +1033,8 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     else:
                         body_text = ""
 
-                    art["summary"] = simple_summarize(body_text, max_chars=400)
+                    clean_text = clean_daum_body_text(body_text)
+                    art["summary"] = simple_summarize(clean_text, max_chars=400)
 
                 except Exception as e:
                     print(f"[CRAWL][DAUM] 기사 파싱 실패 ({art['link']}): {e}")
@@ -1100,6 +1081,7 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/syncsheet 로 텔레그램 메뉴를 갱신할 수 있습니다."
     )
 
+
 # 4) 인라인 버튼 콜백 처리 (분석/뉴스 팝업)
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1123,8 +1105,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_reply_markup(reply_markup=build_analysis_match_menu(key, sport))
         return
 
-    # ✅ 분석픽 – 개별 경기 선택 → 채팅창에 분석글 메시지로 보내기
-    # ✅ 분석픽 – 개별 경기 선택 → 채팅창에 분석글 메시지로 보내기
+    # 분석픽 – 개별 경기 선택 → 채팅창에 분석글 전송
     if data.startswith("match:"):
         _, key, sport, match_id = data.split(":", 3)
         items = ANALYSIS_DATA_MAP.get(key, {}).get(sport, [])
@@ -1149,9 +1130,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
         return
 
-
-    # 스포츠 뉴스 요약 루트: 뉴스 리스트
-    # 금일 스포츠 정보 루트: 뉴스 종목 선택
+    # 스포츠 뉴스 요약 루트: 뉴스 종목 선택
     if data == "news_root":
         await q.edit_message_reply_markup(reply_markup=build_news_category_menu())
         return
@@ -1162,7 +1141,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_reply_markup(reply_markup=build_news_list_menu(sport))
         return
 
-    # ✅ 뉴스 제목 클릭 → 채팅창에 요약 메시지로 보내기
+    # 뉴스 제목 클릭 → 채팅창에 요약 메시지로 보내기
     if data.startswith("news_item:"):
         try:
             _, sport, news_id = data.split(":", 2)
@@ -1194,8 +1173,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-
-
 # ───────────────── 실행부 ─────────────────
 
 def main():
@@ -1214,14 +1191,14 @@ def main():
     app.add_handler(CommandHandler("publish", publish))
 
     # 구글시트 수동 새로고침
-    app.add_handler(CommandHandler("syncsheet", syncsheet))    
-    
+    app.add_handler(CommandHandler("syncsheet", syncsheet))
+
     # 🔹 오늘 ← 내일 복사용 롤오버 명령
     app.add_handler(CommandHandler("rollover", rollover))
 
     # 🔹 해외축구 뉴스 크롤링 명령
-    app.add_handler(CommandHandler("crawlsoccer", crawlsoccer))    
-    
+    app.add_handler(CommandHandler("crawlsoccer", crawlsoccer))
+
     app.add_handler(CallbackQueryHandler(on_callback))
 
     port = int(os.environ.get("PORT", "10000"))
@@ -1235,42 +1212,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
