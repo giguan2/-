@@ -173,7 +173,7 @@ def summarize_text(text: str, max_len: int = 400) -> str:
 
 def clean_daum_body_text(text: str) -> str:
     """
-    다음 뉴스 본문에서 '음성으로 듣기', 번역/요약 UI 텍스트를 최대한 제거.
+    다음 뉴스 본문에서 번역/요약 UI, 언어 목록, 날짜+요약보기 꼬리 등을 최대한 제거.
     """
     if not text:
         return ""
@@ -184,7 +184,7 @@ def clean_daum_body_text(text: str) -> str:
         "번역 beta",                     # 번역 beta ...
         "Translated by",                # Translated by kakao ...
         "Now in translation",           # Now in translation ...
-        "요약본이 자동요약",             # 요약 안내문
+        "요약본이 자동요약",             # 요약 안내문 시작
         "기사 제목과 주요 문장을 기반으로 자동요약한 결과입니다",
     ]
     cut_pos = None
@@ -229,7 +229,42 @@ def clean_daum_body_text(text: str) -> str:
             continue
         clean_lines.append(l)
 
-    return " ".join(clean_lines)
+    text = " ".join(clean_lines)
+
+    # 3단계: "2025. 11. 24. 18:36 요약보기 자동요약" 같은 꼬리 제거
+    text = re.sub(
+        r"\d{4}\.\s*\d{2}\.\s*\d{2}\.\s*\d{2}:\d{2}\s*요약보기 자동요약",
+        "",
+        text
+    )
+
+    # 남은 공백 정리
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+def remove_title_prefix(title: str, body: str) -> str:
+    """
+    본문이 제목으로 시작하면 그 부분을 잘라낸다.
+    (제목이 그대로 summary 에 반복되는 현상 완화용)
+    """
+    if not title or not body:
+        return body
+
+    t = title.strip().strip('\"“”')
+    b = body.strip()
+
+    # 제목 앞뒤 따옴표/기호를 조금 허용해서 비교
+    candidates = [
+        t,
+        f'"{t}"',
+        f"“{t}”",
+    ]
+
+    for cand in candidates:
+        if b.startswith(cand):
+            return b[len(cand):].lstrip(" -–:·,\"'")
+
+    return b
 
 def crawl_naver_soccer(max_count: int = 5) -> list[dict]:
     """
@@ -1038,7 +1073,11 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     else:
                         body_text = ""
 
+                    # 번역/요약 UI 제거
                     clean_text = clean_daum_body_text(body_text)
+                    # 제목이 그대로 앞에 붙어 있으면 제거
+                    clean_text = remove_title_prefix(art["title"], clean_text)
+                    # 400자 정도로 잘라서 summary 생성
                     art["summary"] = simple_summarize(clean_text, max_chars=400)
 
                 except Exception as e:
@@ -1217,4 +1256,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
