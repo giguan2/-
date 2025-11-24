@@ -1044,29 +1044,34 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     r2.raise_for_status()
                     s2 = BeautifulSoup(r2.text, "html.parser")
 
+                    # ▶ 실제 본문 컨테이너 우선적으로 잡기
                     body_el = (
-                        s2.select_one("div#harmonyContainer")
-                        or s2.select_one("div#mArticle div#harmonyContainer")
-                        or s2.select_one("div#mArticle")
+                        s2.select_one("div#harmonyContainer")             # 기사 본문
+                        or s2.select_one("section#article-view-content-div")
+                        or s2.select_one("div.article_view")
+                        or s2.select_one("div#mArticle")                  # 통짜 영역(요약+본문)
                         or s2.find("article")
                         or s2.body
                     )
 
                     if body_el:
-                        body_text = body_el.get_text("\n", strip=True)
+                        raw_body = body_el.get_text("\n", strip=True)
                     else:
-                        body_text = ""
+                        raw_body = ""
 
-                    # 번역/요약 UI 제거
-                    clean_text = clean_daum_body_text(body_text)
-                    # 제목이 그대로 앞에 붙어 있으면 제거
+                    # 번역/언어 선택/요약 안내 제거
+                    clean_text = clean_daum_body_text(raw_body)
+
+                    # 본문 앞에 제목이 그대로 붙어 있으면 제거
                     clean_text = remove_title_prefix(art["title"], clean_text)
-                    # 400자 정도로 잘라서 summary 생성
+
+                    # 요약 길이 늘리고 싶으면 max_chars 를 600 정도로 올려도 됨
                     art["summary"] = simple_summarize(clean_text, max_chars=400)
 
                 except Exception as e:
                     print(f"[CRAWL][DAUM] 기사 파싱 실패 ({art['link']}): {e}")
                     art["summary"] = "(본문 크롤링 실패)"
+
 
     except Exception as e:
         await update.message.reply_text(f"요청 오류가 발생했습니다: {e}")
@@ -1240,6 +1245,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
