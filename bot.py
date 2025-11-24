@@ -802,7 +802,7 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         async with httpx.AsyncClient(
-            headers={"User-Agent": "Mozilla/5.0"},
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
             follow_redirects=True,
         ) as client:
             # 1) 리스트 페이지 요청
@@ -816,18 +816,22 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             seen = set()
 
             # ── 1단계: 뉴스 리스트에서 제목 + 링크 추출 ──
-            for a in soup.find_all("a", href=True):
-                href = a["href"]
+            # 1순위: 다음 뉴스에서 많이 쓰는 클래스
+            link_elems = soup.select("a.link_txt")
+
+            # 2순위: /v/ 를 포함한 링크 (백업용)
+            if not link_elems:
+                link_elems = soup.select("a[href*='/v/']")
+
+            for a in link_elems:
+                href = a.get("href", "").strip()
                 title = a.get_text(strip=True)
 
-                # 다음 뉴스는 v.daum.net/v/ 로 시작하는 것만 기사
-                if not href:
+                if not href or not title:
                     continue
 
-                if "v.daum.net/v/" not in href and not href.startswith("/v/"):
-                    continue
-
-                if not title or len(title) < 3:
+                # # 으로만 된 것 등은 제외
+                if href.startswith("#"):
                     continue
 
                 full_url = urljoin(base, href)
@@ -842,6 +846,9 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     break
 
             if not articles:
+                # 혹시 또 안 잡히면 HTML 앞부분 로그라도 찍어보자
+                print("[CRAWL][DAUM] 리스트에서 기사를 찾지 못했습니다.")
+                print(resp.text[:2000])
                 await update.message.reply_text("해외축구 뉴스 리스트에서 기사를 찾지 못했습니다.")
                 return
 
@@ -852,7 +859,7 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     r2.raise_for_status()
                     s2 = BeautifulSoup(r2.text, "html.parser")
 
-                    # 기사 본문
+                    # 다음 뉴스 본문 영역 추정
                     body_el = (
                         s2.select_one("div#mArticle")
                         or s2.find("article")
@@ -910,8 +917,6 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"다음스포츠 해외축구 뉴스 {len(rows_to_append)}건을 저장했습니다.\n"
         "/syncsheet 로 텔레그램 메뉴를 갱신할 수 있습니다."
     )
-
-
 
 # 4) 인라인 버튼 콜백 처리 (분석/뉴스 팝업)
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1048,6 +1053,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
