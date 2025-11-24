@@ -756,6 +756,59 @@ def simple_summarize(text: str, max_chars: int = 400) -> str:
 
     return text[:max_chars] + "..."
 
+import urllib.parse  # 파일 상단 import 부분에 추가
+
+async def fetch_daum_worldsoccer_json(client: httpx.AsyncClient) -> list[dict]:
+    """
+    다음 스포츠 해외축구 뉴스 JSON 리스트를 가져온다.
+    Daum 내부 harmony API 사용.
+    """
+    base_url = "https://sports.daum.net/media-api/harmony/contents.json"
+
+    # KST 오늘 날짜 기준으로 createDt 범위 생성
+    today_kst = get_kst_now().date()
+    ymd = today_kst.strftime("%Y%m%d")
+    create_dt = f"{ymd}000000~{ymd}235959"
+
+    # discoveryTag[0] 는 네가 캡처한 URL에서 두 번 인코딩된 값이었음.
+    # 실제 값은 {"group":"media","key":"defaultCategoryId3","value":"100032"}
+    discovery_tag_value = json.dumps({
+        "group": "media",
+        "key": "defaultCategoryId3",
+        "value": "100032",      # 해외축구 카테고리 ID
+    }, ensure_ascii=False)
+
+    params = {
+        "page": 0,
+        "consumerType": "HARMONY",
+        "status": "SERVICE",
+        "createDt": create_dt,
+        "size": 20,
+        # discoveryTag[0] 형식 그대로 사용
+        "discoveryTag[0]": discovery_tag_value,
+        # "after": ""  # 첫 페이지면 보통 없어도 됨. 필요하면 채워넣을 수 있음.
+    }
+
+    r = await client.get(base_url, params=params, timeout=10.0)
+    r.raise_for_status()
+    data = r.json()
+
+    # 방어적으로 contents 리스트를 찾아본다.
+    contents = None
+    if isinstance(data, dict):
+        contents = data.get("contents")
+        if contents is None:
+            inner = data.get("data") or data.get("result") or data.get("body")
+            if isinstance(inner, dict):
+                contents = inner.get("contents") or inner.get("list") or inner.get("items")
+    elif isinstance(data, list):
+        contents = data
+
+    if not contents:
+        print("[CRAWL][DAUM] JSON 구조를 파악하지 못했습니다. 최상위 키:", list(data.keys()) if isinstance(data, dict) else type(data))
+        return []
+
+    return contents
 
 async def fetch_article_body(client: httpx.AsyncClient, url: str) -> str:
     """
@@ -798,68 +851,64 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("다음스포츠 해외축구 뉴스를 크롤링합니다. 잠시만 기다려 주세요...")
 
-    list_url = "https://sports.daum.net/worldsoccer/news"
-
     try:
         async with httpx.AsyncClient(
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            headers={"User-Agent": "Mozilla/5.0"},
             follow_redirects=True,
         ) as client:
-            # 1) 리스트 페이지 요청
-            resp = await client.get(list_url, timeout=10.0)
-            resp.raise_for_status()
 
-            soup = BeautifulSoup(resp.text, "html.parser")
-            base = str(resp.url)
+            # 1) 다음 harmony API에서 해외축구 JSON 리스트 가져오기
+            contents = await fetch_daum_worldsoccer_json(client)
+
+            if not contents:
+                await update.message.reply_text("해외축구 JSON 데이터에서 기사를 찾지 못했습니다.")
+                return
 
             articles = []
-            seen = set()
 
-            # ── 1단계: 뉴스 리스트에서 제목 + 링크 추출 ──
-            # 1순위: 다음 뉴스에서 많이 쓰는 클래스
-            link_elems = soup.select("a.link_txt")
+            # 2) JSON에서 제목 + 기사 URL 추출
+            for item in contents:
+                # 가능한 키 후보들을 순서대로 시도
+                title = (
+                    item.get("title")
+                    or item.get("contentTitle")
+                    or item.get("headline")
+                    or item.get("name")
+                )
 
-            # 2순위: /v/ 를 포함한 링크 (백업용)
-            if not link_elems:
-                link_elems = soup.select("a[href*='/v/']")
+                url = (
+                    item.get("contentUrl")
+                    or item.get("permalink")
+                    or item.get("url")
+                    or item.get("link")
+                )
 
-            for a in link_elems:
-                href = a.get("href", "").strip()
-                title = a.get_text(strip=True)
-
-                if not href or not title:
+                if not title or not url:
                     continue
 
-                # # 으로만 된 것 등은 제외
-                if href.startswith("#"):
-                    continue
+                title = str(title).strip()
+                url = str(url).strip()
 
-                full_url = urljoin(base, href)
+                # 상대경로면 절대경로로
+                if url.startswith("/"):
+                    url = urllib.parse.urljoin("https://sports.daum.net", url)
 
-                if full_url in seen:
-                    continue
-                seen.add(full_url)
-
-                articles.append({"title": title, "link": full_url})
+                articles.append({"title": title, "link": url})
 
                 if len(articles) >= 10:
                     break
 
             if not articles:
-                # 혹시 또 안 잡히면 HTML 앞부분 로그라도 찍어보자
-                print("[CRAWL][DAUM] 리스트에서 기사를 찾지 못했습니다.")
-                print(resp.text[:2000])
-                await update.message.reply_text("해외축구 뉴스 리스트에서 기사를 찾지 못했습니다.")
+                await update.message.reply_text("JSON은 받았지만, 제목/URL 정보를 찾지 못했습니다.")
                 return
 
-            # ── 2단계: 각 기사 상세 페이지 크롤링 ──
+            # 3) 각 기사 페이지 들어가서 본문 크롤링 + 요약
             for art in articles:
                 try:
                     r2 = await client.get(art["link"], timeout=10.0)
                     r2.raise_for_status()
                     s2 = BeautifulSoup(r2.text, "html.parser")
 
-                    # 다음 뉴스 본문 영역 추정
                     body_el = (
                         s2.select_one("div#mArticle")
                         or s2.find("article")
@@ -881,7 +930,7 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"요청 오류가 발생했습니다: {e}")
         return
 
-    # ── 3) 구글 시트 저장 ──
+    # 4) 구글 시트 저장
     client_gs = get_gs_client()
     spreadsheet_id = os.getenv("SPREADSHEET_ID")
 
@@ -901,10 +950,10 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows_to_append = []
     for art in articles:
         rows_to_append.append([
-            "축구",
-            "",
-            art["title"],
-            art["summary"],
+            "축구",          # sport
+            "",             # id (비워두면 나중에 자동 생성)
+            art["title"],   # title
+            art["summary"], # summary
         ])
 
     try:
@@ -1053,6 +1102,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
