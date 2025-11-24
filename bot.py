@@ -735,6 +735,61 @@ async def rollover(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "이제 오늘 경기 분석은 'today' 탭에서, 내일 경기는 'tomorrow' 탭에서 작성하면 돼."
     )
 
+def simple_summarize(text: str, max_chars: int = 400) -> str:
+    """
+    아주 단순 요약: 문장 사이 공백 정리 후,
+    max_chars 안쪽에서 '다.' 기준으로 잘라서 반환.
+    """
+    if not text:
+        return ""
+
+    # 공백 정리
+    text = re.sub(r"\s+", " ", text).strip()
+
+    if len(text) <= max_chars:
+        return text
+
+    # '다.' 기준으로 적당히 끊기
+    cut = text.rfind("다.", 0, max_chars)
+    if cut != -1:
+        return text[: cut + 2]
+
+    return text[:max_chars] + "..."
+
+
+async def fetch_article_body(client: httpx.AsyncClient, url: str) -> str:
+    """
+    네이버 뉴스 상세 페이지에서 본문 텍스트만 추출.
+    (모바일/PC 둘 다 시도)
+    """
+    try:
+        r = await client.get(url, timeout=10.0, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+    except Exception as e:
+        print(f"[CRAWL][ARTICLE] 요청 실패: {url} / {e}")
+        return ""
+
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    # 1) 모바일 스포츠 뉴스 (m.sports.naver.com) 쪽 구조
+    body = soup.select_one("#newsEndContents")
+    if body:
+        return body.get_text("\n", strip=True)
+
+    # 2) PC 스포츠 뉴스 (sports.news.naver.com) 쪽 구조
+    body = soup.select_one("#newsEndBody")
+    if body:
+        return body.get_text("\n", strip=True)
+
+    # 3) 일반 네이버 뉴스 구조 (혹시 몰라서)
+    body = soup.select_one("#dic_area")
+    if body:
+        return body.get_text("\n", strip=True)
+
+    # 그래도 못 찾으면 로그만 찍고 빈 문자열
+    print(f"[CRAWL][ARTICLE] 본문 셀렉터 매치 실패: {url}")
+    return ""
+
 async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 관리자만 사용
     if not is_admin(update):
@@ -743,58 +798,66 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("축구 뉴스를 크롤링합니다. 잠시만 기다려 주세요...")
 
-    # 네이버가 302로 보내는 PC 버전 대신, 바로 모바일 버전 사용
-    url = "https://m.sports.naver.com/wfootball/news"
+    # 네이버 해외축구 뉴스 (모바일)
+    list_url = "https://m.sports.naver.com/wfootball/news"
 
-    # 1) 네이버 페이지 가져오기 (리다이렉트 자동 처리)
     try:
         async with httpx.AsyncClient(
             headers={"User-Agent": "Mozilla/5.0"},
             follow_redirects=True,
         ) as client:
-            resp = await client.get(url, timeout=10.0)
-        resp.raise_for_status()
+            # 1) 리스트 페이지 가져오기
+            resp = await client.get(list_url, timeout=10.0)
+            resp.raise_for_status()
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+            base = str(resp.url)
+
+            articles = []
+            seen = set()
+
+            # ── 1단계: 리스트에서 제목 + 링크 뽑기 ──
+            # 모바일 구조가 React라서 정확한 클래스는 바뀔 수 있음.
+            # 우선 a 태그 중에서 "news"를 포함하는 링크만 필터링.
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                title = a.get_text(strip=True)
+
+                if "news" not in href:
+                    continue
+                if not title:
+                    continue
+
+                full_url = urljoin(base, href)
+
+                if full_url in seen:
+                    continue
+                seen.add(full_url)
+
+                articles.append({"title": title, "link": full_url})
+
+                if len(articles) >= 10:
+                    break
+
+            if not articles:
+                # 리스트 HTML 구조를 한 번 확인할 수 있게 로그 출력
+                print("[CRAWL][SOCCER] HTML snippet:\n", resp.text[:2000])
+                await update.message.reply_text(
+                    "크롤링 결과가 없습니다.\n"
+                    "리스트 페이지 구조가 JS로만 그려지는 것 같아. 나중에 셀렉터를 다시 잡아봐야 해."
+                )
+                return
+
+            # ── 2단계: 각 기사 상세 페이지에 들어가서 본문 크롤링 ──
+            for art in articles:
+                body_text = await fetch_article_body(client, art["link"])
+                if not body_text:
+                    art["summary"] = "(본문을 불러오지 못했습니다)"
+                else:
+                    art["summary"] = simple_summarize(body_text)
+
     except Exception as e:
         await update.message.reply_text(f"요청 오류가 발생했습니다: {e}")
-        return
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    base = str(resp.url)
-
-    # 2) 기사 링크 뽑기 (href 패턴으로 필터링)
-    articles = []
-    seen = set()
-
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        text = a.get_text(strip=True)
-
-        # 해외축구 뉴스 링크 대충 필터링
-        # (모바일 페이지에서 뉴스 상세는 보통 news.naver.com / sports.news.naver.com 로 넘어감)
-        if "news" not in href:
-            continue
-        if not text:
-            continue
-
-        full_url = urljoin(base, href)
-
-        if full_url in seen:
-            continue
-        seen.add(full_url)
-
-        articles.append({"title": text, "link": full_url})
-
-        # 테스트라 10개만
-        if len(articles) >= 10:
-            break
-
-    if not articles:
-        # Render 로그에서 HTML 일부 확인할 수 있게 찍어두기
-        print("[CRAWL][SOCCER] HTML snippet:\n", resp.text[:2000])
-        await update.message.reply_text(
-            "크롤링 결과가 없습니다.\n"
-            "모바일 페이지 구조가 바뀐 것 같아. Render 로그의 [CRAWL][SOCCER] HTML을 보고 다시 셀렉터를 잡아야 해."
-        )
         return
 
     # 3) 구글 시트 열기
@@ -819,10 +882,12 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # news 탭 구조: sport | id | title | summary
     rows_to_append = []
     for art in articles:
-        title = art["title"]
-        link = art["link"]
-        # 일단 summary엔 링크만 넣어두고, 시트에서 네가 편집해도 되고
-        rows_to_append.append(["축구", "", title, link])
+        rows_to_append.append([
+            "축구",           # sport
+            "",              # id (비워두면 나중에 자동 생성)
+            art["title"],    # title
+            art["summary"],  # summary = 기사 요약
+        ])
 
     try:
         ws.append_rows(rows_to_append, value_input_option="RAW")
@@ -971,6 +1036,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
