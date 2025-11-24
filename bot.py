@@ -798,12 +798,12 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("축구 뉴스를 크롤링합니다. 잠시만 기다려 주세요...")
 
-    # 네이버 해외축구 뉴스 (모바일)
-    list_url = "https://m.sports.naver.com/wfootball/news"
+    # ✅ PC 버전 네이버 해외축구 뉴스 리스트 URL 사용
+    list_url = "https://sports.news.naver.com/wfootball/news/index?isphoto=N"
 
     try:
         async with httpx.AsyncClient(
-            headers={"User-Agent": "Mozilla/5.0"},
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
             follow_redirects=True,
         ) as client:
             # 1) 리스트 페이지 가져오기
@@ -811,44 +811,46 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             resp.raise_for_status()
 
             soup = BeautifulSoup(resp.text, "html.parser")
-            base = str(resp.url)
 
             articles = []
-            seen = set()
 
-            # ── 1단계: 리스트에서 제목 + 링크 뽑기 ──
-            # 모바일 구조가 React라서 정확한 클래스는 바뀔 수 있음.
-            # 우선 a 태그 중에서 "news"를 포함하는 링크만 필터링.
-            for a in soup.find_all("a", href=True):
-                href = a["href"]
+            # ── 1단계: 리스트에서 제목 + 링크 뽑기 (PC 네이버 스포츠 구조) ──
+            # 예전 sync 함수에서 사용한 것과 동일한 셀렉터
+            link_elems = soup.select("div#_newsList a.title")
+
+            for a in link_elems:
+                href = a.get("href", "").strip()
                 title = a.get_text(strip=True)
 
-                if "news" not in href:
-                    continue
-                if not title:
+                if not href or not title:
                     continue
 
-                full_url = urljoin(base, href)
+                # 상대경로 처리
+                if href.startswith("/"):
+                    href = "https://sports.news.naver.com" + href
 
-                if full_url in seen:
-                    continue
-                seen.add(full_url)
+                articles.append(
+                    {
+                        "title": title,
+                        "link": href,
+                    }
+                )
 
-                articles.append({"title": title, "link": full_url})
-
+                # 너무 많이 가져올 필요 없으면 상위 10개 정도만
                 if len(articles) >= 10:
                     break
 
             if not articles:
-                # 리스트 HTML 구조를 한 번 확인할 수 있게 로그 출력
+                # 디버깅용으로 앞부분 로그 찍어볼 수 있음
+                print("[CRAWL][SOCCER] 리스트에서 기사를 찾지 못했습니다.")
                 print("[CRAWL][SOCCER] HTML snippet:\n", resp.text[:2000])
                 await update.message.reply_text(
-                    "크롤링 결과가 없습니다.\n"
-                    "리스트 페이지 구조가 JS로만 그려지는 것 같아. 나중에 셀렉터를 다시 잡아봐야 해."
+                    "축구 뉴스 리스트에서 기사를 찾지 못했습니다.\n"
+                    "네이버 스포츠 페이지 구조가 바뀐 것 같으니, div#_newsList a.title 셀렉터를 다시 확인해봐야 합니다."
                 )
                 return
 
-            # ── 2단계: 각 기사 상세 페이지에 들어가서 본문 크롤링 ──
+            # ── 2단계: 각 기사 상세 페이지에 들어가서 본문 크롤링 + 요약 ──
             for art in articles:
                 body_text = await fetch_article_body(client, art["link"])
                 if not body_text:
@@ -882,12 +884,14 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # news 탭 구조: sport | id | title | summary
     rows_to_append = []
     for art in articles:
-        rows_to_append.append([
-            "축구",           # sport
-            "",              # id (비워두면 나중에 자동 생성)
-            art["title"],    # title
-            art["summary"],  # summary = 기사 요약
-        ])
+        rows_to_append.append(
+            [
+                "축구",            # sport
+                "",               # id (비워두면 나중에 자동 생성)
+                art["title"],     # title
+                art["summary"],   # summary = 기사 요약
+            ]
+        )
 
     try:
         ws.append_rows(rows_to_append, value_input_option="RAW")
@@ -896,7 +900,7 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        f"축구 뉴스 {len(rows_to_append)}건을 'news' 탭에 추가했습니다.\n"
+        f"축구 뉴스 {len(rows_to_append)}건을 '{sheet_news_name}' 탭에 추가했습니다.\n"
         "구글시트에서 내용 확인하고, 텔레그램 메뉴에 반영하려면 /syncsheet 명령을 실행하면 돼."
     )
 
@@ -1036,6 +1040,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
