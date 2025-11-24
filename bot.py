@@ -173,32 +173,16 @@ def summarize_text(text: str, max_len: int = 400) -> str:
 
 def clean_daum_body_text(text: str) -> str:
     """
-    다음 뉴스 본문에서 번역/요약 UI, 언어 목록, 날짜+요약보기 꼬리 등을 최대한 제거.
+    다음 뉴스 본문에서 번역/요약 UI, 언어 목록, '요약보기 자동요약' 꼬리 등을 제거하고
+    기사 본문만 최대한 남긴다.
     """
     if not text:
         return ""
 
-    # 1단계: 번역/요약/언어선택 블록이 시작되기 전까지만 사용
-    cut_keywords = [
-        "번역 설정",                      # 번역 설정 ...
-        "번역 beta",                     # 번역 beta ...
-        "Translated by",                # Translated by kakao ...
-        "Now in translation",           # Now in translation ...
-        "요약본이 자동요약",             # 요약 안내문 시작
-        "기사 제목과 주요 문장을 기반으로 자동요약한 결과입니다",
-    ]
-    cut_pos = None
-    for kw in cut_keywords:
-        idx = text.find(kw)
-        if idx != -1:
-            if cut_pos is None or idx < cut_pos:
-                cut_pos = idx
-
-    if cut_pos is not None:
-        text = text[:cut_pos]
-
-    # 2단계: 줄 단위로 나눈 뒤 언어 목록 등 불필요한 줄 제거
+    # 1단계: 줄 단위로 나누고, 빈 줄 제거
     lines = [l.strip() for l in text.splitlines() if l.strip()]
+
+    # 줄 전체를 날려야 하는 패턴들
     blacklist = [
         "음성으로 듣기",
         "음성 재생",
@@ -208,6 +192,8 @@ def clean_daum_body_text(text: str) -> str:
         "Translated by",
         "전체 맥락을 이해하기 위해서는 본문 보기를 권장합니다.",
         "요약문이므로 일부 내용이 생략될 수 있습니다.",
+        "요약본이 자동요약 기사 제목과 주요 문장을 기반으로 자동요약한 결과입니다",
+        "기사 제목과 주요 문장을 기반으로 자동요약한 결과입니다",
         # 언어 목록 키워드
         "한국어 - English",
         "한국어 - 영어",
@@ -231,15 +217,13 @@ def clean_daum_body_text(text: str) -> str:
 
     text = " ".join(clean_lines)
 
-    # 3단계: "2025. 11. 24. 18:36 요약보기 자동요약" 같은 꼬리 제거
-    text = re.sub(
-        r"\d{4}\.\s*\d{2}\.\s*\d{2}\.\s*\d{2}:\d{2}\s*요약보기 자동요약",
-        "",
-        text
-    )
+    # 2단계: 한 줄 안에 붙어 있는 '요약보기 자동요약' 꼬리 제거
+    # 예) "... 기자 2025. 11. 24. 18:36 요약보기 자동요약 ..."
+    text = re.sub(r"요약보기\s*자동요약.*$", "", text)
 
-    # 남은 공백 정리
+    # 3단계: 공백 정리
     text = re.sub(r"\s+", " ", text).strip()
+
     return text
 
 def remove_title_prefix(title: str, body: str) -> str:
@@ -1256,5 +1240,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
