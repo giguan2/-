@@ -108,12 +108,24 @@ ANALYSIS_DATA_MAP = {
     "tomorrow": ANALYSIS_TOMORROW,
 }
 
-# ───────────────── 구글 시트 연동 설정 ─────────────────
+# ───────────────── 다음 스포츠 카테고리 ID 설정 ─────────────────
+# DevTools > Network 에서 harmony contents.json 요청 확인 후
+# defaultCategoryId3 의 value 를 환경변수에 세팅.
+DAUM_CATEGORY_IDS = {
+    # 해외축구 (기본값 100032)
+    "world_soccer": os.getenv("DAUM_CAT_WORLD_SOCCER", "100032"),
 
-# GOOGLE_SERVICE_KEY  : 서비스계정 JSON 전체 (Render 환경변수)
-# SPREADSHEET_ID      : 구글시트 ID (환경변수)
-# SHEET_TODAY_NAME    : 오늘 탭 이름 (기본값 "today")
-# SHEET_TOMORROW_NAME : 내일 탭 이름 (기본값 "tomorrow")
+    # ⚽ 국내축구 (K리그 등) – DevTools로 찾은 ID를 환경변수에 세팅
+    "soccer_kleague": os.getenv("DAUM_CAT_SOCCER_KLEAGUE", ""),
+
+    # 아래 값들은 직접 찾은 후 환경변수에 넣어야 동작함.
+    "baseball_kbo": os.getenv("DAUM_CAT_BASEBALL_KBO", ""),
+    "baseball_world": os.getenv("DAUM_CAT_BASEBALL_WORLD", ""),
+    "basketball": os.getenv("DAUM_CAT_BASKETBALL", ""),
+    "volleyball": os.getenv("DAUM_CAT_VOLLEYBALL", ""),
+}
+
+# ───────────────── 구글 시트 연동 설정 ─────────────────
 
 _gs_client = None  # gspread 클라이언트 캐시용
 
@@ -165,7 +177,6 @@ def summarize_text(text: str, max_len: int = 400) -> str:
         if len(candidate) > max_len:
             break
         result = candidate
-    # 너무 짧으면 그냥 원문 한 번 더 잘라줌
     if not result:
         result = text[:max_len]
     return result
@@ -226,6 +237,7 @@ def clean_daum_body_text(text: str) -> str:
 
     return text
 
+
 def remove_title_prefix(title: str, body: str) -> str:
     """
     본문이 제목으로 시작하면 그 부분을 잘라낸다.
@@ -237,7 +249,6 @@ def remove_title_prefix(title: str, body: str) -> str:
     t = title.strip().strip('\"“”')
     b = body.strip()
 
-    # 제목 앞뒤 따옴표/기호를 조금 허용해서 비교
     candidates = [
         t,
         f'"{t}"',
@@ -249,154 +260,6 @@ def remove_title_prefix(title: str, body: str) -> str:
             return b[len(cand):].lstrip(" -–:·,\"'")
 
     return b
-
-def crawl_naver_soccer(max_count: int = 5) -> list[dict]:
-    """
-    (다음 스포츠 해외축구) 최신 뉴스 일부를 크롤링해서
-    [ {title, summary, url}, ... ] 리스트로 반환
-    """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-    }
-
-    articles: list[dict] = []
-
-    # ── 1) 다음 harmony JSON API에서 해외축구 리스트 가져오기 ──
-    base_url = "https://sports.daum.net/media-api/harmony/contents.json"
-
-    # 한국 시간 기준 오늘 날짜
-    today_kst = get_kst_now().date()
-    ymd = today_kst.strftime("%Y%m%d")
-    create_dt = f"{ymd}000000~{ymd}235959"
-
-    # discoveryTag[0] 값 (해외축구 카테고리 ID: 100032)
-    discovery_tag_value = json.dumps(
-        {
-            "group": "media",
-            "key": "defaultCategoryId3",
-            "value": "100032",
-        },
-        ensure_ascii=False,
-    )
-
-    params = {
-        "page": 0,
-        "consumerType": "HARMONY",
-        "status": "SERVICE",
-        "createDt": create_dt,
-        "size": max_count if max_count > 0 else 5,
-        "discoveryTag[0]": discovery_tag_value,
-    }
-
-    try:
-        resp = requests.get(base_url, headers=headers, params=params, timeout=10)
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"[CRAWLER] 다음 harmony API 요청 실패: {e}")
-        return articles
-
-    try:
-        data = resp.json()
-    except Exception as e:
-        print(f"[CRAWLER] JSON 파싱 실패: {e}")
-        return articles
-
-    # contents 리스트 찾기 (구조 변화에 대비한 방어 코드)
-    contents = None
-    if isinstance(data, dict):
-        contents = data.get("contents")
-        if contents is None:
-            inner = data.get("data") or data.get("result") or data.get("body")
-            if isinstance(inner, dict):
-                contents = inner.get("contents") or inner.get("list") or inner.get("items")
-    elif isinstance(data, list):
-        contents = data
-
-    if not contents:
-        print(
-            "[CRAWLER] JSON에서 contents 리스트를 찾지 못했습니다.",
-            f"type={type(data)}, keys={list(data.keys()) if isinstance(data, dict) else 'N/A'}",
-        )
-        return articles
-
-    # ── 2) JSON에서 제목 + 링크 추출 ──
-    link_items: list[dict] = []
-    for item in contents:
-        if not isinstance(item, dict):
-            continue
-
-        title = (
-            item.get("title")
-            or item.get("contentTitle")
-            or item.get("headline")
-            or item.get("name")
-        )
-
-        url = (
-            item.get("contentUrl")
-            or item.get("permalink")
-            or item.get("url")
-            or item.get("link")
-        )
-
-        if not title or not url:
-            continue
-
-        title = str(title).strip()
-        url = str(url).strip()
-
-        # 상대경로면 절대경로로 변환
-        if url.startswith("/"):
-            url = urljoin("https://sports.daum.net", url)
-
-        link_items.append({"title": title, "url": url})
-
-        if len(link_items) >= max_count:
-            break
-
-    if not link_items:
-        print("[CRAWLER] 제목/URL 추출 실패 (contents 구조 변경 가능성)")
-        return articles
-
-    # ── 3) 각 기사 페이지에서 본문 긁고 요약 ──
-    for it in link_items:
-        link = it["url"]
-        title = it["title"]
-
-        try:
-            resp2 = requests.get(link, headers=headers, timeout=10)
-            resp2.raise_for_status()
-            s2 = BeautifulSoup(resp2.text, "html.parser")
-
-            body_el = (
-                s2.select_one("div#harmonyContainer")
-                or s2.select_one("div#mArticle div#harmonyContainer")
-                or s2.select_one("div#mArticle")
-                or s2.find("article")
-                or s2.body
-            )
-
-            if not body_el:
-                print(f"[CRAWLER] 본문 태그 못 찾음: {link}")
-                continue
-
-            raw_body_text = body_el.get_text("\n", strip=True)
-            clean_body_text = clean_daum_body_text(raw_body_text)
-            summary = summarize_text(clean_body_text, max_len=400)
-
-            articles.append(
-                {
-                    "title": title,
-                    "summary": summary,
-                    "url": link,
-                }
-            )
-
-        except Exception as e:
-            print(f"[CRAWLER] 기사 파싱 실패 ({link}): {e}")
-            continue
-
-    return articles
 
 
 def _load_analysis_sheet(sh, sheet_name: str) -> dict:
@@ -420,9 +283,7 @@ def _load_analysis_sheet(sh, sheet_name: str) -> dict:
     if not rows:
         return {}
 
-    # 헤더 파싱 (첫 행)
     header = rows[0]
-    # 기본 인덱스
     idx_sport = 0
     idx_id = 1
     idx_title = 2
@@ -434,7 +295,6 @@ def _load_analysis_sheet(sh, sheet_name: str) -> dict:
         except ValueError:
             return default
 
-    # 헤더에 'sport', 'id', 'title', 'summary' 글자가 있으면 그 위치 사용
     idx_sport = safe_index("sport", idx_sport)
     idx_id = safe_index("id", idx_id)
     idx_title = safe_index("title", idx_title)
@@ -442,7 +302,7 @@ def _load_analysis_sheet(sh, sheet_name: str) -> dict:
 
     data: dict[str, list[dict]] = {}
 
-    for row in rows[1:]:  # 데이터 행
+    for row in rows[1:]:
         if len(row) <= idx_title:
             continue
 
@@ -457,7 +317,6 @@ def _load_analysis_sheet(sh, sheet_name: str) -> dict:
         if not title:
             continue
 
-        # id 없으면 자동 생성
         if not item_id:
             cur_len = len(data.get(sport, []))
             item_id = f"{sport}_{cur_len + 1}"
@@ -543,13 +402,11 @@ def _load_news_sheet(sh, sheet_name: str) -> dict:
 
     header = rows[0]
 
-    # 기본 index
     idx_sport = 0
     idx_id = 1
     idx_title = 2
     idx_summary = 3
 
-    # 헤더 기반 동적 매칭
     def safe_index(name, default):
         try:
             return header.index(name)
@@ -578,7 +435,6 @@ def _load_news_sheet(sh, sheet_name: str) -> dict:
         if not title:
             continue
 
-        # id 비어 있으면 자동 생성
         if not item_id:
             cur_len = len(data.get(sport, []))
             item_id = f"{sport}_news_{cur_len + 1}"
@@ -738,7 +594,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     today_str, tomorrow_str = get_date_labels()
 
-    # 오늘 분석 버튼
     if mode == "today":
         await update.message.reply_text(
             f"{today_str} 경기 분석픽 메뉴입니다. 종목을 선택하세요 👇",
@@ -746,7 +601,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # 내일 분석 버튼
     if mode == "tomorrow":
         await update.message.reply_text(
             f"{tomorrow_str} 경기 분석픽 메뉴입니다. 종목을 선택하세요 👇",
@@ -761,7 +615,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # 그 외: DM에서 전체 레이아웃 미리보기
     await update.message.reply_text(
         "스포츠봇입니다.\n"
         "아래에는 채널에 올라갈 메뉴와 동일한 레이아웃 미리보기를 보여줄게.\n"
@@ -801,16 +654,13 @@ async def publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("CHANNEL_ID가 비어 있습니다. Render 환경변수에 CHANNEL_ID를 설정하세요.")
         return
 
-    # 기존 고정 메시지 해제 (선택)
     try:
         await context.bot.unpin_all_chat_messages(CHANNEL_ID)
     except Exception:
         pass
 
-    # 채널에 DM과 동일한 메뉴 전송
     msg = await send_main_menu(CHANNEL_ID, context, preview=False)
 
-    # 방금 보낸 메뉴 메시지 상단 고정
     await context.bot.pin_chat_message(
         chat_id=CHANNEL_ID,
         message_id=msg.message_id,
@@ -853,15 +703,12 @@ async def rollover(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ws_today = sh.worksheet(sheet_today_name)
             ws_tomorrow = sh.worksheet(sheet_tomorrow_name)
 
-            # tomorrow 탭 전체 데이터 가져오기
             rows = ws_tomorrow.get_all_values()
 
             if rows:
-                # 1-1) today 탭을 tomorrow 내용으로 통째로 덮어쓰기
                 ws_today.clear()
                 ws_today.update("A1", rows)
 
-                # 1-2) tomorrow 탭은 헤더만 남기고 비우기
                 header = rows[0]
                 ws_tomorrow.clear()
                 ws_tomorrow.update("A1", [header])
@@ -904,11 +751,16 @@ def simple_summarize(text: str, max_chars: int = 400) -> str:
     return text[:max_chars] + "..."
 
 
-async def fetch_daum_worldsoccer_json(client: httpx.AsyncClient) -> list[dict]:
+# ───────────────── Daum harmony API 공통 함수 ─────────────────
+
+async def fetch_daum_news_json(client: httpx.AsyncClient, category_id: str, size: int = 20) -> list[dict]:
     """
-    다음 스포츠 해외축구 뉴스 JSON 리스트를 가져온다.
-    Daum 내부 harmony API 사용.
+    다음 스포츠 harmony API에서 특정 카테고리 ID의 뉴스 JSON 리스트를 가져온다.
+    (해외축구, KBO, 해외야구, 농구, 배구 공통)
     """
+    if not category_id:
+        return []
+
     base_url = "https://sports.daum.net/media-api/harmony/contents.json"
 
     today_kst = get_kst_now().date()
@@ -918,7 +770,7 @@ async def fetch_daum_worldsoccer_json(client: httpx.AsyncClient) -> list[dict]:
     discovery_tag_value = json.dumps({
         "group": "media",
         "key": "defaultCategoryId3",
-        "value": "100032",      # 해외축구 카테고리 ID
+        "value": str(category_id),
     }, ensure_ascii=False)
 
     params = {
@@ -926,7 +778,7 @@ async def fetch_daum_worldsoccer_json(client: httpx.AsyncClient) -> list[dict]:
         "consumerType": "HARMONY",
         "status": "SERVICE",
         "createDt": create_dt,
-        "size": 20,
+        "size": size,
         "discoveryTag[0]": discovery_tag_value,
     }
 
@@ -945,7 +797,8 @@ async def fetch_daum_worldsoccer_json(client: httpx.AsyncClient) -> list[dict]:
         contents = data
 
     if not contents:
-        print("[CRAWL][DAUM] JSON 구조를 파악하지 못했습니다. 최상위 키:", list(data.keys()) if isinstance(data, dict) else type(data))
+        print("[CRAWL][DAUM] JSON 구조를 파악하지 못했습니다. 최상위 키:",
+              list(data.keys()) if isinstance(data, dict) else type(data))
         return []
 
     return contents
@@ -981,30 +834,51 @@ async def fetch_article_body(client: httpx.AsyncClient, url: str) -> str:
     return ""
 
 
-async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # 관리자만 사용
+async def crawl_daum_news_common(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    category_id: str,
+    sport_label: str,
+    max_articles: int = 10,
+):
+    """
+    Daum harmony API + HTML 본문을 이용해 뉴스 크롤링 후
+    구글시트 news 탭에 저장하는 공통 함수.
+    """
     if not is_admin(update):
         await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
         return
 
-    await update.message.reply_text("다음스포츠 해외축구 뉴스를 크롤링합니다. 잠시만 기다려 주세요...")
+    if not category_id:
+        await update.message.reply_text(
+            f"{sport_label} 카테고리 ID가 설정되어 있지 않습니다.\n"
+            "코드 상단 DAUM_CATEGORY_IDS 또는 환경변수를 확인해 주세요."
+        )
+        return
+
+    await update.message.reply_text(
+        f"다음스포츠 {sport_label} 뉴스를 크롤링합니다. 잠시만 기다려 주세요..."
+    )
 
     try:
         async with httpx.AsyncClient(
             headers={"User-Agent": "Mozilla/5.0"},
             follow_redirects=True,
         ) as client:
-
-            contents = await fetch_daum_worldsoccer_json(client)
+            contents = await fetch_daum_news_json(client, category_id, size=max_articles)
 
             if not contents:
-                await update.message.reply_text("해외축구 JSON 데이터에서 기사를 찾지 못했습니다.")
+                await update.message.reply_text(f"{sport_label} JSON 데이터에서 기사를 찾지 못했습니다.")
                 return
 
-            articles = []
+            articles: list[dict] = []
 
-            # 2) JSON에서 제목 + 기사 URL 추출
+            # 1) JSON에서 제목 + 기사 URL 추출
             for item in contents:
+                if not isinstance(item, dict):
+                    continue
+
                 title = (
                     item.get("title")
                     or item.get("contentTitle")
@@ -1030,26 +904,27 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 articles.append({"title": title, "link": url})
 
-                if len(articles) >= 10:
+                if len(articles) >= max_articles:
                     break
 
             if not articles:
-                await update.message.reply_text("JSON은 받았지만, 제목/URL 정보를 찾지 못했습니다.")
+                await update.message.reply_text(
+                    f"JSON은 받았지만, {sport_label} 제목/URL 정보를 찾지 못했습니다."
+                )
                 return
 
-            # 3) 각 기사 페이지 들어가서 본문 크롤링 + 요약
+            # 2) 각 기사 페이지 들어가서 본문 크롤링 + 요약
             for art in articles:
                 try:
                     r2 = await client.get(art["link"], timeout=10.0)
                     r2.raise_for_status()
                     s2 = BeautifulSoup(r2.text, "html.parser")
 
-                    # ▶ 실제 본문 컨테이너 우선적으로 잡기
                     body_el = (
-                        s2.select_one("div#harmonyContainer")             # 기사 본문
+                        s2.select_one("div#harmonyContainer")
                         or s2.select_one("section#article-view-content-div")
                         or s2.select_one("div.article_view")
-                        or s2.select_one("div#mArticle")                  # 통짜 영역(요약+본문)
+                        or s2.select_one("div#mArticle")
                         or s2.find("article")
                         or s2.body
                     )
@@ -1059,25 +934,20 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     else:
                         raw_body = ""
 
-                    # 번역/언어 선택/요약 안내 제거
                     clean_text = clean_daum_body_text(raw_body)
-
-                    # 본문 앞에 제목이 그대로 붙어 있으면 제거
                     clean_text = remove_title_prefix(art["title"], clean_text)
 
-                    # 요약 길이 늘리고 싶으면 max_chars 를 600 정도로 올려도 됨
                     art["summary"] = simple_summarize(clean_text, max_chars=400)
 
                 except Exception as e:
                     print(f"[CRAWL][DAUM] 기사 파싱 실패 ({art['link']}): {e}")
                     art["summary"] = "(본문 크롤링 실패)"
 
-
     except Exception as e:
         await update.message.reply_text(f"요청 오류가 발생했습니다: {e}")
         return
 
-    # 4) 구글 시트 저장
+    # 3) 구글 시트 저장
     client_gs = get_gs_client()
     spreadsheet_id = os.getenv("SPREADSHEET_ID")
 
@@ -1097,10 +967,10 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows_to_append = []
     for art in articles:
         rows_to_append.append([
-            "축구",          # sport
-            "",             # id (비워두면 나중에 자동 생성)
-            art["title"],   # title
-            art["summary"], # summary
+            sport_label,      # sport
+            "",               # id
+            art["title"],     # title
+            art["summary"],   # summary
         ])
 
     try:
@@ -1110,8 +980,77 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        f"다음스포츠 해외축구 뉴스 {len(rows_to_append)}건을 저장했습니다.\n"
+        f"다음스포츠 {sport_label} 뉴스 {len(rows_to_append)}건을 저장했습니다.\n"
         "/syncsheet 로 텔레그램 메뉴를 갱신할 수 있습니다."
+    )
+
+
+# ───────────────── 종목별 크롤링 명령어 ─────────────────
+
+# 해외축구
+async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cat_id = DAUM_CATEGORY_IDS.get("world_soccer")
+    await crawl_daum_news_common(
+        update,
+        context,
+        category_id=cat_id,
+        sport_label="축구",
+        max_articles=5,
+    )
+
+# 국내축구 (K리그 등, 5개)
+async def crawlsoccerkr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cat_id = DAUM_CATEGORY_IDS.get("soccer_kleague")
+    await crawl_daum_news_common(
+        update,
+        context,
+        category_id=cat_id,
+        sport_label="축구",   # 똑같이 '축구'로 저장 → 해외/국내 섞여서 뜸
+        max_articles=5,
+    )
+
+# KBO 야구
+async def crawlbaseball(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cat_id = DAUM_CATEGORY_IDS.get("baseball_kbo")
+    await crawl_daum_news_common(
+        update,
+        context,
+        category_id=cat_id,
+        sport_label="야구",
+        max_articles=5,
+    )
+
+# 해외야구 (MLB 등)
+async def crawloverbaseball(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cat_id = DAUM_CATEGORY_IDS.get("baseball_world")
+    await crawl_daum_news_common(
+        update,
+        context,
+        category_id=cat_id,
+        sport_label="야구",  # 필요하면 '해외야구' 로 변경 가능
+        max_articles=5,
+    )
+
+# 농구
+async def crawlbasketball(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cat_id = DAUM_CATEGORY_IDS.get("basketball")
+    await crawl_daum_news_common(
+        update,
+        context,
+        category_id=cat_id,
+        sport_label="농구",
+        max_articles=10,
+    )
+
+# 배구
+async def crawlvolleyball(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cat_id = DAUM_CATEGORY_IDS.get("volleyball")
+    await crawl_daum_news_common(
+        update,
+        context,
+        category_id=cat_id,
+        sport_label="배구",
+        max_articles=10,
     )
 
 
@@ -1119,26 +1058,22 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     data = q.data or ""
-    await q.answer()  # 기본 로딩표시 제거
+    await q.answer()
 
-    # 메인 메뉴로 돌아가기
     if data == "back_main":
         await q.edit_message_reply_markup(reply_markup=build_main_inline_menu())
         return
 
-    # 분석픽 루트: 종목 리스트
     if data.startswith("analysis_root:"):
-        _, key = data.split(":", 1)          # today / tomorrow
+        _, key = data.split(":", 1)
         await q.edit_message_reply_markup(reply_markup=build_analysis_category_menu(key))
         return
 
-    # 분석픽 – 종목 선택
     if data.startswith("analysis_cat:"):
         _, key, sport = data.split(":", 2)
         await q.edit_message_reply_markup(reply_markup=build_analysis_match_menu(key, sport))
         return
 
-    # 분석픽 – 개별 경기 선택 → 채팅창에 분석글 전송
     if data.startswith("match:"):
         _, key, sport, match_id = data.split(":", 3)
         items = ANALYSIS_DATA_MAP.get(key, {}).get(sport, [])
@@ -1163,18 +1098,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
         return
 
-    # 스포츠 뉴스 요약 루트: 뉴스 종목 선택
     if data == "news_root":
         await q.edit_message_reply_markup(reply_markup=build_news_category_menu())
         return
 
-    # 뉴스 – 종목 선택
     if data.startswith("news_cat:"):
         sport = data.split(":", 1)[1]
         await q.edit_message_reply_markup(reply_markup=build_news_list_menu(sport))
         return
 
-    # 뉴스 제목 클릭 → 채팅창에 요약 메시지로 보내기
     if data.startswith("news_item:"):
         try:
             _, sport, news_id = data.split(":", 2)
@@ -1209,28 +1141,26 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ───────────────── 실행부 ─────────────────
 
 def main():
-    # 서버 시작할 때 한 번 시트에서 데이터 읽어오기
     reload_analysis_from_sheet()
     reload_news_from_sheet()
 
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # 1:1 테스트용
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    # 채널 메뉴용
     app.add_handler(CommandHandler("publish", publish))
-
-    # 구글시트 수동 새로고침
     app.add_handler(CommandHandler("syncsheet", syncsheet))
-
-    # 🔹 오늘 ← 내일 복사용 롤오버 명령
     app.add_handler(CommandHandler("rollover", rollover))
 
-    # 🔹 해외축구 뉴스 크롤링 명령
-    app.add_handler(CommandHandler("crawlsoccer", crawlsoccer))
+    # 뉴스 크롤링 명령어들
+    app.add_handler(CommandHandler("crawlsoccer", crawlsoccer))        # 해외축구
+    app.add_handler(CommandHandler("crawlsoccerkr", crawlsoccerkr))    # 국내축구
+    app.add_handler(CommandHandler("crawlbaseball", crawlbaseball))    # KBO
+    app.add_handler(CommandHandler("crawloverbaseball", crawloverbaseball))  # 해외야구
+    app.add_handler(CommandHandler("crawlbasketball", crawlbasketball))
+    app.add_handler(CommandHandler("crawlvolleyball", crawlvolleyball))
 
     app.add_handler(CallbackQueryHandler(on_callback))
 
@@ -1245,7 +1175,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
