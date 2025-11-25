@@ -191,8 +191,8 @@ def summarize_text(text: str, max_len: int = 400) -> str:
 
 def clean_daum_body_text(text: str) -> str:
     """
-    다음 뉴스 본문에서 번역/요약 UI, 언어 목록, '요약보기 자동요약' 꼬리,
-    대괄호 안 매체/기자 크레딧 등을 제거하고 기사 본문만 남긴다.
+    다음 뉴스 본문에서 번역/요약 UI, 언어 목록, 기자 크레딧/사진 설명 등
+    불필요한 문장을 최대한 제거하고 기사 본문만 남긴다.
     """
     if not text:
         return ""
@@ -228,24 +228,38 @@ def clean_daum_body_text(text: str) -> str:
 
     clean_lines = []
     for l in lines:
+        # 1) 공통 블랙리스트
         if any(b in l for b in blacklist):
             continue
+
+        # 2) 사진/기사 크레딧 한 줄 통째로 날리기
+        #    예) "[포포투=김아인] 맨유 감독…" / "[SPORTALKOREA] 박문서 기자"
+        if re.match(r"^\[[^]]{2,60}\]\s*[^ ]{1,20}\s*(기자|통신원|특파원)?\s*$", l):
+            continue
+
         clean_lines.append(l)
 
     text = " ".join(clean_lines)
 
-    # 2-1) 본문 중간에 끼어 있는 [매체=기자명], [매체 한OO 기자] 같은 크레딧 제거
-    # 예) [포포투=김아인], [베스트 일레븐 한재연 기자]
-    text = re.sub(r"\[[^\[\]]*기자\]", "", text)  # 대괄호 안에 '기자'가 들어가면 통째로 제거
+    # 3단계: 본문 안에 끼어 있는 크레딧 패턴 제거
+    #    예) 문장 중간의 "[베스트 일레븐] 한지형 기자" 등
+    text = re.sub(
+        r"\[[^]]{2,60}(일보|뉴스|코리아|KOREA|포포투|베스트 일레븐)[^]]*?\]\s*[^ ]{1,20}\s*(기자|통신원|특파원)?",
+        "",
+        text,
+    )
+    # 혹시 남은 "[무언가] 아무개 기자" 패턴 한 번 더 정리
+    text = re.sub(
+        r"\[[^]]{2,60}\]\s*[^ ]{1,20}\s*(기자|통신원|특파원)",
+        "",
+        text,
+    )
 
-    # 혹시 '기자'라는 단어가 없더라도 매체 이름만 있는 경우 추가 필터 (선택)
-    text = re.sub(r"\[[^\[\]]*(포포투|베스트 일레븐)[^\[\]]*\]", "", text)
-
-    # 2-2) 한 줄 안에 붙어 있는 '요약보기 자동요약' 꼬리 제거
+    # 4단계: "요약보기 자동요약" 꼬리 제거 (문장 끝 부분)
     text = re.sub(r"요약보기\s*자동요약.*$", "", text)
 
-    # 3단계: 공백 정리
-    text = re.sub(r"\s+", " ", text).strip()
+    # 5단계: 공백 정리
+    text = re.sub(r"\s{2,}", " ", text).strip()
 
     return text
 
@@ -1235,6 +1249,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
