@@ -28,9 +28,6 @@ from telegram.ext import (
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-# OpenAI LLM 요약용
-from openai import OpenAI
-
 # ───────────────── 기본 설정 ─────────────────
 TOKEN = os.getenv("BOT_TOKEN")
 APP_URL = (os.getenv("APP_URL") or "").strip()
@@ -38,6 +35,9 @@ CHANNEL_ID = (os.getenv("CHANNEL_ID") or "").strip()  # 예: @채널아이디 �
 
 # 🔴 여기만 네 봇 유저네임으로 수정하면 됨 (@ 빼고)
 BOT_USERNAME = "castlive_bot"  # 예: @castlive_bot 이라면 "castlive_bot"
+
+# 🔹 Gemini API 키 (환경변수에 설정)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 # 🔹 관리자 ID 목록 (쉼표로 여러 명 가능) 예: "123456789,987654321"
 _admin_ids_raw = os.getenv("ADMIN_IDS", "")
@@ -170,7 +170,7 @@ def get_gs_client():
 
 def summarize_text(text: str, max_len: int = 400) -> str:
     """
-    (이전 방식) 앞부분 잘라서 요약 – 현재는 사용 안 하고, 혹시 몰라 남겨둠
+    (예전용) 아주 단순한 요약: 문장을 잘라서 앞에서부터 max_len까지 자르는 방식.
     """
     text = text.replace("\n", " ").strip()
     sentences = re.split(r'(?<=[\.!?다요])\s+', text)
@@ -288,87 +288,10 @@ def remove_title_prefix(title: str, body: str) -> str:
     return b
 
 
-# ───────────────── OpenAI LLM 요약 함수 ─────────────────
-
-_LLM_CLIENT = None
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-
-def get_llm_client():
-    global _LLM_CLIENT
-    if _LLM_CLIENT is None and OPENAI_API_KEY:
-        _LLM_CLIENT = OpenAI(api_key=OPENAI_API_KEY)
-    return _LLM_CLIENT
-
-
-def summarize_with_llm(text: str, max_chars: int = 400) -> str:
-    """
-    OpenAI LLM을 사용해서 기사 전체 내용을 기반으로
-    약 max_chars자 분량의 서술형 요약을 생성.
-    실패 시 simple_summarize로 폴백.
-    """
-    client = get_llm_client()
-    if not client:
-        # OPENAI_API_KEY 없으면 기존 단순 요약 사용
-        return simple_summarize(text, max_chars=max_chars)
-
-    # 너무 긴 본문은 앞쪽 일부만 잘라서 LLM에 전달 (토큰 과다 방지)
-    text_short = text.strip()
-    if len(text_short) > 4000:
-        text_short = text_short[:4000]
-
-    try:
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "당신은 한국어 스포츠 기사 편집자입니다. "
-                        "사용자가 준 기사 전체 내용을 보고 핵심 내용만 자연스럽게 정리해 주세요. "
-                        "제목은 쓰지 말고, 한 단락의 서술형 기사 요약으로 작성합니다."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"다음 스포츠 기사를 약 {max_chars}자 분량의 한국어 한 단락으로 요약해줘. "
-                        "핵심 득점 장면, 스코어 흐름, 승패의 결정적 장면 위주로 정리해. "
-                        "불필요한 수식어나 감탄사는 최소화해.\n\n"
-                        f"{text_short}"
-                    ),
-                },
-            ],
-            temperature=0.3,
-        )
-        summary = (resp.choices[0].message.content or "").strip()
-
-        # 길이 조금만 정리 (너무 길면 문장 단위로 컷)
-        if len(summary) > max_chars + 80:
-            cut = summary.rfind("다.", 0, max_chars)
-            if cut != -1:
-                summary = summary[: cut + 2]
-            else:
-                summary = summary[:max_chars]
-
-        return summary or simple_summarize(text, max_chars=max_chars)
-
-    except Exception as e:
-        print(f"[LLM] 요약 실패: {e}")
-        return simple_summarize(text, max_chars=max_chars)
-
-
 def _load_analysis_sheet(sh, sheet_name: str) -> dict:
     """
     구글시트에서 한 탭(today / tomorrow)을 읽어서
     { sport: [ {id,title,summary}, ... ] } 구조로 변환
-
-    시트 컬럼 구조 (1행 헤더 기준):
-    A열: sport   (예: 축구/농구/야구/배구)
-    B열: id      (bot에서 쓸 고유 id, 비워두면 자동 생성)
-    C열: title   (버튼에 보이는 제목)
-    D열: summary (분석 본문)
     """
     try:
         ws = sh.worksheet(sheet_name)
@@ -480,12 +403,6 @@ def _load_news_sheet(sh, sheet_name: str) -> dict:
     {
         sport: [ {id,title,summary}, ... ]
     } 구조로 변환
-
-    시트 컬럼 구조 (1행 헤더 기준):
-    A열: sport
-    B열: id
-    C열: title
-    D열: summary
     """
     try:
         ws = sh.worksheet(sheet_name)
@@ -767,7 +684,7 @@ async def publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("채널에 메뉴를 올리고 상단에 고정했습니다 ✅")
 
 
-# 5) /syncsheet – 구글시트에서 분석 데이터 다시 로딩
+# 5) /syncsheet – 구글시트에서 분석/뉴스 데이터 다시 로딩
 async def syncsheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
@@ -871,6 +788,7 @@ def simple_summarize(text: str, max_chars: int = 400) -> str:
     """
     아주 단순 요약: 문장 사이 공백 정리 후,
     max_chars 안쪽에서 '다.' 기준으로 잘라서 반환.
+    (Gemini 오류 시 fallback 용)
     """
     if not text:
         return ""
@@ -885,6 +803,82 @@ def simple_summarize(text: str, max_chars: int = 400) -> str:
         return text[: cut + 2]
 
     return text[:max_chars] + "..."
+
+
+# ───────────────── Gemini 요약 함수 ─────────────────
+
+def summarize_with_gemini(full_text: str, max_chars: int = 400) -> str:
+    """
+    Gemini API를 이용해서 기사 전체 내용을
+    '뉴스 기사 스타일'로 약 max_chars 정도 한국어 서술형 요약.
+    - 제목은 붙이지 말고, 본문형 한두 단락으로만 작성.
+    """
+    if not full_text:
+        return ""
+
+    if not GEMINI_API_KEY:
+        # 키 없으면 예전 방식으로 fallback
+        print("[GEMINI] GEMINI_API_KEY 미설정 → simple_summarize 사용")
+        return simple_summarize(full_text, max_chars=max_chars)
+
+    # 길이 제한 (토큰 폭주 방지용, 대충 6000자 정도로 컷)
+    trimmed = full_text.strip()
+    if len(trimmed) > 6000:
+        trimmed = trimmed[:6000]
+
+    prompt = (
+        "다음 스포츠 뉴스를 한국어 '기사 요약' 형식으로 자연스럽게 정리해줘.\n"
+        "- 제목은 쓰지 말고, 본문 내용만 서술형으로 써줘.\n"
+        "- 정보 위주로 중요한 내용 중심으로 정리해줘.\n"
+        f"- 전체 길이는 대략 {max_chars}자 안팎으로.\n\n"
+        "===== 기사 원문 =====\n"
+        f"{trimmed}\n"
+    )
+
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+    headers = {"Content-Type": "application/json"}
+    params = {"key": GEMINI_API_KEY}
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt}
+                ]
+            }
+        ]
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, params=params, json=payload, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Gemini 응답 구조 파싱
+        candidates = data.get("candidates") or []
+        if not candidates:
+            print("[GEMINI] candidates 비어 있음 → fallback")
+            return simple_summarize(full_text, max_chars=max_chars)
+
+        content = candidates[0].get("content") or {}
+        parts = content.get("parts") or []
+        if not parts:
+            print("[GEMINI] parts 비어 있음 → fallback")
+            return simple_summarize(full_text, max_chars=max_chars)
+
+        text = parts[0].get("text", "").strip()
+        if not text:
+            print("[GEMINI] text 비어 있음 → fallback")
+            return simple_summarize(full_text, max_chars=max_chars)
+
+        # 혹시 너무 길면 한 번 더 잘라주기
+        if len(text) > max_chars * 2:
+            return simple_summarize(text, max_chars=max_chars)
+
+        return text
+
+    except Exception as e:
+        print(f"[GEMINI] 요약 중 오류: {e} → fallback simple_summarize")
+        return simple_summarize(full_text, max_chars=max_chars)
 
 
 # ───────────────── Daum harmony API 공통 함수 ─────────────────
@@ -1068,25 +1062,30 @@ async def crawl_daum_news_common(
                     raw_body = ""
                     if body_el:
                         # 이미지 설명 캡션 제거
-                        for cap in body_el.select(
-                            "figcaption, .txt_caption, .photo_desc, .caption, "
-                            "em.photo_desc, span.caption, p.caption"
-                        ):
-                            try:
-                                cap.extract()
-                            except Exception:
-                                pass
+                        try:
+                            for cap in body_el.select(
+                                "figcaption, .txt_caption, .photo_desc, .caption, "
+                                "em.photo_desc, span.caption, p.caption"
+                            ):
+                                try:
+                                    cap.extract()
+                                except Exception:
+                                    pass
+                        except Exception:
+                            # select가 안 되는 경우는 그냥 무시
+                            pass
 
                         raw_body = body_el.get_text("\n", strip=True)
 
                     clean_text = clean_daum_body_text(raw_body)
                     clean_text = remove_title_prefix(art["title"], clean_text)
 
-                    # 🔥 여기서 LLM으로 전체 기사 요약 (약 400자 서술형)
-                    art["summary"] = summarize_with_llm(clean_text, max_chars=400)
+                    # ✅ 여기서 Gemini로 요약 (뉴스 기사 스타일, 400자 내외)
+                    art["summary"] = summarize_with_gemini(clean_text, max_chars=400)
 
                 except Exception as e:
                     print(f"[CRAWL][DAUM] 기사 파싱 실패 ({art['link']}): {e}")
+                    # 크롤링 실패 시에도 최소한 뭔가 넣어두기
                     art["summary"] = "(본문 크롤링 실패)"
 
     except Exception as e:
@@ -1152,7 +1151,7 @@ async def crawlsoccerkr(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update,
         context,
         category_id=cat_id,
-        sport_label="축구",   # 해외/국내 모두 '축구'로 묶어서 버튼에 노출
+        sport_label="축구",   # 해외/국내를 한 카테고리에 묶어서 보여주기
         max_articles=5,
     )
 
@@ -1176,7 +1175,7 @@ async def crawloverbaseball(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update,
         context,
         category_id=cat_id,
-        sport_label="야구",  # 필요하면 '해외야구' 로 분리도 가능
+        sport_label="야구",  # 필요하면 '해외야구'로 분리해서도 가능
         max_articles=5,
     )
 
@@ -1309,12 +1308,12 @@ def main():
     app.add_handler(CommandHandler("rollover", rollover))
 
     # 뉴스 크롤링 명령어들
-    app.add_handler(CommandHandler("crawlsoccer", crawlsoccer))        # 해외축구
-    app.add_handler(CommandHandler("crawlsoccerkr", crawlsoccerkr))    # 국내축구
-    app.add_handler(CommandHandler("crawlbaseball", crawlbaseball))    # KBO
-    app.add_handler(CommandHandler("crawloverbaseball", crawloverbaseball))  # 해외야구
-    app.add_handler(CommandHandler("crawlbasketball", crawlbasketball))
-    app.add_handler(CommandHandler("crawlvolleyball", crawlvolleyball))
+    app.add_handler(CommandHandler("crawlsoccer", crawlsoccer))             # 해외축구
+    app.add_handler(CommandHandler("crawlsoccerkr", crawlsoccerkr))         # 국내축구
+    app.add_handler(CommandHandler("crawlbaseball", crawlbaseball))         # KBO
+    app.add_handler(CommandHandler("crawloverbaseball", crawloverbaseball)) # 해외야구
+    app.add_handler(CommandHandler("crawlbasketball", crawlbasketball))     # 농구
+    app.add_handler(CommandHandler("crawlvolleyball", crawlvolleyball))     # 배구
 
     app.add_handler(CallbackQueryHandler(on_callback))
 
