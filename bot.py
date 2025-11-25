@@ -109,8 +109,6 @@ ANALYSIS_DATA_MAP = {
 }
 
 # ───────────────── 다음 스포츠 카테고리 ID 설정 ─────────────────
-# DevTools > Network 에서 harmony contents.json 요청 확인 후
-# defaultCategoryId3 의 value 를 환경변수에 세팅.
 DAUM_CATEGORY_IDS = {
     # 해외축구
     "world_soccer": os.getenv("DAUM_CAT_WORLD_SOCCER", "100032"),
@@ -170,7 +168,6 @@ def summarize_text(text: str, max_len: int = 400) -> str:
     아주 단순한 요약: 문장을 잘라서 앞에서부터 max_len까지 자르는 방식.
     """
     text = text.replace("\n", " ").strip()
-    # 문장 단위로 대충 자르기 (한국어라 대충 마침표/다/요 기준)
     sentences = re.split(r'(?<=[\.!?다요])\s+', text)
     result = ""
     for s in sentences:
@@ -197,7 +194,6 @@ def clean_daum_body_text(text: str) -> str:
     if not text:
         return ""
 
-    # 1단계: 줄 단위로 나누고, 빈 줄 제거
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
     blacklist = [
@@ -211,7 +207,6 @@ def clean_daum_body_text(text: str) -> str:
         "요약문이므로 일부 내용이 생략될 수 있습니다.",
         "요약본이 자동요약 기사 제목과 주요 문장을 기반으로 자동요약한 결과입니다",
         "기사 제목과 주요 문장을 기반으로 자동요약한 결과입니다",
-        # 언어 목록 키워드
         "한국어 - English",
         "한국어 - 영어",
         "English",
@@ -228,12 +223,12 @@ def clean_daum_body_text(text: str) -> str:
 
     clean_lines = []
     for l in lines:
-        # 1) 공통 블랙리스트
+        # 공통 블랙리스트
         if any(b in l for b in blacklist):
             continue
 
-        # 2) 사진/기사 크레딧 한 줄 통째로 날리기
-        #    예) "[포포투=김아인] 맨유 감독…" / "[SPORTALKOREA] 박문서 기자"
+        # 사진/기사 크레딧 한 줄 통째로 날리기
+        # 예) "[포포투=김아인] 맨유 감독…" / "[SPORTALKOREA] 박문서 기자"
         if re.match(r"^\[[^]]{2,60}\]\s*[^ ]{1,20}\s*(기자|통신원|특파원)?\s*$", l):
             continue
 
@@ -241,27 +236,102 @@ def clean_daum_body_text(text: str) -> str:
 
     text = " ".join(clean_lines)
 
-    # 3단계: 본문 안에 끼어 있는 크레딧 패턴 제거
-    #    예) 문장 중간의 "[베스트 일레븐] 한지형 기자" 등
+    # 본문 안에 끼어 있는 크레딧 패턴 제거
     text = re.sub(
         r"\[[^]]{2,60}(일보|뉴스|코리아|KOREA|포포투|베스트 일레븐)[^]]*?\]\s*[^ ]{1,20}\s*(기자|통신원|특파원)?",
         "",
         text,
     )
-    # 혹시 남은 "[무언가] 아무개 기자" 패턴 한 번 더 정리
     text = re.sub(
         r"\[[^]]{2,60}\]\s*[^ ]{1,20}\s*(기자|통신원|특파원)",
         "",
         text,
     )
 
-    # 4단계: "요약보기 자동요약" 꼬리 제거 (문장 끝 부분)
+    # "요약보기 자동요약" 꼬리 제거
     text = re.sub(r"요약보기\s*자동요약.*$", "", text)
 
-    # 5단계: 공백 정리
     text = re.sub(r"\s{2,}", " ", text).strip()
-
     return text
+
+
+def _is_noise_paragraph(text: str) -> bool:
+    """
+    기자명/매체명, 사진 캡션 같이 요약에 불필요한 문단을 걸러내기 위한 휴리스틱.
+    """
+    t = text.strip()
+
+    # 기자/매체 줄: 짧고 '기자' 또는 매체명이 포함된 경우
+    if "기자" in t:
+        if len(t) <= 50 or t.startswith("[") or "뉴스" in t or "일보" in t or "스포츠" in t:
+            return True
+
+    # 대괄호 매체명 + 기자 형태
+    if re.match(r"^\[[^\]]+]\s*[^ ]+\s*기자", t):
+        return True
+
+    # 사진/제공 캡션: 보통 짧고 '사진', '제공'이 들어감
+    if ("사진" in t or "제공" in t) and len(t) <= 80:
+        return True
+
+    # 기타 짧은 캡션
+    if len(t) <= 15 and ("연합뉴스" in t or "EPA" in t or "AP" in t):
+        return True
+
+    return False
+
+
+def extract_daum_article_text(soup: BeautifulSoup) -> str:
+    """
+    다음 뉴스 페이지에서 실제 기사 본문만 추출.
+    핵심: p[contents-hash] 만 모으고, figure 내부나 캡션/기자줄은 제외.
+    """
+    paragraphs = []
+
+    for p in soup.select("p[contents-hash]"):
+        # figure(이미지) 안에 있는 캡션이면 스킵
+        if p.find_parent("figure"):
+            continue
+
+        txt = p.get_text(" ", strip=True)
+        if not txt:
+            continue
+
+        if _is_noise_paragraph(txt):
+            continue
+
+        paragraphs.append(txt)
+
+    # p[contents-hash]에서 잘 모였으면 그걸 사용
+    if paragraphs:
+        return "\n".join(paragraphs)
+
+    # 아니면 기존 방식으로 fallback
+    body_el = (
+        soup.select_one("div#harmonyContainer")
+        or soup.select_one("section#article-view-content-div")
+        or soup.select_one("div.article_view")
+        or soup.select_one("div#mArticle")
+        or soup.find("article")
+    )
+    if body_el:
+        # 이미지 설명 캡션 제거
+        for cap in body_el.select(
+            "figcaption, .txt_caption, .photo_desc, .caption, em.photo_desc, span.caption, p.caption"
+        ):
+            try:
+                cap.extract()
+            except Exception:
+                pass
+
+        return body_el.get_text("\n", strip=True)
+
+    # 그래도 없으면 body 전체
+    if soup.body:
+        return soup.body.get_text("\n", strip=True)
+
+    return ""
+
 
 def remove_title_prefix(title: str, body: str) -> str:
     """
@@ -291,12 +361,6 @@ def _load_analysis_sheet(sh, sheet_name: str) -> dict:
     """
     구글시트에서 한 탭(today / tomorrow)을 읽어서
     { sport: [ {id,title,summary}, ... ] } 구조로 변환
-
-    시트 컬럼 구조 (1행 헤더 기준):
-    A열: sport   (예: 축구/농구/야구/배구)
-    B열: id      (bot에서 쓸 고유 id, 비워두면 자동 생성)
-    C열: title   (버튼에 보이는 제목)
-    D열: summary (분석 본문)
     """
     try:
         ws = sh.worksheet(sheet_name)
@@ -405,15 +469,7 @@ NEWS_DATA = {}
 def _load_news_sheet(sh, sheet_name: str) -> dict:
     """
     구글시트에서 뉴스 탭을 읽어서
-    {
-        sport: [ {id,title,summary}, ... ]
-    } 구조로 변환
-
-    시트 컬럼 구조 (1행 헤더 기준):
-    A열: sport
-    B열: id
-    C열: title
-    D열: summary
+    { sport: [ {id,title,summary}, ... ] } 구조로 변환
     """
     try:
         ws = sh.worksheet(sheet_name)
@@ -516,7 +572,6 @@ def build_reply_keyboard() -> ReplyKeyboardMarkup:
 def build_main_inline_menu() -> InlineKeyboardMarkup:
     """
     메인 인라인 메뉴 (채널/미리보기 공통)
-    채널에서는 이 버튼을 눌러 각자 봇 DM으로 이동하게 함.
     """
     today_str, tomorrow_str = get_date_labels()
 
@@ -598,9 +653,6 @@ def build_news_list_menu(sport: str) -> InlineKeyboardMarkup:
 # ───────────────── 공통: 메인 메뉴 보내는 함수 ─────────────────
 
 async def send_main_menu(chat_id: int | str, context: ContextTypes.DEFAULT_TYPE, preview: bool = False):
-    """
-    채널/DM 공통으로 '텍스트 + 메인 메뉴 버튼' 전송.
-    """
     msg = await context.bot.send_message(
         chat_id=chat_id,
         text=get_menu_caption(),
@@ -611,7 +663,6 @@ async def send_main_menu(chat_id: int | str, context: ContextTypes.DEFAULT_TYPE,
 
 # ───────────────── 핸들러들 ─────────────────
 
-# 1) /start – DM에서 채널과 동일한 레이아웃 or 바로 메뉴 진입
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     args = context.args
@@ -655,7 +706,6 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"당신의 텔레그램 ID: {uid}")
 
 
-# 2) DM 텍스트 처리 – 간단 테스트용
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if "메뉴 미리보기" in text:
@@ -669,7 +719,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("메뉴 미리보기는 /start 또는 '메뉴 미리보기' 버튼을 눌러주세요.")
 
 
-# 3) /publish – 채널로 메뉴 보내고 상단 고정
 async def publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
@@ -695,7 +744,6 @@ async def publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("채널에 메뉴를 올리고 상단에 고정했습니다 ✅")
 
 
-# 5) /syncsheet – 구글시트에서 분석 데이터 다시 로딩
 async def syncsheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
@@ -707,6 +755,7 @@ async def syncsheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("구글시트에서 분석 데이터를 다시 불러왔습니다 ✅")
     except Exception as e:
         await update.message.reply_text(f"구글시트 로딩 중 오류가 발생했습니다: {e}")
+
 
 # 🔹 /newsclean – news 시트 초기화 (헤더만 남기기)
 async def newsclean(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -733,13 +782,10 @@ async def newsclean(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         rows = ws.get_all_values()
         if rows:
-            # 1행을 헤더로 보고 보존
             header = rows[0]
         else:
-            # 시트가 완전 비어 있는 경우 기본 헤더 생성
             header = ["sport", "id", "title", "summary"]
 
-        # 전체 내용 삭제 후 헤더만 다시 쓰기
         ws.clear()
         ws.update("A1", [header])
 
@@ -748,6 +794,7 @@ async def newsclean(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"시트 초기화 중 오류가 발생했습니다: {e}")
         return
+
 
 # 🔹 4) /rollover – 내일 분석 → 오늘 분석으로 복사
 async def rollover(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -821,7 +868,6 @@ def simple_summarize(text: str, max_chars: int = 400) -> str:
 async def fetch_daum_news_json(client: httpx.AsyncClient, category_id: str, size: int = 20) -> list[dict]:
     """
     다음 스포츠 harmony API에서 특정 카테고리 ID의 뉴스 JSON 리스트를 가져온다.
-    (해외축구, KBO, 해외야구, 농구, 배구 공통)
     """
     if not category_id:
         return []
@@ -985,25 +1031,8 @@ async def crawl_daum_news_common(
                     r2.raise_for_status()
                     s2 = BeautifulSoup(r2.text, "html.parser")
 
-                    body_el = (
-                        s2.select_one("div#harmonyContainer")
-                        or s2.select_one("section#article-view-content-div")
-                        or s2.select_one("div.article_view")
-                        or s2.select_one("div#mArticle")
-                        or s2.find("article")
-                        or s2.body
-                    )
-                    # 이미지 설명 캡션 제거
-                    for cap in body_el.select("figcaption, .txt_caption, .photo_desc, .caption, em.photo_desc, span.caption, p.caption"):
-                        try:
-                            cap.extract()
-                        except:
-                            pass
-
-                    if body_el:
-                        raw_body = body_el.get_text("\n", strip=True)
-                    else:
-                        raw_body = ""
+                    # 개선된 본문 추출 (캡션/기자줄 제거 + p[contents-hash] 우선)
+                    raw_body = extract_daum_article_text(s2)
 
                     clean_text = clean_daum_body_text(raw_body)
                     clean_text = remove_title_prefix(art["title"], clean_text)
@@ -1069,6 +1098,7 @@ async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         max_articles=5,
     )
 
+
 # 국내축구 (K리그 등, 5개)
 async def crawlsoccerkr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cat_id = DAUM_CATEGORY_IDS.get("soccer_kleague")
@@ -1076,9 +1106,10 @@ async def crawlsoccerkr(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update,
         context,
         category_id=cat_id,
-        sport_label="축구",   # 똑같이 '축구'로 저장 → 해외/국내 섞여서 뜸
+        sport_label="축구",   # 해외/국내 모두 '축구'로 모아서 사용
         max_articles=5,
     )
+
 
 # KBO 야구
 async def crawlbaseball(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1091,6 +1122,7 @@ async def crawlbaseball(update: Update, context: ContextTypes.DEFAULT_TYPE):
         max_articles=5,
     )
 
+
 # 해외야구 (MLB 등)
 async def crawloverbaseball(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cat_id = DAUM_CATEGORY_IDS.get("baseball_world")
@@ -1098,9 +1130,10 @@ async def crawloverbaseball(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update,
         context,
         category_id=cat_id,
-        sport_label="야구",  # 필요하면 '해외야구' 로 변경 가능
+        sport_label="야구",
         max_articles=5,
     )
+
 
 # 농구
 async def crawlbasketball(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1112,6 +1145,7 @@ async def crawlbasketball(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sport_label="농구",
         max_articles=10,
     )
+
 
 # 배구
 async def crawlvolleyball(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1223,7 +1257,7 @@ def main():
 
     app.add_handler(CommandHandler("publish", publish))
     app.add_handler(CommandHandler("syncsheet", syncsheet))
-        # 뉴스 시트 전체 초기화
+    # 뉴스 시트 전체 초기화
     app.add_handler(CommandHandler("newsclean", newsclean))
 
     app.add_handler(CommandHandler("rollover", rollover))
@@ -1249,9 +1283,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
