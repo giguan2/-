@@ -690,6 +690,46 @@ async def syncsheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"구글시트 로딩 중 오류가 발생했습니다: {e}")
 
+# 🔹 /newsclean – news 시트 초기화 (헤더만 남기기)
+async def newsclean(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+
+    client_gs = get_gs_client()
+    spreadsheet_id = os.getenv("SPREADSHEET_ID")
+
+    if not (client_gs and spreadsheet_id):
+        await update.message.reply_text(
+            "구글시트 설정(GOOGLE_SERVICE_KEY 또는 SPREADSHEET_ID)이 없어 시트를 초기화할 수 없습니다."
+        )
+        return
+
+    try:
+        sh = client_gs.open_by_key(spreadsheet_id)
+        ws = sh.worksheet(os.getenv("SHEET_NEWS_NAME", "news"))
+    except Exception as e:
+        await update.message.reply_text(f"뉴스 시트를 열지 못했습니다: {e}")
+        return
+
+    try:
+        rows = ws.get_all_values()
+        if rows:
+            # 1행을 헤더로 보고 보존
+            header = rows[0]
+        else:
+            # 시트가 완전 비어 있는 경우 기본 헤더 생성
+            header = ["sport", "id", "title", "summary"]
+
+        # 전체 내용 삭제 후 헤더만 다시 쓰기
+        ws.clear()
+        ws.update("A1", [header])
+
+        await update.message.reply_text("뉴스 시트를 초기화했습니다. (헤더만 남겨둠) ✅")
+
+    except Exception as e:
+        await update.message.reply_text(f"시트 초기화 중 오류가 발생했습니다: {e}")
+        return
 
 # 🔹 4) /rollover – 내일 분석 → 오늘 분석으로 복사
 async def rollover(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1159,6 +1199,9 @@ def main():
 
     app.add_handler(CommandHandler("publish", publish))
     app.add_handler(CommandHandler("syncsheet", syncsheet))
+        # 뉴스 시트 전체 초기화
+    app.add_handler(CommandHandler("newsclean", newsclean))
+
     app.add_handler(CommandHandler("rollover", rollover))
 
     # 뉴스 크롤링 명령어들
@@ -1182,4 +1225,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
