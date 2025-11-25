@@ -838,52 +838,42 @@ def summarize_with_gemini(full_text: str, max_chars: int = 400) -> str:
         "===== 기사 원문 끝 =====\n"
     )
 
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        "gemini-1.5-flash:generateContent"
+url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+
+headers = {
+    "Content-Type": "application/json"
+}
+
+payload = {
+    "contents": [
+        {
+            "parts": [
+                {"text": prompt}
+            ]
+        }
+    ]
+}
+
+try:
+    resp = requests.post(url, headers=headers, json=payload, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Gemini 응답 구조 파싱
+    result_text = (
+        data["candidates"][0]
+        ["content"]["parts"][0]
+        ["text"]
     )
-    headers = {"Content-Type": "application/json"}
-    params = {"key": GEMINI_API_KEY}
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": prompt}
-                ]
-            }
-        ]
-    }
 
-    try:
-        resp = requests.post(
-            url,
-            headers=headers,
-            params=params,
-            json=payload,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+    # 길이 제한 적용
+    result_text = result_text[:max_chars]
 
-        candidates = data.get("candidates") or []
-        if not candidates:
-            raise ValueError("no candidates from Gemini")
+    return result_text
 
-        parts = (candidates[0].get("content") or {}).get("parts") or []
-        text_out = "".join(p.get("text", "") for p in parts).strip()
-
-        if not text_out:
-            raise ValueError("empty response from Gemini")
-
-        # 너무 길게 오면 살짝 잘라주기
-        if len(text_out) > max_chars + 100:
-            text_out = text_out[: max_chars + 100]
-
-        return text_out
-
-    except Exception as e:
-        print(f"[GEMINI] 요약 실패 → simple_summarize로 폴백: {e}")
-        return simple_summarize(full_text, max_chars=max_chars)
+except Exception as e:
+    print("[GEMINI] 요약 실패 → simple_summarize 사용 :", e)
+    return simple_summarize(full_text, max_chars=max_chars)
 
 # ───────────────── Daum harmony API 공통 함수 ─────────────────
 
@@ -1332,6 +1322,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
