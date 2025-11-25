@@ -811,7 +811,9 @@ def summarize_with_gemini(full_text: str, max_chars: int = 400) -> str:
     """
     Gemini API를 이용해서 기사 전체 내용을
     '뉴스 기사 스타일'로 약 max_chars 정도 한국어 서술형 요약.
+
     - 제목은 붙이지 말고, 본문형 한두 단락으로만 작성.
+    - 원문 문장을 그대로 복사하지 말고, 의미만 살려서 완전히 새로 써야 함.
     """
     if not full_text:
         return ""
@@ -827,10 +829,16 @@ def summarize_with_gemini(full_text: str, max_chars: int = 400) -> str:
         trimmed = trimmed[:6000]
 
     prompt = (
-        "다음 스포츠 뉴스를 한국어 '기사 요약' 형식으로 자연스럽게 정리해줘.\n"
-        "- 제목은 쓰지 말고, 본문 내용만 서술형으로 써줘.\n"
-        "- 정보 위주로 중요한 내용 중심으로 정리해줘.\n"
-        f"- 전체 길이는 대략 {max_chars}자 안팎으로.\n\n"
+        "다음은 스포츠 뉴스 기사 원문이다.\n"
+        "이 내용을 기반으로 한국어 '뉴스 기사 요약문'을 작성해줘.\n"
+        "\n"
+        "요구사항:\n"
+        "1) 제목은 쓰지 말고, 본문 내용만 1~2개 단락으로 작성할 것.\n"
+        "2) 원문 문장을 그대로 복사하지 말고, 같은 의미를 유지하되\n"
+        "   문장 구조와 표현을 바꿔서 '완전히 새롭게' 작성할 것.\n"
+        "3) 중요한 정보(누가, 언제, 어디서, 무엇을, 결과/의미)를 중심으로 정리할 것.\n"
+        f"4) 전체 길이는 대략 {max_chars}자 안팎으로 맞출 것.\n"
+        "\n"
         "===== 기사 원문 =====\n"
         f"{trimmed}\n"
     )
@@ -845,15 +853,19 @@ def summarize_with_gemini(full_text: str, max_chars: int = 400) -> str:
                     {"text": prompt}
                 ]
             }
-        ]
+        ],
+        # 선택: 출력 길이 살짝 제한
+        "generationConfig": {
+            "temperature": 0.7,
+            "maxOutputTokens": 512
+        }
     }
 
     try:
-        resp = requests.post(url, headers=headers, params=params, json=payload, timeout=15)
+        resp = requests.post(url, headers=headers, params=params, json=payload, timeout=20)
         resp.raise_for_status()
         data = resp.json()
 
-        # Gemini 응답 구조 파싱
         candidates = data.get("candidates") or []
         if not candidates:
             print("[GEMINI] candidates 비어 있음 → fallback")
@@ -871,15 +883,14 @@ def summarize_with_gemini(full_text: str, max_chars: int = 400) -> str:
             return simple_summarize(full_text, max_chars=max_chars)
 
         # 혹시 너무 길면 한 번 더 잘라주기
-        if len(text) > max_chars * 2:
-            return simple_summarize(text, max_chars=max_chars)
+        if len(text) > max_chars:
+            text = simple_summarize(text, max_chars=max_chars)
 
         return text
 
     except Exception as e:
         print(f"[GEMINI] 요약 중 오류: {e} → fallback simple_summarize")
         return simple_summarize(full_text, max_chars=max_chars)
-
 
 # ───────────────── Daum harmony API 공통 함수 ─────────────────
 
@@ -1328,3 +1339,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
