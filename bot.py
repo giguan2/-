@@ -112,18 +112,25 @@ ANALYSIS_DATA_MAP = {
 # DevTools > Network 에서 harmony contents.json 요청 확인 후
 # defaultCategoryId3 의 value 를 환경변수에 세팅.
 DAUM_CATEGORY_IDS = {
-    # 해외축구 (기본값 100032)
+    # 해외축구
     "world_soccer": os.getenv("DAUM_CAT_WORLD_SOCCER", "100032"),
 
-    # ⚽ 국내축구 (K리그 등) – DevTools로 찾은 ID를 환경변수에 세팅
-    "soccer_kleague": os.getenv("DAUM_CAT_SOCCER_KLEAGUE", ""),
+    # 국내축구 (K리그)
+    "soccer_kleague": os.getenv("DAUM_CAT_SOCCER_KLEAGUE", "1027"),
 
-    # 아래 값들은 직접 찾은 후 환경변수에 넣어야 동작함.
-    "baseball_kbo": os.getenv("DAUM_CAT_BASEBALL_KBO", ""),
-    "baseball_world": os.getenv("DAUM_CAT_BASEBALL_WORLD", ""),
-    "basketball": os.getenv("DAUM_CAT_BASKETBALL", ""),
-    "volleyball": os.getenv("DAUM_CAT_VOLLEYBALL", ""),
+    # 국내야구 (KBO)
+    "baseball_kbo": os.getenv("DAUM_CAT_BASEBALL_KBO", "1028"),
+
+    # 해외야구 (MLB)
+    "baseball_world": os.getenv("DAUM_CAT_BASEBALL_WORLD", "1015"),
+
+    # 농구
+    "basketball": os.getenv("DAUM_CAT_BASKETBALL", "1029"),
+
+    # 배구
+    "volleyball": os.getenv("DAUM_CAT_VOLLEYBALL", "100033"),
 }
+
 
 # ───────────────── 구글 시트 연동 설정 ─────────────────
 
@@ -1175,3 +1182,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
