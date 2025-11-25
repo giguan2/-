@@ -975,6 +975,12 @@ async def crawl_daum_news_common(
                         or s2.find("article")
                         or s2.body
                     )
+                    # 이미지 설명 캡션 제거
+                    for cap in body_el.select("figcaption, .txt_caption, .photo_desc, .caption, em.photo_desc, span.caption, p.caption"):
+                        try:
+                            cap.extract()
+                        except:
+                            pass
 
                     if body_el:
                         raw_body = body_el.get_text("\n", strip=True)
@@ -1225,5 +1231,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
