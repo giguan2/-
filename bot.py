@@ -814,38 +814,27 @@ def summarize_with_gemini(full_text: str, max_chars: int = 400) -> str:
     """
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-    # 키 없으면 예전 방식으로
     if not GEMINI_API_KEY:
-        print("[GEMINI] GEMINI_API_KEY 미설정 -> simple_summarize 사용")
+        print("[GEMINI] GEMINI_API_KEY 미설정 → simple_summarize 사용")
         return simple_summarize(full_text, max_chars=max_chars)
 
-    # 너무 긴 본문은 대략 6000자까지 잘라서 보냄 (토큰 폭주 방지)
     trimmed = full_text.strip()
     if len(trimmed) > 6000:
         trimmed = trimmed[:6000]
 
-    # 한국어 뉴스 기사 스타일 요약 프롬프트
     prompt = (
         "다음은 스포츠 뉴스 기사 원문이다.\n"
-        "이 내용을 기반으로 한국어 뉴스 기사 요약문을 작성해줘.\n"
-        "\n"
-        "요약 방식:\n"
-        "1) 제목은 쓰지 말고, 본문 내용만 2~3문장 정도의 서술형으로 작성할 것.\n"
-        "2) 기사 앞부분을 그대로 복사하지 말고, 전체 내용을 읽고 핵심 내용을 정리할 것.\n"
-        "3) 팀/선수/스코어/핵심 사건이 자연스럽게 드러나도록 작성할 것.\n"
-        f"4) 전체 길이는 공백 포함 {max_chars}자 내외로 맞출 것.\n"
-        "\n"
+        "전체 내용을 이해한 뒤 2~3문장으로 자연스러운 서술형 뉴스 요약을 작성해줘.\n"
+        "기사 앞부분을 그대로 복사하지 말 것.\n"
+        f"전체 길이는 {max_chars}자 내외.\n\n"
         "===== 기사 원문 =====\n"
         f"{trimmed}\n"
     )
 
-    # Gemini REST API 호출
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        "gemini-1.5-flash:generateContent"
-    )
+    url = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent"
     headers = {"Content-Type": "application/json"}
     params = {"key": GEMINI_API_KEY}
+
     payload = {
         "contents": [
             {
@@ -862,30 +851,28 @@ def summarize_with_gemini(full_text: str, max_chars: int = 400) -> str:
             headers=headers,
             params=params,
             json=payload,
-            timeout=15,
+            timeout=20,
         )
         resp.raise_for_status()
         data = resp.json()
 
-        # candidates → content.parts[].text 합치기
         candidates = data.get("candidates") or []
         if not candidates:
             raise ValueError("no candidates from Gemini")
 
         parts = (candidates[0].get("content") or {}).get("parts") or []
-        result_text = "".join(p.get("text", "") for p in parts).strip()
+        result = "".join(p.get("text", "") for p in parts).strip()
 
-        if not result_text:
-            raise ValueError("empty response from Gemini")
+        if not result:
+            raise ValueError("empty response")
 
-        # 너무 길면 살짝 잘라주기
-        if len(result_text) > max_chars + 100:
-            result_text = result_text[: max_chars + 100]
+        if len(result) > max_chars + 100:
+            result = result[: max_chars + 100]
 
-        return result_text
+        return result
 
     except Exception as e:
-        print(f"[GEMINI] 요약 실패 → simple_summarize로 폴백: {e}")
+        print(f"[GEMINI] 요약 실패 → fallback: {e}")
         return simple_summarize(full_text, max_chars=max_chars)
 
 # ───────────────── Daum harmony API 공통 함수 ─────────────────
@@ -1335,6 +1322,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
