@@ -1104,12 +1104,19 @@ async def crawl_daum_news_common(
                             pass
 
                         raw_body = body_el.get_text("\n", strip=True)
-
+                    
                     clean_text = clean_daum_body_text(raw_body)
                     clean_text = remove_title_prefix(art["title"], clean_text)
+                    
+                    # ✅ Gemini로 "새 제목 + 요약" 생성 (400자 내외)
+                    new_title, new_summary = summarize_with_gemini(
+                        clean_text,
+                        orig_title=art["title"],
+                        max_chars=400,
+                    )
 
-                    # ✅ 여기서 Gemini로 요약 (뉴스 기사 스타일, 400자 내외)
-                    art["summary"] = summarize_with_gemini(clean_text, max_chars=500)
+                    art["title"] = new_title
+                    art["summary"] = new_summary
 
                 except Exception as e:
                     print(f"[CRAWL][DAUM] 기사 파싱 실패 ({art['link']}): {e}")
@@ -1356,6 +1363,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
