@@ -806,39 +806,45 @@ def simple_summarize(text: str, max_chars: int = 400) -> str:
 
 # ───────────────── Gemini 요약 함수 ─────────────────
 
-def summarize_with_gemini(full_text: str, max_chars: int = 400) -> str:
+def summarize_with_gemini(full_text: str, orig_title: str = "", max_chars: int = 400) -> tuple[str, str]:
     """
-    Gemini API를 사용해서 뉴스 기사를 서술형으로 요약한다.
-    실패하면 simple_summarize로 폴백.
+    Gemini API를 사용해서 '새로운 기사 제목 + 요약문' 을 생성한다.
+    실패하면 (기존 제목, simple_summarize(full_text)) 으로 폴백.
+    반환값: (new_title, summary)
     """
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-    # 키 없으면 바로 폴백
+    # 키 없으면 폴백
     if not GEMINI_API_KEY:
         print("[GEMINI] GEMINI_API_KEY 미설정 → simple_summarize 사용")
-        return "[FALLBACK_NO_KEY] " + simple_summarize(full_text, max_chars=max_chars)
+        fb_summary = simple_summarize(full_text, max_chars=max_chars)
+        return (orig_title or "[제목 없음]", fb_summary)
 
-    # 너무 긴 본문은 6000자 정도로 잘라서 전송
     trimmed = (full_text or "").strip()
     if len(trimmed) > 6000:
         trimmed = trimmed[:6000]
 
-    # 프롬프트 (뉴스 기사 2~3문장 서술형 요약)
+    # 제목 + 요약을 한 번에 뽑도록 프롬프트
     prompt = (
-        "다음은 스포츠 뉴스 기사 원문이다.\n"
-        "전체 내용을 이해한 뒤 2~3문장으로 자연스러운 서술형 한국어 뉴스 요약을 작성해줘.\n"
-        "기사 앞부분을 그대로 복사하지 말고, 핵심 내용과 맥락을 정리해 줄 것.\n"
-        f"전체 길이는 공백 포함 {max_chars}자 내외.\n\n"
+        "다음은 스포츠 뉴스 기사 원문과 기존 제목이다.\n"
+        "전체 내용을 이해한 뒤, 새로운 한국어 뉴스 헤드라인 1개와 2~3문장짜리 요약을 작성해줘.\n"
+        "기사 앞부분을 그대로 복사하지 말 것.\n"
+        f"요약 길이는 공백 포함 {max_chars}자 내외.\n"
+        "반드시 아래 형식으로만 출력해:\n"
+        "제목: (여기에 새 제목)\n"
+        "요약: (여기에 요약문)\n"
+        "그 외의 문장은 출력하지 마.\n"
+        "\n"
+        "===== 기존 제목 =====\n"
+        f"{orig_title}\n"
+        "\n"
         "===== 기사 원문 =====\n"
         f"{trimmed}\n"
     )
 
-    # ✅ 네 계정에서 실제로 존재하는 모델 (위 list_models 결과 기준)
-    model_name = "gemini-2.0-flash-001"
-
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{model_name}:generateContent"
+        "gemini-2.0-flash-001:generateContent"
     )
     headers = {"Content-Type": "application/json"}
     params = {"key": GEMINI_API_KEY}
@@ -853,7 +859,7 @@ def summarize_with_gemini(full_text: str, max_chars: int = 400) -> str:
     }
 
     try:
-        print("[GEMINI] 요청 시작 ->", model_name)
+        print("[GEMINI] 요청 시작")
         resp = requests.post(
             url,
             headers=headers,
@@ -861,11 +867,7 @@ def summarize_with_gemini(full_text: str, max_chars: int = 400) -> str:
             json=payload,
             timeout=20,
         )
-        # 디버그용 로그 (앞부분만)
         print("[GEMINI] HTTP status:", resp.status_code)
-        if resp.status_code != 200:
-            print("[GEMINI] body snippet:", resp.text[:300])
-
         resp.raise_for_status()
         data = resp.json()
 
@@ -874,22 +876,38 @@ def summarize_with_gemini(full_text: str, max_chars: int = 400) -> str:
             raise ValueError("no candidates from Gemini")
 
         parts = (candidates[0].get("content") or {}).get("parts") or []
-        result = "".join(p.get("text", "") for p in parts).strip()
+        text_out = "".join(p.get("text", "") for p in parts).strip()
+        if not text_out:
+            raise ValueError("empty response")
 
-        if not result:
-            raise ValueError("empty response from Gemini")
+        # ---- 출력 파싱 (제목 / 요약 분리) ----
+        new_title = ""
+        summary = ""
+        for line in text_out.splitlines():
+            line = line.strip()
+            if line.startswith("제목:"):
+                new_title = line[len("제목:"):].strip(" ：:")  # 콜론/공백 제거
+            elif line.startswith("요약:"):
+                summary = line[len("요약:"):].strip(" ：:")
 
-        # 너무 길면 살짝 자르기
-        if len(result) > max_chars + 100:
-            result = result[: max_chars + 100]
+        # 혹시 형식을 안 지켰으면, 전체를 요약으로 보고 제목은 기존 제목 사용
+        if not summary:
+            summary = text_out
 
-        print("[GEMINI] 요청 성공, 결과 길이:", len(result))
-        return result
+        # 길이 제한
+        if len(summary) > max_chars + 100:
+            summary = summary[: max_chars + 100]
+
+        if not new_title:
+            new_title = orig_title or "[제목 없음]"
+
+        print("[GEMINI] 요청 성공, 제목/요약 생성 완료")
+        return (new_title, summary)
 
     except Exception as e:
         print(f"[GEMINI] 요약 실패 → simple_summarize로 폴백: {e}")
-        fb = simple_summarize(full_text, max_chars=max_chars)
-        return "[FALLBACK_ERR] " + fb
+        fb_summary = simple_summarize(full_text, max_chars=max_chars)
+        return (orig_title or "[제목 없음]", fb_summary)
 
 # ───────────────── Daum harmony API 공통 함수 ─────────────────
 
@@ -1338,6 +1356,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
