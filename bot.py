@@ -884,7 +884,7 @@ def summarize_with_gemini(full_text: str, max_chars: int = 400) -> str:
             result = result[: max_chars + 100]
 
         print("[GEMINI] 요청 성공, 결과 길이:", len(result))
-        return "[GEMINI] " + result
+        return result
 
     except Exception as e:
         print(f"[GEMINI] 요약 실패 → simple_summarize로 폴백: {e}")
@@ -1091,7 +1091,7 @@ async def crawl_daum_news_common(
                     clean_text = remove_title_prefix(art["title"], clean_text)
 
                     # ✅ 여기서 Gemini로 요약 (뉴스 기사 스타일, 400자 내외)
-                    art["summary"] = summarize_with_gemini(clean_text, max_chars=400)
+                    art["summary"] = summarize_with_gemini(clean_text, max_chars=500)
 
                 except Exception as e:
                     print(f"[CRAWL][DAUM] 기사 파싱 실패 ({art['link']}): {e}")
@@ -1338,6 +1338,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
