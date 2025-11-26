@@ -804,40 +804,42 @@ def simple_summarize(text: str, max_chars: int = 400) -> str:
 
     return text[:max_chars] + "..."
 
-
 # ───────────────── Gemini 요약 함수 ─────────────────
 
 def summarize_with_gemini(full_text: str, max_chars: int = 400) -> str:
     """
     Gemini API를 사용해서 뉴스 기사를 서술형으로 요약한다.
-    실패하면 simple_summarize로 폴백하며
-    HTTP status / 에러 메시지 일부를 summary 앞에 그대로 표시한다.
+    실패하면 simple_summarize로 폴백.
     """
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
+    # 키 없으면 바로 폴백
     if not GEMINI_API_KEY:
         print("[GEMINI] GEMINI_API_KEY 미설정 → simple_summarize 사용")
         return "[FALLBACK_NO_KEY] " + simple_summarize(full_text, max_chars=max_chars)
 
+    # 너무 긴 본문은 6000자 정도로 잘라서 전송
     trimmed = (full_text or "").strip()
     if len(trimmed) > 6000:
         trimmed = trimmed[:6000]
 
+    # 프롬프트 (뉴스 기사 2~3문장 서술형 요약)
     prompt = (
         "다음은 스포츠 뉴스 기사 원문이다.\n"
-        "전체 내용을 읽고 2~3문장으로 자연스러운 서술형 한국어 뉴스 요약을 작성해줘.\n"
-        "앞부분을 그대로 복사하지 말고, 전체 사건을 요약해서 재작성해.\n"
-        f"전체 길이는 약 {max_chars}자.\n\n"
+        "전체 내용을 이해한 뒤 2~3문장으로 자연스러운 서술형 한국어 뉴스 요약을 작성해줘.\n"
+        "기사 앞부분을 그대로 복사하지 말고, 핵심 내용과 맥락을 정리해 줄 것.\n"
+        f"전체 길이는 공백 포함 {max_chars}자 내외.\n\n"
         "===== 기사 원문 =====\n"
         f"{trimmed}\n"
     )
 
-    # 올바른 엔드포인트 + 들여쓰기 복구!!!
-    url = (
-        "https://generativelanguage.googleapis.com/v1/models/"
-        "gemini-1.5-flash-001:generateContent"
-    )
+    # ✅ 네 계정에서 실제로 존재하는 모델 (위 list_models 결과 기준)
+    model_name = "gemini-2.0-flash-001"
 
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model_name}:generateContent"
+    )
     headers = {"Content-Type": "application/json"}
     params = {"key": GEMINI_API_KEY}
     payload = {
@@ -851,7 +853,7 @@ def summarize_with_gemini(full_text: str, max_chars: int = 400) -> str:
     }
 
     try:
-        print("[GEMINI] 요청 시작")
+        print("[GEMINI] 요청 시작 ->", model_name)
         resp = requests.post(
             url,
             headers=headers,
@@ -859,11 +861,14 @@ def summarize_with_gemini(full_text: str, max_chars: int = 400) -> str:
             json=payload,
             timeout=20,
         )
-
+        # 디버그용 로그 (앞부분만)
         print("[GEMINI] HTTP status:", resp.status_code)
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            print("[GEMINI] body snippet:", resp.text[:300])
 
+        resp.raise_for_status()
         data = resp.json()
+
         candidates = data.get("candidates") or []
         if not candidates:
             raise ValueError("no candidates from Gemini")
@@ -872,30 +877,19 @@ def summarize_with_gemini(full_text: str, max_chars: int = 400) -> str:
         result = "".join(p.get("text", "") for p in parts).strip()
 
         if not result:
-            raise ValueError("empty response")
+            raise ValueError("empty response from Gemini")
 
-        # 너무 길면 잘라서 반환
+        # 너무 길면 살짝 자르기
         if len(result) > max_chars + 100:
             result = result[: max_chars + 100]
 
+        print("[GEMINI] 요청 성공, 결과 길이:", len(result))
         return "[GEMINI] " + result
 
-    except requests.exceptions.HTTPError as e:
-        status = e.response.status_code if e.response else "?"
-        body = ""
-        try:
-            body = e.response.text[:200]
-        except:
-            pass
-
-        print(f"[GEMINI] HTTPError status={status}, body={body}")
-        fb = simple_summarize(full_text, max_chars=max_chars)
-        return f"[FALLBACK_ERR status={status} body={body}] " + fb
-
     except Exception as e:
-        print(f"[GEMINI] 기타 예외: {e}")
+        print(f"[GEMINI] 요약 실패 → simple_summarize로 폴백: {e}")
         fb = simple_summarize(full_text, max_chars=max_chars)
-        return f"[FALLBACK_ERR exception={e}] " + fb
+        return "[FALLBACK_ERR] " + fb
 
 # ───────────────── Daum harmony API 공통 함수 ─────────────────
 
@@ -1344,6 +1338,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
