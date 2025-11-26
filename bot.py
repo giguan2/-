@@ -834,9 +834,10 @@ def summarize_with_gemini(full_text: str, max_chars: int = 400) -> str:
 
     # 올바른 엔드포인트 + 들여쓰기 복구!!!
     url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
+        "https://generativelanguage.googleapis.com/v1/models/"
         "gemini-1.5-flash-001:generateContent"
     )
+
     headers = {"Content-Type": "application/json"}
     params = {"key": GEMINI_API_KEY}
     payload = {
@@ -1343,6 +1344,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
