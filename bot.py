@@ -831,22 +831,22 @@ def summarize_with_gemini(full_text: str, max_chars: int = 400) -> str:
         f"{trimmed}\n"
     )
 
-    # ✅ 최신 Gemini 엔드포인트
-url = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    "gemini-1.5-flash-001:generateContent"
-)
-headers = {"Content-Type": "application/json"}
-params = {"key": GEMINI_API_KEY}
-payload = {
-    "contents": [
-        {
-            "parts": [
-                {"text": prompt}
-            ]
-        }
-    ]
-}
+    # ✅ 최신 Gemini 엔드포인트 (v1beta + gemini-1.5-flash-001)
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemini-1.5-flash-001:generateContent"
+    )
+    headers = {"Content-Type": "application/json"}
+    params = {"key": GEMINI_API_KEY}
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt}
+                ]
+            }
+        ]
+    }
 
     try:
         print("[GEMINI] 요청 시작")
@@ -1330,6 +1330,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
