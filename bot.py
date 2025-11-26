@@ -816,7 +816,7 @@ def summarize_with_gemini(full_text: str, max_chars: int = 400) -> str:
 
     if not GEMINI_API_KEY:
         print("[GEMINI] GEMINI_API_KEY 미설정 → simple_summarize 사용")
-        return simple_summarize(full_text, max_chars=max_chars)
+        return "[FALLBACK_NO_KEY] " + simple_summarize(full_text, max_chars=max_chars)
 
     trimmed = full_text.strip()
     if len(trimmed) > 6000:
@@ -831,6 +831,7 @@ def summarize_with_gemini(full_text: str, max_chars: int = 400) -> str:
         f"{trimmed}\n"
     )
 
+    # ✅ 최신 Gemini 엔드포인트
     url = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent"
     headers = {"Content-Type": "application/json"}
     params = {"key": GEMINI_API_KEY}
@@ -846,6 +847,7 @@ def summarize_with_gemini(full_text: str, max_chars: int = 400) -> str:
     }
 
     try:
+        print("[GEMINI] 요청 시작")
         resp = requests.post(
             url,
             headers=headers,
@@ -853,6 +855,7 @@ def summarize_with_gemini(full_text: str, max_chars: int = 400) -> str:
             json=payload,
             timeout=20,
         )
+        print("[GEMINI] HTTP status:", resp.status_code, resp.text[:200])
         resp.raise_for_status()
         data = resp.json()
 
@@ -869,11 +872,14 @@ def summarize_with_gemini(full_text: str, max_chars: int = 400) -> str:
         if len(result) > max_chars + 100:
             result = result[: max_chars + 100]
 
-        return result
+        print("[GEMINI] 요청 성공, 결과 길이:", len(result))
+        # 시트에서 육안 확인용 prefix
+        return "[GEMINI] " + result
 
     except Exception as e:
-        print(f"[GEMINI] 요약 실패 → fallback: {e}")
-        return simple_summarize(full_text, max_chars=max_chars)
+        print(f"[GEMINI] 요약 실패 → simple_summarize로 폴백: {e}")
+        fb = simple_summarize(full_text, max_chars=max_chars)
+        return "[FALLBACK_ERR] " + fb
 
 # ───────────────── Daum harmony API 공통 함수 ─────────────────
 
@@ -1322,6 +1328,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
