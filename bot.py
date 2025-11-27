@@ -78,6 +78,31 @@ def get_date_labels():
     return today_str, tomorrow_str
 
 
+def get_tomorrow_keywords():
+    """
+    해외분석 리스트에서 '내일 경기'만 필터링하기 위한 키워드 세트 생성.
+    - '내일'
+    - 11.28 / 11-28 / 11/28 같은 여러 날짜 포맷
+    """
+    tomorrow = get_kst_now().date() + timedelta(days=1)
+    m = tomorrow.month
+    d = tomorrow.day
+
+    md_dot_1 = f"{m}.{d}"
+    md_dot_2 = f"{m}.{d:02d}"
+    md_dash_1 = f"{m}-{d}"
+    md_dash_2 = f"{m}-{d:02d}"
+    md_slash_1 = f"{m}/{d}"
+    md_slash_2 = f"{m}/{d:02d}"
+
+    return {
+        "내일",
+        md_dot_1, md_dot_2,
+        md_dash_1, md_dash_2,
+        md_slash_1, md_slash_2,
+    }
+
+
 def get_menu_caption() -> str:
     """메인 메뉴 설명 텍스트 (오늘/내일 날짜 자동 반영)"""
     today_str, tomorrow_str = get_date_labels()
@@ -235,7 +260,6 @@ def clean_daum_body_text(text: str) -> str:
             continue
 
         # 2) 사진/기사 크레딧 한 줄 통째로 날리기
-        #    예) "[포포투=김아인] 맨유 감독…" / "[SPORTALKOREA] 박문서 기자"
         if re.match(r"^\[[^]]{2,60}\]\s*[^ ]{1,20}\s*(기자|통신원|특파원)?\s*$", l):
             continue
 
@@ -392,6 +416,38 @@ def reload_analysis_from_sheet():
     }
 
     print("[GSHEET] ANALYSIS_TODAY / ANALYSIS_TOMORROW 갱신 완료")
+
+
+def append_analysis_rows(day_key: str, rows: list[list[str]]) -> bool:
+    """
+    분석 데이터를 today / tomorrow 탭에 추가하는 공용 함수.
+    rows: [ [sport, "", title, summary], ... ]
+    """
+    client_gs = get_gs_client()
+    spreadsheet_id = os.getenv("SPREADSHEET_ID")
+
+    if not (client_gs and spreadsheet_id):
+        print("[GSHEET][ANALYSIS] 설정 없음 → 저장 불가")
+        return False
+
+    sheet_today_name = os.getenv("SHEET_TODAY_NAME", "today")
+    sheet_tomorrow_name = os.getenv("SHEET_TOMORROW_NAME", "tomorrow")
+    sheet_name = sheet_today_name if day_key == "today" else sheet_tomorrow_name
+
+    try:
+        sh = client_gs.open_by_key(spreadsheet_id)
+        ws = sh.worksheet(sheet_name)
+    except Exception as e:
+        print(f"[GSHEET][ANALYSIS] 시트 '{sheet_name}' 열기 실패: {e}")
+        return False
+
+    try:
+        ws.append_rows(rows, value_input_option="RAW")
+        print(f"[GSHEET][ANALYSIS] {sheet_name} 에 {len(rows)}건 추가")
+        return True
+    except Exception as e:
+        print(f"[GSHEET][ANALYSIS] append_rows 오류: {e}")
+        return False
 
 
 NEWS_DATA = {}
@@ -804,7 +860,139 @@ def simple_summarize(text: str, max_chars: int = 400) -> str:
 
     return text[:max_chars] + "..."
 
-# ───────────────── Gemini 요약 함수 ─────────────────
+
+# ───────────────── 경기 분석용 Gemini 요약 함수 ─────────────────
+
+def summarize_analysis_with_gemini(
+    full_text: str,
+    *,
+    league: str = "해외축구",
+    home_team: str = "",
+    away_team: str = "",
+    max_chars: int = 900,
+) -> tuple[str, str]:
+    """
+    경기 분석 전용 요약 함수.
+    - new_title: 시트의 title 컬럼에 들어갈 제목
+    - summary : 텔레그램에서 보여줄 분석 본문 (구조화된 텍스트)
+
+    실패하면 (자동 생성 제목, simple_summarize(full_text)) 으로 폴백.
+    """
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+
+    base_title = f"[{league}] {home_team} vs {away_team} 경기 분석".strip()
+    if not home_team or not away_team:
+        base_title = f"[{league}] 해외축구 경기 분석"
+
+    if not GEMINI_API_KEY:
+        print("[GEMINI][ANALYSIS] GEMINI_API_KEY 미설정 → simple_summarize 사용")
+        fb = simple_summarize(full_text, max_chars=max_chars)
+        return (base_title or "[경기 분석]", fb)
+
+    trimmed = (full_text or "").strip()
+    if len(trimmed) > 7000:
+        trimmed = trimmed[:7000]
+
+    prompt = (
+        "다음은 해외축구 경기 분석 글 원문이다.\n"
+        "전체 내용을 이해한 뒤, 아래 형식에 맞게 한국어로 다시 작성해줘.\n"
+        "문장은 간결하고 직설적으로 쓰고, 원문 문장을 그대로 복사하지 말 것.\n"
+        f"전체 길이는 공백 포함 {max_chars}자 내외.\n"
+        "\n"
+        "반드시 아래 구조를 지켜서 출력해:\n"
+        "제목: [리그] 홈팀 vs 원정팀 경기 분석\n"
+        "본문:\n"
+        "경기 정보: 한 문단\n"
+        "팀 컨디션 & 최근 흐름: 2~3문장\n"
+        "전력 비교 & 핵심 포인트: 3~5문장\n"
+        "종합 분석: 2~3문장 정리\n"
+        "\n"
+        "예시 형식:\n"
+        "제목: [EPL] 맨시티 vs 리버풀 경기 분석\n"
+        "본문:\n"
+        "경기 정보: ...\n"
+        "팀 컨디션 & 최근 흐름: ...\n"
+        "전력 비교 & 핵심 포인트: ...\n"
+        "종합 분석: ...\n"
+        "\n"
+        f"리그: {league}\n"
+        f"홈팀: {home_team}\n"
+        f"원정팀: {away_team}\n"
+        "\n"
+        "===== 경기 분석 원문 =====\n"
+        f"{trimmed}\n"
+    )
+
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemini-2.0-flash-001:generateContent"
+    )
+    headers = {"Content-Type": "application/json"}
+    params = {"key": GEMINI_API_KEY}
+    payload = {
+        "contents": [
+            {"parts": [{"text": prompt}]}
+        ]
+    }
+
+    try:
+        print("[GEMINI][ANALYSIS] 요청 시작")
+        resp = requests.post(
+            url,
+            headers=headers,
+            params=params,
+            json=payload,
+            timeout=25,
+        )
+        print("[GEMINI][ANALYSIS] HTTP status:", resp.status_code)
+        resp.raise_for_status()
+        data = resp.json()
+
+        candidates = data.get("candidates") or []
+        if not candidates:
+            raise ValueError("no candidates from Gemini (analysis)")
+
+        parts = (candidates[0].get("content") or {}).get("parts") or []
+        text_out = "".join(p.get("text", "") for p in parts).strip()
+        if not text_out:
+            raise ValueError("empty response (analysis)")
+
+        new_title = ""
+        body = ""
+        lines = text_out.splitlines()
+        mode = None
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("제목:"):
+                new_title = line[len("제목:"):].strip(" ：:")
+                mode = None
+            elif line.startswith("본문:"):
+                mode = "body"
+            else:
+                if mode == "body":
+                    body += line + "\n"
+
+        if not new_title:
+            new_title = base_title or "[경기 분석]"
+        if not body:
+            body = text_out
+
+        body = body.strip()
+        if len(body) > max_chars + 200:
+            body = body[: max_chars + 200]
+
+        print("[GEMINI][ANALYSIS] 제목/본문 생성 완료")
+        return (new_title, body)
+
+    except Exception as e:
+        print(f"[GEMINI][ANALYSIS] 실패 → simple_summarize 폴백: {e}")
+        fb = simple_summarize(full_text, max_chars=max_chars)
+        return (base_title or "[경기 분석]", fb)
+
+
+# ───────────────── 뉴스용 Gemini 요약 함수 ─────────────────
 
 def summarize_with_gemini(full_text: str, orig_title: str = "", max_chars: int = 400) -> tuple[str, str]:
     """
@@ -908,6 +1096,7 @@ def summarize_with_gemini(full_text: str, orig_title: str = "", max_chars: int =
         print(f"[GEMINI] 요약 실패 → simple_summarize로 폴백: {e}")
         fb_summary = simple_summarize(full_text, max_chars=max_chars)
         return (orig_title or "[제목 없음]", fb_summary)
+
 
 # ───────────────── Daum harmony API 공통 함수 ─────────────────
 
@@ -1165,7 +1354,192 @@ async def crawl_daum_news_common(
     )
 
 
-# ───────────────── 종목별 크롤링 명령어 ─────────────────
+# ───────────────── mazgtv 분석 공통 (내일 경기 → today/tomorrow 시트) ─────────────────
+
+async def crawl_maz_analysis_common(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    base_url: str,
+    sport_label: str,     # 시트에 들어갈 sport (예: "축구", "야구")
+    league_default: str,  # Gemini 프롬프트에 쓸 기본 리그명 (예: "해외축구")
+    day_key: str = "tomorrow",  # "today" or "tomorrow"
+    max_pages: int = 5,
+):
+    """
+    mazgtv 분석 페이지 공통 크롤러.
+    - base_url: 예) 해외축구: https://mazgtv1.com/analyze/overseas
+    - sport_label: 시트 sport 컬럼 값 (예: "축구")
+    - league_default: 분석 제목에 들어갈 기본 리그명
+    - day_key: today / tomorrow 중 어디에 넣을지
+    """
+    if not is_admin(update):
+        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+
+    await update.message.reply_text(
+        f"mazgtv {sport_label} 분석 페이지에서 내일 경기 분석글을 가져옵니다. 잠시만 기다려 주세요..."
+    )
+
+    tomorrow_keywords = get_tomorrow_keywords()
+    print("[MAZ][ANALYSIS] tomorrow keywords:", tomorrow_keywords)
+
+    articles: list[dict] = []
+
+    try:
+        async with httpx.AsyncClient(
+            headers={"User-Agent": "Mozilla/5.0"},
+            follow_redirects=True,
+        ) as client:
+
+            # 1) 리스트 페이지(1~max_pages) 순회
+            for page in range(1, max_pages + 1):
+                if page == 1:
+                    url = base_url
+                else:
+                    # ⚠️ TODO: 실제 페이지네이션 구조에 맞게 수정
+                    # 예: ?page=2 또는 /2 등
+                    url = f"{base_url}?page={page}"
+
+                try:
+                    r = await client.get(url, timeout=10.0)
+                    r.raise_for_status()
+                except Exception as e:
+                    print(f"[MAZ][ANALYSIS] 페이지 요청 실패 {url}: {e}")
+                    continue
+
+                soup = BeautifulSoup(r.text, "html.parser")
+
+                # ⚠️ TODO: 실제 해외분석 리스트 HTML 구조에 맞게 수정
+                # 예: div.analyze-list 안에 a.item 형태라고 가정
+                item_elems = soup.select("div.analyze-list .item")  # 여기를 실제 구조로 바꿔줘야 함
+                if not item_elems and page > 1:
+                    print(f"[MAZ][ANALYSIS] page {page} 에 아이템 없음 → 중단")
+                    break
+
+                for item in item_elems:
+                    txt_all = item.get_text(" ", strip=True)
+
+                    # '내일' 또는 내일 날짜 키워드 포함 여부 체크
+                    if not any(k in txt_all for k in tomorrow_keywords):
+                        continue
+
+                    a = item.select_one("a")
+                    if not a:
+                        continue
+
+                    href = a.get("href")
+                    if not href:
+                        continue
+
+                    link = href if href.startswith("http") else urljoin(base_url, href)
+                    title = (a.get_text(strip=True) or "").strip()
+
+                    league = league_default
+                    home_team = ""
+                    away_team = ""
+
+                    # 예: [EPL] 맨시티 vs 리버풀
+                    m = re.search(r"\[(.+?)\]\s*([^vV]+)\s+vs\s+(.+)", title)
+                    if m:
+                        league = m.group(1).strip()
+                        home_team = m.group(2).strip()
+                        away_team = m.group(3).strip()
+
+                    articles.append({
+                        "url": link,
+                        "orig_title": title,
+                        "league": league,
+                        "home": home_team,
+                        "away": away_team,
+                    })
+
+            if not articles:
+                await update.message.reply_text(
+                    "내일 경기에 해당하는 분석글을 찾지 못했습니다.\n"
+                    "리스트 페이지의 HTML 구조와 '내일' 표기 방식을 한 번 확인해줘."
+                )
+                return
+
+            # 2) 각 분석글 상세 페이지 크롤링 + Gemini 요약
+            rows_to_append: list[list[str]] = []
+
+            for art in articles:
+                try:
+                    r2 = await client.get(art["url"], timeout=10.0)
+                    r2.raise_for_status()
+                    s2 = BeautifulSoup(r2.text, "html.parser")
+
+                    # ⚠️ TODO: 실제 분석 본문 셀렉터로 수정 필요
+                    body_el = (
+                        s2.select_one("div.view-cont")        # 예시 1
+                        or s2.select_one("div.article-body")  # 예시 2
+                        or s2.select_one("div#content")       # fallback
+                        or s2.find("article")                 # fallback
+                        or s2.body
+                    )
+
+                    if not body_el:
+                        print(f"[MAZ][ANALYSIS] 본문 요소 없음: {art['url']}")
+                        continue
+
+                    try:
+                        for bad in body_el.select("script, style, .ad, .banner"):
+                            bad.extract()
+                    except Exception:
+                        pass
+
+                    raw_body = body_el.get_text("\n", strip=True)
+                    if not raw_body:
+                        print(f"[MAZ][ANALYSIS] 본문 텍스트 없음: {art['url']}")
+                        continue
+
+                    clean_text = re.sub(r"\s+", " ", raw_body).strip()
+
+                    new_title, new_body = summarize_analysis_with_gemini(
+                        clean_text,
+                        league=art["league"],
+                        home_team=art["home"],
+                        away_team=art["away"],
+                        max_chars=900,
+                    )
+
+                    rows_to_append.append([
+                        sport_label,  # sport (ex: "축구")
+                        "",           # id (비워두면 _load_analysis_sheet 에서 자동 부여)
+                        new_title,    # title
+                        new_body,     # summary
+                    ])
+
+                except Exception as e:
+                    print(f"[MAZ][ANALYSIS] 상세 파싱 실패 ({art['url']}): {e}")
+                    continue
+
+    except Exception as e:
+        await update.message.reply_text(f"요청 오류가 발생했습니다: {e}")
+        return
+
+    if not rows_to_append:
+        await update.message.reply_text(
+            "내일 경기 분석을 가져왔지만, 유효한 본문이 없어 시트에 저장하지 않았습니다."
+        )
+        return
+
+    ok = append_analysis_rows(day_key, rows_to_append)
+    if not ok:
+        await update.message.reply_text("구글시트에 분석 데이터를 저장하지 못했습니다.")
+        return
+
+    # 메모리 갱신 (텔레그램 메뉴에 바로 반영)
+    reload_analysis_from_sheet()
+
+    await update.message.reply_text(
+        f"mazgtv {sport_label} 분석에서 내일 경기 분석 {len(rows_to_append)}건을 "
+        f"'{day_key}' 시트에 저장했습니다.\n"
+        "텔레그램에서 경기 분석픽 메뉴를 열어 확인해보세요."
+    )
+
+# ───────────────── 종목별 (Daum 뉴스) 크롤링 명령어 ─────────────────
 
 # 해외축구
 async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1322,6 +1696,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+# 해외축구 분석 (내일 경기 → tomorrow 시트)
+async def crawlmazsoccer_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await crawl_maz_analysis_common(
+        update,
+        context,
+        base_url="https://mazgtv1.com/analyze/overseas",  # 해외축구 분석 리스트
+        sport_label="축구",         # 시트에서 종목 이름
+        league_default="해외축구",  # 제목 기본 리그명
+        day_key="tomorrow",        # tomorrow 시트에 저장
+        max_pages=5,               # 필요하면 조절
+    )
 
 # ───────────────── 실행부 ─────────────────
 
@@ -1342,13 +1727,16 @@ def main():
 
     app.add_handler(CommandHandler("rollover", rollover))
 
-    # 뉴스 크롤링 명령어들
+    # 뉴스 크롤링 명령어들 (Daum)
     app.add_handler(CommandHandler("crawlsoccer", crawlsoccer))             # 해외축구
     app.add_handler(CommandHandler("crawlsoccerkr", crawlsoccerkr))         # 국내축구
     app.add_handler(CommandHandler("crawlbaseball", crawlbaseball))         # KBO
     app.add_handler(CommandHandler("crawloverbaseball", crawloverbaseball)) # 해외야구
     app.add_handler(CommandHandler("crawlbasketball", crawlbasketball))     # 농구
     app.add_handler(CommandHandler("crawlvolleyball", crawlvolleyball))     # 배구
+
+    # mazgtv 해외축구 분석 (내일 경기 → tomorrow 시트)
+    app.add_handler(CommandHandler("crawlmazsoccer_tomorrow", crawlmazsoccer_tomorrow))
 
     app.add_handler(CallbackQueryHandler(on_callback))
 
@@ -1363,24 +1751,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
