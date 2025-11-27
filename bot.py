@@ -471,37 +471,6 @@ def reload_analysis_from_sheet():
 
 def append_analysis_rows(day_key: str, rows: list[list[str]]) -> bool:
     """
-    today / tomorrow 시트에 [sport, id, title, summary] 형식의 여러 행을 추가한다.
-    day_key: "today" 또는 "tomorrow"
-    """
-    client = get_gs_client()
-    spreadsheet_id = os.getenv("SPREADSHEET_ID")
-
-    if not (client and spreadsheet_id):
-        print("[GSHEET] append_analysis_rows: 클라이언트 또는 SPREADSHEET_ID 없음")
-        return False
-
-    try:
-        sh = client.open_by_key(spreadsheet_id)
-        sheet_today_name = os.getenv("SHEET_TODAY_NAME", "today")
-        sheet_tomorrow_name = os.getenv("SHEET_TOMORROW_NAME", "tomorrow")
-
-        if day_key == "today":
-            sheet_name = sheet_today_name
-        else:
-            sheet_name = sheet_tomorrow_name
-
-        ws = sh.worksheet(sheet_name)
-        ws.append_rows(rows, value_input_option="RAW")
-        print(f"[GSHEET] append_analysis_rows: {sheet_name} 에 {len(rows)}건 추가")
-        return True
-
-    except Exception as e:
-        print(f"[GSHEET] append_analysis_rows 오류: {e}")
-        return False
-
-def append_analysis_rows(day_key: str, rows: list[list[str]]) -> bool:
-    """
     분석 데이터를 today / tomorrow 탭에 추가하는 공용 함수.
     rows: [ [sport, "", title, summary], ... ]
     """
@@ -1579,97 +1548,6 @@ async def crawl_daum_news_common(
         "/syncsheet 로 텔레그램 메뉴를 갱신할 수 있습니다."
     )
 
-# ───────────────── mazgtv 해외축구 분석 (내일 경기 → tomorrow 시트) ─────────────────
-
-async def crawlmazsoccer_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    https://mazgtv1.com/analyze/overseas 페이지에서
-    내일 날짜에 해당하는 경기들만 골라,
-    tomorrow 시트에 [sport, id, title, summary] 형식으로 저장.
-    """
-    if not is_admin(update):
-        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
-        return
-
-    base_url = "https://mazgtv1.com/analyze/overseas"
-    max_pages = 5
-
-    # 내일 날짜 객체
-    tomorrow_date = get_kst_now().date() + timedelta(days=1)
-    tomorrow_str_for_msg = tomorrow_date.strftime("%m-%d")  # 안내 메시지용
-
-    await update.message.reply_text(
-        f"mazgtv 축구 분석 페이지에서 내일({tomorrow_str_for_msg}) 경기 분석글을 가져옵니다. 잠시만 기다려 주세요..."
-    )
-...
-                    kickoff = info["kickoff"]
-
-                    # ---- 내일 경기인지 판별 ----
-                    mm, dd = extract_mmdd_from_kickoff(kickoff)
-                    if mm is None:
-                        # 날짜를 못 뽑은 경우, 디버깅용으로 로그만 남기고 건너뜀
-                        print(f"[MAZ][LIST] kickoff 파싱 실패: {kickoff!r}")
-                        continue
-
-                    try:
-                        kickoff_date = datetime(
-                            year=tomorrow_date.year,
-                            month=mm,
-                            day=dd,
-                        ).date()
-                    except ValueError:
-                        print(f"[MAZ][LIST] kickoff 잘못된 날짜: {kickoff!r}")
-                        continue
-
-                    if kickoff_date != tomorrow_date:
-                        # 내일이 아니면 스킵
-                        continue
-
-                    league = info["league"] or "해외축구"
-                    home = info["home"] or "홈팀"
-                    away = info["away"] or "원정팀"
-
-                    # 현재는 상세 분석 원문을 긁지 못하므로,
-                    # 리그/팀/시간 정보만으로 프리뷰 분석 생성
-                    new_title, new_summary = summarize_analysis_from_info(
-                        league=league,
-                        home_team=home,
-                        away_team=away,
-                        kickoff_str=kickoff,
-                        max_chars=900,
-                    )
-
-                    rows_to_append.append([
-                        "축구",    # sport
-                        "",        # id (비워두면 _load_analysis_sheet 에서 자동 생성)
-                        new_title,
-                        new_summary,
-                    ])
-
-    except Exception as e:
-        await update.message.reply_text(f"요청 오류가 발생했습니다: {e}")
-        return
-
-    if not rows_to_append:
-        await update.message.reply_text(
-            f"mazgtv 해외축구 페이지에서 내일({tomorrow_key}) 경기 분석에 해당하는 행을 찾지 못했습니다."
-        )
-        return
-
-    ok = append_analysis_rows("tomorrow", rows_to_append)
-    if not ok:
-        await update.message.reply_text("구글시트에 분석 데이터를 저장하지 못했습니다.")
-        return
-
-    # 메모리 갱신 → 텔레그램 메뉴에 바로 반영
-    reload_analysis_from_sheet()
-
-    await update.message.reply_text(
-        f"mazgtv 해외축구 분석에서 내일({tomorrow_key}) 경기 {len(rows_to_append)}건을 "
-        f"'tomorrow' 시트에 저장했습니다.\n"
-        "텔레그램에서 내일 경기 분석픽 메뉴를 열어 확인해보세요."
-    )
-
 # ───────────────── mazgtv 분석 공통 (내일 경기 → today/tomorrow 시트) ─────────────────
 
 async def crawl_maz_analysis_common(
@@ -2067,5 +1945,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
