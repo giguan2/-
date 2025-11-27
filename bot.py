@@ -1574,7 +1574,7 @@ async def crawl_daum_news_common(
 
 # ───────────────── mazgtv 분석 공통 (내일 경기 → today/tomorrow 시트, JSON/API 버전) ─────────────────
 
-MAZ_LIST_API = "https://mazgtv1.com/api/board/list?page=2&perpage=20&boardType=2&category=1&time=1764215660&sort=b.game_start_at+DESC,+b.created_at+DESC"
+MAZ_LIST_API = "https://mazgtv1.com/api/board/list?page={page}&perpage=20&boardType=2&category=1&sort=b.game_start_at+DESC,+b.created_at+DESC"
 # 상세 API 실제 경로에 맞게 여기만 수정하면 됨
 MAZ_DETAIL_API_TEMPLATE = "https://mazgtv1.com/api/board/{board_id}"
 
@@ -1988,6 +1988,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
