@@ -525,7 +525,7 @@ def build_main_inline_menu() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(
-                "{today_str} 스포츠 뉴스 요약",
+                "스포츠 뉴스 요약",
                 url=f"https://t.me/{BOT_USERNAME}?start=news",
             )
         ],
@@ -1363,6 +1363,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
