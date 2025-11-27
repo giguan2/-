@@ -321,19 +321,7 @@ def remove_title_prefix(title: str, body: str) -> str:
 def parse_maz_overseas_row(tr) -> dict | None:
     """
     mazgtv 해외분석 테이블의 <tr> 하나에서
-    리그명 / 홈팀 / 원정팀 / 킥오프 시간 문자열을 추출한다.
-
-    예시 HTML:
-    <tr>
-      <td>AZ 알크마르</td>
-      <td>
-         UEFA 유로파컨퍼런스
-         VS
-         11-28 (금) 02:45
-      </td>
-      <td>쉘본 ...</td>
-      ...
-    </tr>
+    리그명 / 홈팀 / 원정팀 / 킥오프 시간 / 상세 링크를 추출한다.
     """
     tds = tr.find_all("td")
     if len(tds) < 3:
@@ -352,16 +340,16 @@ def parse_maz_overseas_row(tr) -> dict | None:
     away_parts = list(tds[2].stripped_strings)
     away_team = away_parts[0] if away_parts else ""
 
-    # 혹시 나중에 상세 링크가 들어가면 쓰려고 시도해봄 (현재는 없을 수도 있음)
-    a = tr.find("a", href=True)
-    url = a["href"] if a else ""
+    # 상세 링크 (tr 안에 있는 첫 번째 <a href>)
+    a = tr.select_one("a[href]") or tr.find("a", href=True)
+    url = a["href"].strip() if a and a.get("href") else ""
 
     return {
         "league": league.strip(),
         "home": home_team.strip(),
         "away": away_team.strip(),
         "kickoff": kickoff.strip(),
-        "url": url.strip(),
+        "url": url,
     }
 
 def _load_analysis_sheet(sh, sheet_name: str) -> dict:
@@ -1293,6 +1281,42 @@ def summarize_analysis_from_info(
             body = simple_summarize(body, max_chars=max_chars)
         return (title_fallback or "[제목 없음]", body)
 
+def extract_main_text_from_html(soup: BeautifulSoup) -> str:
+    """
+    mazgtv 분석 상세 페이지에서 본문 텍스트를 최대한 잘 뽑아서 리턴.
+    HTML 구조를 정확히 모를 때를 대비해서 여러 후보 셀렉터를 시도하고,
+    그래도 없으면 body 전체 텍스트를 사용.
+    """
+    # 광고/스크립트 제거
+    for bad in soup.select("script, style, noscript"):
+        try:
+            bad.decompose()
+        except Exception:
+            pass
+
+    candidates = [
+        "div.ql-editor",      # 에디터 본문일 때 자주 쓰는 클래스
+        "div.v-card__text",   # vuetify 카드 본문
+        "div.article-body",
+        "div.view-cont",
+        "div#content",
+        "article",
+        "main",
+    ]
+
+    for sel in candidates:
+        el = soup.select_one(sel)
+        if not el:
+            continue
+        text = el.get_text("\n", strip=True)
+        if len(text) >= 200:   # 너무 짧으면 본문이 아닐 가능성
+            return re.sub(r"\s+", " ", text).strip()
+
+    # 후보들에서 못 찾으면 bodyFallback
+    body = soup.body or soup
+    text = body.get_text("\n", strip=True)
+    return re.sub(r"\s+", " ", text).strip()
+
 # ───────────────── Daum harmony API 공통 함수 ─────────────────
 
 async def fetch_daum_news_json(client: httpx.AsyncClient, category_id: str, size: int = 20) -> list[dict]:
@@ -1892,14 +1916,157 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # 해외축구 분석 (내일 경기 → tomorrow 시트)
 async def crawlmazsoccer_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await crawl_maz_analysis_common(
-        update,
-        context,
-        base_url="https://mazgtv1.com/analyze/overseas",  # 해외축구 분석 리스트
-        sport_label="축구",         # 시트에서 종목 이름
-        league_default="해외축구",  # 제목 기본 리그명
-        day_key="tomorrow",        # tomorrow 시트에 저장
-        max_pages=5,               # 필요하면 조절
+    """
+    https://mazgtv1.com/analyze/overseas 리스트에서
+    내일 날짜 경기를 찾은 뒤,
+    각 행의 상세 페이지로 들어가 본문을 요약해서
+    'tomorrow' 시트에 [sport, id, title, summary] 형식으로 저장한다.
+    """
+    if not is_admin(update):
+        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+
+    base_url = "https://mazgtv1.com/analyze/overseas"
+    max_pages = 5  # 페이지 1~5까지 체크 (필요하면 조정)
+
+    tomorrow_date = get_kst_now().date() + timedelta(days=1)
+    tomorrow_key = tomorrow_date.strftime("%m-%d")
+
+    await update.message.reply_text(
+        f"mazgtv 해외축구 분석 리스트에서 내일({tomorrow_key}) 경기만 골라 "
+        f"'tomorrow' 시트에 저장합니다. 잠시만 기다려 주세요..."
+    )
+
+    rows_to_append: list[list[str]] = []
+
+    try:
+        async with httpx.AsyncClient(
+            headers={"User-Agent": "Mozilla/5.0"},
+            follow_redirects=True,
+        ) as client:
+            # 1) 리스트 페이지 순회
+            for page in range(1, max_pages + 1):
+                if page == 1:
+                    url = base_url
+                else:
+                    # 페이지 버튼 눌렀을 때 주소가 다르면 여기만 바꾸면 됨
+                    url = f"{base_url}?page={page}"
+
+                try:
+                    r = await client.get(url, timeout=10.0)
+                    r.raise_for_status()
+                except Exception as e:
+                    print(f"[MAZ][LIST] 페이지 요청 실패 {url}: {e}")
+                    continue
+
+                soup = BeautifulSoup(r.text, "html.parser")
+
+                table = soup.select_one("table")
+                if not table:
+                    print(f"[MAZ][LIST] page {page} 에 table 없음")
+                    if page > 1:
+                        break
+                    else:
+                        continue
+
+                trs = table.select("tbody tr") or table.find_all("tr")
+                if not trs:
+                    print(f"[MAZ][LIST] page {page} 에 tr 없음")
+                    if page > 1:
+                        break
+                    else:
+                        continue
+
+                for tr in trs:
+                    info = parse_maz_overseas_row(tr)
+                    if not info:
+                        continue
+
+                    kickoff = info["kickoff"]
+                    mm, dd = extract_mmdd_from_kickoff(kickoff)
+                    if mm is None:
+                        print(f"[MAZ][LIST] kickoff 파싱 실패: {kickoff!r}")
+                        continue
+
+                    try:
+                        kickoff_date = datetime(
+                            year=tomorrow_date.year,
+                            month=mm,
+                            day=dd,
+                        ).date()
+                    except ValueError:
+                        print(f"[MAZ][LIST] kickoff 잘못된 날짜: {kickoff!r}")
+                        continue
+
+                    # 내일이 아니면 스킵
+                    if kickoff_date != tomorrow_date:
+                        continue
+
+                    # 상세 페이지 링크가 없으면 본문을 읽을 수 없음
+                    detail_url = info.get("url", "")
+                    if not detail_url:
+                        print(f"[MAZ][LIST] 상세 링크 없음: home={info['home']}, away={info['away']}")
+                        continue
+                    if not detail_url.startswith("http"):
+                        detail_url = urljoin(base_url, detail_url)
+
+                    # 2) 상세 페이지 들어가서 본문 추출
+                    try:
+                        r2 = await client.get(detail_url, timeout=10.0)
+                        r2.raise_for_status()
+                    except Exception as e:
+                        print(f"[MAZ][DETAIL] 요청 실패 {detail_url}: {e}")
+                        continue
+
+                    s2 = BeautifulSoup(r2.text, "html.parser")
+                    full_text = extract_main_text_from_html(s2)
+                    if not full_text or len(full_text) < 50:
+                        print(f"[MAZ][DETAIL] 본문 텍스트 부족: {detail_url}")
+                        continue
+
+                    league = info["league"] or "해외축구"
+                    home = info["home"] or "홈팀"
+                    away = info["away"] or "원정팀"
+
+                    # 상세 본문을 가지고 Gemini 요약
+                    new_title, new_body = summarize_analysis_with_gemini(
+                        full_text,
+                        league=league,
+                        home_team=home,
+                        away_team=away,
+                        max_chars=900,
+                    )
+
+                    rows_to_append.append([
+                        "축구",      # sport
+                        "",          # id (비우면 자동 생성)
+                        new_title,   # title
+                        new_body,    # summary
+                    ])
+
+    except Exception as e:
+        await update.message.reply_text(f"mazgtv 크롤링 중 오류가 발생했습니다: {e}")
+        return
+
+    if not rows_to_append:
+        await update.message.reply_text(
+            f"내일({tomorrow_key}) 날짜의 경기 tr은 찾았지만, "
+            "상세 페이지 본문을 읽어 저장할 수 있는 항목이 없었습니다.\n"
+            "▶ tr 안에 <a href=\"...\"> 링크가 있는지 한 번 확인해줘."
+        )
+        return
+
+    ok = append_analysis_rows("tomorrow", rows_to_append)
+    if not ok:
+        await update.message.reply_text("구글시트에 분석 데이터를 저장하지 못했습니다.")
+        return
+
+    reload_analysis_from_sheet()
+
+    await update.message.reply_text(
+        f"mazgtv 해외축구 분석에서 내일({tomorrow_key}) 경기 {len(rows_to_append)}건을 "
+        "'tomorrow' 시트에 저장했습니다.\n"
+        "텔레그램에서 내일 경기 분석픽 메뉴를 열어 확인해봐."
     )
 
 # ───────────────── 실행부 ─────────────────
@@ -1945,6 +2112,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
