@@ -1750,19 +1750,6 @@ async def crawl_maz_analysis_common(
         )
         return
 
-    ok = append_analysis_rows(day_key, rows_to_append)
-    if not ok:
-        await update.message.reply_text("구글시트에 분석 데이터를 저장하지 못했습니다.")
-        return
-
-    reload_analysis_from_sheet()
-
-    await update.message.reply_text(
-        f"mazgtv {sport_label} 분석에서 내일({tomorrow_str}) 경기 분석 {len(rows_to_append)}건을 "
-        f"'{day_key}' 시트에 저장했습니다.\n"
-        "텔레그램에서 경기 분석픽 메뉴를 열어 확인해보세요."
-    )
-
 # ───────────────── 종목별 (Daum 뉴스) 크롤링 명령어 ─────────────────
 
 # 해외축구
@@ -1932,19 +1919,6 @@ async def crawlmazsoccer_tomorrow(update: Update, context: ContextTypes.DEFAULT_
         max_pages=5,
     )
 
-    ok = append_analysis_rows("tomorrow", rows_to_append)
-    if not ok:
-        await update.message.reply_text("구글시트에 분석 데이터를 저장하지 못했습니다.")
-        return
-
-    reload_analysis_from_sheet()
-
-    await update.message.reply_text(
-        f"mazgtv 해외축구 분석에서 내일({tomorrow_key}) 경기 {len(rows_to_append)}건을 "
-        "'tomorrow' 시트에 저장했습니다.\n"
-        "텔레그램에서 내일 경기 분석픽 메뉴를 열어 확인해봐."
-    )
-
 # ───────────────── 실행부 ─────────────────
 
 def main():
@@ -1988,6 +1962,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
