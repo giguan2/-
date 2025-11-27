@@ -14,7 +14,7 @@ from telegram import (
     InlineKeyboardMarkup,
 )
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
 from telegram.ext import (
     ApplicationBuilder,
@@ -1579,7 +1579,7 @@ MAZ_LIST_API = "https://mazgtv1.com/api/board/list?page={page}&perpage=20&boardT
 MAZ_DETAIL_API_TEMPLATE = "https://mazgtv1.com/api/board/{board_id}"
 
 
-def _parse_game_start_date(game_start_at: str) -> datetime.date | None:
+def _parse_game_start_date(game_start_at: str) -> date | None:
     """
     '2025-11-28T05:00:00' 같은 문자열에서 날짜(date)만 뽑는다.
     """
@@ -1694,7 +1694,7 @@ async def crawl_maz_analysis_common(
                     away = item.get("awayTeamName") or ""
 
                     # 2) 상세 페이지 JSON 호출 → content(HTML) 추출
-                    detail_url = MAZ_DETAIL_API_TEMPLATE.format(id=board_id)
+                    detail_url = MAZ_DETAIL_API_TEMPLATE.format(board_id=board_id)
                     try:
                         r2 = await client.get(detail_url, timeout=10.0)
                         r2.raise_for_status()
@@ -1988,6 +1988,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
