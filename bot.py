@@ -942,6 +942,31 @@ def simple_summarize(text: str, max_chars: int = 400) -> str:
 
     return text[:max_chars] + "..."
 
+def extract_mmdd_from_kickoff(kickoff: str) -> tuple[int | None, int | None]:
+    """
+    '11-28 (금) 02:45' 같은 문자열에서 (month, day)를 뽑는다.
+    다른 포맷(예: '11월 28일 02:45')도 대비해서 정규식 두 개를 시도.
+    """
+    if not kickoff:
+        return (None, None)
+
+    text = kickoff.strip()
+
+    # 1) 11-28 (금) 02:45 형태
+    m = re.search(r"(\d{1,2})\s*-\s*(\d{1,2})", text)
+    if not m:
+        # 2) 11월 28일 (금) 02:45 형태
+        m = re.search(r"(\d{1,2})\s*월\s*(\d{1,2})\s*일", text)
+
+    if not m:
+        return (None, None)
+
+    try:
+        month = int(m.group(1))
+        day = int(m.group(2))
+        return (month, day)
+    except ValueError:
+        return (None, None)
 
 # ───────────────── 경기 분석용 Gemini 요약 함수 ─────────────────
 
@@ -1567,57 +1592,37 @@ async def crawlmazsoccer_tomorrow(update: Update, context: ContextTypes.DEFAULT_
         return
 
     base_url = "https://mazgtv1.com/analyze/overseas"
-    max_pages = 5  # 필요하면 조절
-    tomorrow_key = get_tomorrow_mmdd_str()  # 예: '11-28'
+    max_pages = 5
+
+    # 내일 날짜 객체
+    tomorrow_date = get_kst_now().date() + timedelta(days=1)
+    tomorrow_str_for_msg = tomorrow_date.strftime("%m-%d")  # 안내 메시지용
 
     await update.message.reply_text(
-        f"mazgtv 해외축구 분석 페이지에서 내일({tomorrow_key}) 경기 목록을 가져옵니다. 잠시만 기다려 주세요..."
+        f"mazgtv 축구 분석 페이지에서 내일({tomorrow_str_for_msg}) 경기 분석글을 가져옵니다. 잠시만 기다려 주세요..."
     )
-
-    rows_to_append: list[list[str]] = []
-
-    try:
-        async with httpx.AsyncClient(
-            headers={"User-Agent": "Mozilla/5.0"},
-            follow_redirects=True,
-        ) as client:
-
-            for page in range(1, max_pages + 1):
-                if page == 1:
-                    url = base_url
-                else:
-                    # 사이트 페이지네이션 구조에 맞게 조정 필요
-                    # 현재는 ?page=2 형식으로 가정
-                    url = f"{base_url}?page={page}"
-
-                try:
-                    r = await client.get(url, timeout=10.0)
-                    r.raise_for_status()
-                except Exception as e:
-                    print(f"[MAZ][LIST] 페이지 요청 실패 {url}: {e}")
-                    continue
-
-                soup = BeautifulSoup(r.text, "html.parser")
-
-                # 테이블의 모든 tr 선택 (필요하면 더 구체적으로 좁혀도 됨)
-                tr_list = soup.select("table tbody tr")
-                if not tr_list:
-                    # 더 이상 데이터가 없으면 중단
-                    if page > 1:
-                        print(f"[MAZ][LIST] page {page} 에 tr 없음 → 중단")
-                        break
-                    else:
-                        print(f"[MAZ][LIST] page {page} 에 tr 없음")
-                        continue
-
-                for tr in tr_list:
-                    info = parse_maz_overseas_row(tr)
-                    if not info:
-                        continue
-
+...
                     kickoff = info["kickoff"]
-                    if tomorrow_key not in kickoff:
-                        # 내일 날짜가 아닌 경기는 건너뛴다
+
+                    # ---- 내일 경기인지 판별 ----
+                    mm, dd = extract_mmdd_from_kickoff(kickoff)
+                    if mm is None:
+                        # 날짜를 못 뽑은 경우, 디버깅용으로 로그만 남기고 건너뜀
+                        print(f"[MAZ][LIST] kickoff 파싱 실패: {kickoff!r}")
+                        continue
+
+                    try:
+                        kickoff_date = datetime(
+                            year=tomorrow_date.year,
+                            month=mm,
+                            day=dd,
+                        ).date()
+                    except ValueError:
+                        print(f"[MAZ][LIST] kickoff 잘못된 날짜: {kickoff!r}")
+                        continue
+
+                    if kickoff_date != tomorrow_date:
+                        # 내일이 아니면 스킵
                         continue
 
                     league = info["league"] or "해외축구"
@@ -2062,4 +2067,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
