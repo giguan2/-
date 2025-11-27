@@ -77,6 +77,13 @@ def get_date_labels():
     tomorrow_str = f"{tomorrow.month}.{tomorrow.day:02d}"
     return today_str, tomorrow_str
 
+def get_tomorrow_mmdd_str() -> str:
+    """
+    mazgtv 테이블의 '11-28 (금) 02:45' 같은 날짜에서
+    앞부분 'MM-DD' 와 비교하기 위한 내일 날짜 문자열 생성 (예: '11-28')
+    """
+    tomorrow = get_kst_now().date() + timedelta(days=1)
+    return f"{tomorrow.month:02d}-{tomorrow.day:02d}"
 
 def get_tomorrow_keywords():
     """
@@ -311,6 +318,51 @@ def remove_title_prefix(title: str, body: str) -> str:
 
     return b
 
+def parse_maz_overseas_row(tr) -> dict | None:
+    """
+    mazgtv 해외분석 테이블의 <tr> 하나에서
+    리그명 / 홈팀 / 원정팀 / 킥오프 시간 문자열을 추출한다.
+
+    예시 HTML:
+    <tr>
+      <td>AZ 알크마르</td>
+      <td>
+         UEFA 유로파컨퍼런스
+         VS
+         11-28 (금) 02:45
+      </td>
+      <td>쉘본 ...</td>
+      ...
+    </tr>
+    """
+    tds = tr.find_all("td")
+    if len(tds) < 3:
+        return None
+
+    # 홈팀
+    home_parts = list(tds[0].stripped_strings)
+    home_team = home_parts[0] if home_parts else ""
+
+    # 가운데: [리그, VS, 날짜/시간] 구조라고 가정
+    center_parts = list(tds[1].stripped_strings)
+    league = center_parts[0] if center_parts else ""
+    kickoff = center_parts[-1] if center_parts else ""
+
+    # 원정팀
+    away_parts = list(tds[2].stripped_strings)
+    away_team = away_parts[0] if away_parts else ""
+
+    # 혹시 나중에 상세 링크가 들어가면 쓰려고 시도해봄 (현재는 없을 수도 있음)
+    a = tr.find("a", href=True)
+    url = a["href"] if a else ""
+
+    return {
+        "league": league.strip(),
+        "home": home_team.strip(),
+        "away": away_team.strip(),
+        "kickoff": kickoff.strip(),
+        "url": url.strip(),
+    }
 
 def _load_analysis_sheet(sh, sheet_name: str) -> dict:
     """
@@ -417,6 +469,36 @@ def reload_analysis_from_sheet():
 
     print("[GSHEET] ANALYSIS_TODAY / ANALYSIS_TOMORROW 갱신 완료")
 
+def append_analysis_rows(day_key: str, rows: list[list[str]]) -> bool:
+    """
+    today / tomorrow 시트에 [sport, id, title, summary] 형식의 여러 행을 추가한다.
+    day_key: "today" 또는 "tomorrow"
+    """
+    client = get_gs_client()
+    spreadsheet_id = os.getenv("SPREADSHEET_ID")
+
+    if not (client and spreadsheet_id):
+        print("[GSHEET] append_analysis_rows: 클라이언트 또는 SPREADSHEET_ID 없음")
+        return False
+
+    try:
+        sh = client.open_by_key(spreadsheet_id)
+        sheet_today_name = os.getenv("SHEET_TODAY_NAME", "today")
+        sheet_tomorrow_name = os.getenv("SHEET_TOMORROW_NAME", "tomorrow")
+
+        if day_key == "today":
+            sheet_name = sheet_today_name
+        else:
+            sheet_name = sheet_tomorrow_name
+
+        ws = sh.worksheet(sheet_name)
+        ws.append_rows(rows, value_input_option="RAW")
+        print(f"[GSHEET] append_analysis_rows: {sheet_name} 에 {len(rows)}건 추가")
+        return True
+
+    except Exception as e:
+        print(f"[GSHEET] append_analysis_rows 오류: {e}")
+        return False
 
 def append_analysis_rows(day_key: str, rows: list[list[str]]) -> bool:
     """
@@ -1097,6 +1179,125 @@ def summarize_with_gemini(full_text: str, orig_title: str = "", max_chars: int =
         fb_summary = simple_summarize(full_text, max_chars=max_chars)
         return (orig_title or "[제목 없음]", fb_summary)
 
+def summarize_analysis_from_info(
+    league: str,
+    home_team: str,
+    away_team: str,
+    kickoff_str: str,
+    max_chars: int = 900,
+) -> tuple[str, str]:
+    """
+    실제 원문 분석글을 긁어오지 못해도,
+    '리그 / 홈 / 원정 / 시간' 정보만으로
+    프리뷰 형식의 분석 텍스트를 Gemini로 생성한다.
+
+    실패하면 간단한 문장으로 폴백.
+    """
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+    title_fallback = f"[{league}] {home_team} vs {away_team}".strip()
+
+    # 키 없으면 폴백
+    if not GEMINI_API_KEY:
+        body = (
+            f"{league} {home_team}와 {away_team}의 맞대결이다. "
+            f"경기 일정은 {kickoff_str}로 예정되어 있다. "
+            "양 팀의 세부 전력 분석은 추후 업데이트 예정이며, "
+            "현재는 경기 일정 안내용 프리뷰 텍스트만 제공된다."
+        )
+        if len(body) > max_chars:
+            body = simple_summarize(body, max_chars=max_chars)
+        return (title_fallback or "[제목 없음]", body)
+
+    # Gemini 프롬프트
+    prompt = (
+        "다음 정보를 기반으로 한국어 축구 경기 분석 프리뷰를 작성해줘.\n"
+        "실제 스탯 데이터가 없어도 일반적인 축구 분석 표현으로 자연스럽게 추론해서 써도 된다.\n\n"
+        f"리그: {league}\n"
+        f"홈팀: {home_team}\n"
+        f"원정팀: {away_team}\n"
+        f"경기 시간(표기 문자열): {kickoff_str}\n\n"
+        "요구사항:\n"
+        "- 제목 1개와 요약형 분석 본문을 작성할 것\n"
+        "- 제목에는 반드시 '홈팀 vs 원정팀' 형태가 포함될 것\n"
+        "- 본문은 3~6문장, 공백 포함 "
+        f"{max_chars}자 내외로 작성할 것\n"
+        "- 베팅 참고용으로, 양 팀의 스타일/최근 흐름/전술적 포인트를 자연스럽게 추론해 서술\n"
+        "- 실제 특정 경기 결과를 단정하지 말고, '유리해 보인다', '우세할 가능성이 크다' 식으로 표현\n\n"
+        "출력 형식은 꼭 아래처럼만 써줘:\n"
+        "제목: (제목)\n"
+        "요약: (본문)\n"
+        "그 외의 문장은 절대 쓰지 마.\n"
+    )
+
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemini-2.0-flash-001:generateContent"
+    )
+    headers = {"Content-Type": "application/json"}
+    params = {"key": GEMINI_API_KEY}
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt}
+                ]
+            }
+        ]
+    }
+
+    try:
+        print("[GEMINI][ANALYSIS] 요청 시작")
+        resp = requests.post(
+            url,
+            headers=headers,
+            params=params,
+            json=payload,
+            timeout=20,
+        )
+        print("[GEMINI][ANALYSIS] HTTP status:", resp.status_code)
+        resp.raise_for_status()
+        data = resp.json()
+
+        candidates = data.get("candidates") or []
+        if not candidates:
+            raise ValueError("no candidates from Gemini")
+
+        parts = (candidates[0].get("content") or {}).get("parts") or []
+        text_out = "".join(p.get("text", "") for p in parts).strip()
+        if not text_out:
+            raise ValueError("empty response")
+
+        new_title = ""
+        summary = ""
+        for line in text_out.splitlines():
+            line = line.strip()
+            if line.startswith("제목:"):
+                new_title = line[len("제목:"):].strip(" ：:")
+            elif line.startswith("요약:"):
+                summary = line[len("요약:"):].strip(" ：:")
+
+        if not summary:
+            summary = text_out
+
+        if len(summary) > max_chars + 200:
+            summary = summary[: max_chars + 200]
+
+        if not new_title:
+            new_title = title_fallback or "[제목 없음]"
+
+        print("[GEMINI][ANALYSIS] 제목/요약 생성 완료")
+        return (new_title, summary)
+
+    except Exception as e:
+        print(f"[GEMINI][ANALYSIS] 실패 → 폴백 사용: {e}")
+        body = (
+            f"{league} {home_team}와 {away_team}의 경기다. "
+            f"경기 시간은 {kickoff_str}로 예정되어 있다. "
+            "상세 분석은 추후 업데이트 예정이다."
+        )
+        if len(body) > max_chars:
+            body = simple_summarize(body, max_chars=max_chars)
+        return (title_fallback or "[제목 없음]", body)
 
 # ───────────────── Daum harmony API 공통 함수 ─────────────────
 
@@ -1353,6 +1554,116 @@ async def crawl_daum_news_common(
         "/syncsheet 로 텔레그램 메뉴를 갱신할 수 있습니다."
     )
 
+# ───────────────── mazgtv 해외축구 분석 (내일 경기 → tomorrow 시트) ─────────────────
+
+async def crawlmazsoccer_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    https://mazgtv1.com/analyze/overseas 페이지에서
+    내일 날짜에 해당하는 경기들만 골라,
+    tomorrow 시트에 [sport, id, title, summary] 형식으로 저장.
+    """
+    if not is_admin(update):
+        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+
+    base_url = "https://mazgtv1.com/analyze/overseas"
+    max_pages = 5  # 필요하면 조절
+    tomorrow_key = get_tomorrow_mmdd_str()  # 예: '11-28'
+
+    await update.message.reply_text(
+        f"mazgtv 해외축구 분석 페이지에서 내일({tomorrow_key}) 경기 목록을 가져옵니다. 잠시만 기다려 주세요..."
+    )
+
+    rows_to_append: list[list[str]] = []
+
+    try:
+        async with httpx.AsyncClient(
+            headers={"User-Agent": "Mozilla/5.0"},
+            follow_redirects=True,
+        ) as client:
+
+            for page in range(1, max_pages + 1):
+                if page == 1:
+                    url = base_url
+                else:
+                    # 사이트 페이지네이션 구조에 맞게 조정 필요
+                    # 현재는 ?page=2 형식으로 가정
+                    url = f"{base_url}?page={page}"
+
+                try:
+                    r = await client.get(url, timeout=10.0)
+                    r.raise_for_status()
+                except Exception as e:
+                    print(f"[MAZ][LIST] 페이지 요청 실패 {url}: {e}")
+                    continue
+
+                soup = BeautifulSoup(r.text, "html.parser")
+
+                # 테이블의 모든 tr 선택 (필요하면 더 구체적으로 좁혀도 됨)
+                tr_list = soup.select("table tbody tr")
+                if not tr_list:
+                    # 더 이상 데이터가 없으면 중단
+                    if page > 1:
+                        print(f"[MAZ][LIST] page {page} 에 tr 없음 → 중단")
+                        break
+                    else:
+                        print(f"[MAZ][LIST] page {page} 에 tr 없음")
+                        continue
+
+                for tr in tr_list:
+                    info = parse_maz_overseas_row(tr)
+                    if not info:
+                        continue
+
+                    kickoff = info["kickoff"]
+                    if tomorrow_key not in kickoff:
+                        # 내일 날짜가 아닌 경기는 건너뛴다
+                        continue
+
+                    league = info["league"] or "해외축구"
+                    home = info["home"] or "홈팀"
+                    away = info["away"] or "원정팀"
+
+                    # 현재는 상세 분석 원문을 긁지 못하므로,
+                    # 리그/팀/시간 정보만으로 프리뷰 분석 생성
+                    new_title, new_summary = summarize_analysis_from_info(
+                        league=league,
+                        home_team=home,
+                        away_team=away,
+                        kickoff_str=kickoff,
+                        max_chars=900,
+                    )
+
+                    rows_to_append.append([
+                        "축구",    # sport
+                        "",        # id (비워두면 _load_analysis_sheet 에서 자동 생성)
+                        new_title,
+                        new_summary,
+                    ])
+
+    except Exception as e:
+        await update.message.reply_text(f"요청 오류가 발생했습니다: {e}")
+        return
+
+    if not rows_to_append:
+        await update.message.reply_text(
+            f"mazgtv 해외축구 페이지에서 내일({tomorrow_key}) 경기 분석에 해당하는 행을 찾지 못했습니다."
+        )
+        return
+
+    ok = append_analysis_rows("tomorrow", rows_to_append)
+    if not ok:
+        await update.message.reply_text("구글시트에 분석 데이터를 저장하지 못했습니다.")
+        return
+
+    # 메모리 갱신 → 텔레그램 메뉴에 바로 반영
+    reload_analysis_from_sheet()
+
+    await update.message.reply_text(
+        f"mazgtv 해외축구 분석에서 내일({tomorrow_key}) 경기 {len(rows_to_append)}건을 "
+        f"'tomorrow' 시트에 저장했습니다.\n"
+        "텔레그램에서 내일 경기 분석픽 메뉴를 열어 확인해보세요."
+    )
 
 # ───────────────── mazgtv 분석 공통 (내일 경기 → today/tomorrow 시트) ─────────────────
 
@@ -1751,3 +2062,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
