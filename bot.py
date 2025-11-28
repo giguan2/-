@@ -1007,6 +1007,8 @@ def extract_mmdd_from_kickoff(kickoff: str) -> tuple[int | None, int | None]:
 
 # ───────────────── 경기 분석용 Gemini 요약 함수 ─────────────────
 
+# ───────────────── 경기 분석용 Gemini 요약 함수 (팀별 + 픽 형식) ─────────────────
+
 def summarize_analysis_with_gemini(
     full_text: str,
     *,
@@ -1017,52 +1019,83 @@ def summarize_analysis_with_gemini(
 ) -> tuple[str, str]:
     """
     경기 분석 전용 요약 함수.
-    - new_title: 시트의 title 컬럼에 들어갈 제목
-    - summary : 텔레그램에서 보여줄 분석 본문 (구조화된 텍스트)
 
-    실패하면 (자동 생성 제목, simple_summarize(full_text)) 으로 폴백.
+    반환:
+      - new_title: 시트 title 컬럼에 들어갈 제목 (우리가 직접 생성)
+      - summary  : 텔레그램에 뿌릴 본문 (아래 형식)
+
+    예시 형식:
+        오사수나:
+        ...
+
+        소시에다드:
+        ...
+
+        🎯 픽
+        ➡️ 오사수나 승(주력)
+        ➡️ 핸디 승(추천)
+        ➡️ 언더(대안 선택)
     """
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
+    # 타이틀은 모델에 맡기지 않고 우리가 고정 형식으로 만든다.
     base_title = f"[{league}] {home_team} vs {away_team} 경기 분석".strip()
     if not home_team or not away_team:
         base_title = f"[{league}] 해외축구 경기 분석"
 
     # 🔹 원문 먼저 정리 (홍보 문구 제거)
     full_text_clean = clean_maz_text(full_text or "")
-
-    # Gemini 키 없으면 바로 폴백
-    if not GEMINI_API_KEY:
-        print("[GEMINI][ANALYSIS] GEMINI_API_KEY 미설정 → simple_summarize 사용")
-        fb = simple_summarize(full_text_clean, max_chars=max_chars)
-        fb = clean_maz_text(fb)
-        return (base_title or "[경기 분석]", fb)
-
     trimmed = full_text_clean.strip()
     if len(trimmed) > 7000:
         trimmed = trimmed[:7000]
 
+    # Gemini 키가 없으면 폴백 (간단히 같은 형식 흉내만 냄)
+    if not GEMINI_API_KEY:
+        print("[GEMINI][ANALYSIS] GEMINI_API_KEY 미설정 → simple_summarize 사용")
+        core = simple_summarize(trimmed, max_chars=max_chars - 100)
+        core = clean_maz_text(core)
+
+        h = home_team or "홈팀"
+        a = away_team or "원정팀"
+
+        body = (
+            f"{h}:\n"
+            f"{core}\n\n"
+            f"{a}:\n"
+            "상대 전력은 원문을 참고해 판단해야 한다.\n\n"
+            "🎯 픽\n"
+            "➡️ 경기 정보 참고용 텍스트입니다.\n"
+        )
+        return (base_title or "[경기 분석]", body)
+
+    # ── Gemini 프롬프트: "제목"은 만들지 말고, 본문만 위 형식으로 작성하게 함 ──
     prompt = (
         "다음은 해외축구 경기 분석 글 원문이다.\n"
-        "전체 내용을 이해한 뒤, 아래 형식에 맞게 한국어로 다시 작성해줘.\n"
+        "전체 내용을 이해한 뒤, 아래 형식으로 한국어 분석을 다시 작성해줘.\n"
         "문장은 간결하고 직설적으로 쓰고, 원문 문장을 그대로 복사하지 말 것.\n"
         f"전체 길이는 공백 포함 {max_chars}자 내외.\n"
         "\n"
-        "반드시 아래 구조를 지켜서 출력해:\n"
-        "제목: [리그] 홈팀 vs 원정팀 경기 분석\n"
-        "본문:\n"
-        "경기 정보: 한 문단\n"
-        "팀 컨디션 & 최근 흐름: 2~3문장\n"
-        "전력 비교 & 핵심 포인트: 3~5문장\n"
-        "종합 분석: 2~3문장 정리\n"
+        "반드시 아래 형식을 지켜서 출력해.\n"
+        "1) 첫 블록: '홈팀이름:' 으로 시작하고, 그 아래에 홈팀 분석을 2~4문장으로 작성\n"
+        "2) 두 번째 블록: '원정팀이름:' 으로 시작하고, 그 아래에 원정팀 분석을 2~4문장으로 작성\n"
+        "3) 세 번째 블록: 아래 예시처럼 픽 섹션을 붙이기\n"
         "\n"
-        "예시 형식:\n"
-        "제목: [EPL] 맨시티 vs 리버풀 경기 분석\n"
-        "본문:\n"
-        "경기 정보: ...\n"
-        "팀 컨디션 & 최근 흐름: ...\n"
-        "전력 비교 & 핵심 포인트: ...\n"
-        "종합 분석: ...\n"
+        "형식 예시:\n"
+        "오사수나:\n"
+        "쓰리백 기반 + 세컨드볼 압박 강점. 부디미르 롱볼 연계 탄탄, 오로즈·루벤 가르시아의 전진 침투 활발. 후반 압박·에너지 레벨은 홈에서 더욱 상승.\n"
+        "\n"
+        "소시에다드:\n"
+        "점유율 중심 4-1-4-1. 전반은 안정적이지만 후반 세컨드볼 대응 떨어짐. 중원·2선 간격 벌어지면서 루즈볼 놓치고 역습·2차 찬스 허용 반복.\n"
+        "\n"
+        "🎯 픽\n"
+        "➡️ 오사수나 승(주력)\n"
+        "➡️ 핸디 승(추천)\n"
+        "➡️ 언더(대안 선택)\n"
+        "\n"
+        "주의사항:\n"
+        "- 반드시 위와 같은 블록 구조를 유지할 것.\n"
+        "- 실제 승부 결과를 단정하지 말고, '우세해 보인다', '유리해 보인다'처럼 표현해도 된다.\n"
+        "- 홈팀과 원정팀 이름은 아래에 주어진 값을 그대로 사용할 것.\n"
         "\n"
         f"리그: {league}\n"
         f"홈팀: {home_team}\n"
@@ -1078,40 +1111,25 @@ def summarize_analysis_with_gemini(
     )
     headers = {"Content-Type": "application/json"}
     params = {"key": GEMINI_API_KEY}
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    payload = {
+        "contents": [
+            {"parts": [{"text": prompt}]}
+        ]
+    }
 
     try:
         print("[GEMINI][ANALYSIS] 요청 시작")
-
-        # 🔁 429 대비: 최대 3번까지 재시도 (지수 백오프)
-        resp = None
-        for attempt in range(3):
-            try:
-                resp = requests.post(
-                    url,
-                    headers=headers,
-                    params=params,
-                    json=payload,
-                    timeout=25,
-                )
-                print("[GEMINI][ANALYSIS] HTTP status:", resp.status_code)
-                resp.raise_for_status()
-                break
-            except requests.exceptions.HTTPError as e:
-                status = getattr(e.response, "status_code", None)
-                # 429면 잠깐 쉬고 재시도
-                if status == 429 and attempt < 2:
-                    wait_sec = 3 * (attempt + 1)
-                    print(f"[GEMINI][ANALYSIS] 429 Too Many Requests → {wait_sec}초 대기 후 재시도 ({attempt+1}/3)")
-                    time.sleep(wait_sec)
-                    continue
-                # 그 외 에러는 바로 폴백으로
-                raise
-
-        if resp is None:
-            raise RuntimeError("No response from Gemini")
-
+        resp = requests.post(
+            url,
+            headers=headers,
+            params=params,
+            json=payload,
+            timeout=25,
+        )
+        print("[GEMINI][ANALYSIS] HTTP status:", resp.status_code)
+        resp.raise_for_status()
         data = resp.json()
+
         candidates = data.get("candidates") or []
         if not candidates:
             raise ValueError("no candidates from Gemini (analysis)")
@@ -1121,70 +1139,36 @@ def summarize_analysis_with_gemini(
         if not text_out:
             raise ValueError("empty response (analysis)")
 
-        # ── 1단계: 제목/본문 느슨하게 파싱 ──
-        new_title = ""
-        body = ""
+        # 우리는 이제 제목/본문을 따로 파싱하지 않고,
+        # 모델이 돌려준 전체 텍스트를 그대로 본문으로 사용한다.
+        body = text_out
 
-        # 1) "제목: ..." 패턴 먼저 찾기
-        m_title = re.search(r"제목\s*[:：]\s*(.+)", text_out)
-        if m_title:
-            new_title = m_title.group(1).strip()
-
-        # 2) "본문:" 또는 "요약:" 이후를 본문으로
-        m_body = re.search(r"(본문|요약)\s*[:：]\s*(.+)", text_out, flags=re.S)
-        if m_body:
-            body = m_body.group(2).strip()
-        else:
-            # 3) 형식이 많이 깨졌을 때 라인 단위로 다시 한 번 시도
-            lines = text_out.splitlines()
-            tmp_title = ""
-            tmp_body = ""
-            mode = None
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-                # "## 제목:" / "**제목:**" 포함해서 인식
-                if re.match(r"^[#\*\s]*제목\s*[:：]", line):
-                    tmp_title = re.sub(r"^[#\*\s]*제목\s*[:：]\s*", "", line).strip()
-                    mode = None
-                elif re.match(r"^[#\*\s]*본문\s*[:：]", line):
-                    mode = "body"
-                    line_clean = re.sub(r"^[#\*\s]*본문\s*[:：]\s*", "", line).strip()
-                    if line_clean:
-                        tmp_body += line_clean + "\n"
-                else:
-                    if mode == "body":
-                        tmp_body += line + "\n"
-
-            if tmp_title:
-                new_title = tmp_title
-            if tmp_body:
-                body = tmp_body.strip()
-
-        if not new_title:
-            new_title = base_title or "[경기 분석]"
-        if not body:
-            body = text_out
-
-        # ── 2단계: 본문에서 제목이 앞에 한 번 더 나오면 잘라내기 ──
-        body = remove_title_prefix(new_title, body)
-
-        # ── 3단계: maz 홍보 문구/해시태그 한 번 더 제거 ──
+        # maz 홍보 문구/해시태그 한 번 더 제거 + 공백 정리
         body = clean_maz_text(body)
 
-        # ── 4단계: 길이 제한 ──
         if len(body) > max_chars + 200:
             body = body[: max_chars + 200]
 
-        print("[GEMINI][ANALYSIS] 제목/본문 생성 완료")
-        return (new_title, body)
+        print("[GEMINI][ANALYSIS] 본문 생성 완료 (팀별+픽 형식)")
+        return (base_title or "[경기 분석]", body)
 
     except Exception as e:
         print(f"[GEMINI][ANALYSIS] 실패 → simple_summarize 폴백: {e}")
-        fb = simple_summarize(full_text_clean, max_chars=max_chars)
-        fb = clean_maz_text(fb)
-        return (base_title or "[경기 분석]", fb)
+        core = simple_summarize(full_text_clean, max_chars=max_chars - 100)
+        core = clean_maz_text(core)
+
+        h = home_team or "홈팀"
+        a = away_team or "원정팀"
+
+        body = (
+            f"{h}:\n"
+            f"{core}\n\n"
+            f"{a}:\n"
+            "상대 전력은 원문을 참고해 판단해야 한다.\n\n"
+            "🎯 픽\n"
+            "➡️ 경기 정보 참고용 텍스트입니다.\n"
+        )
+        return (base_title or "[경기 분석]", body)
 
 
 # ───────────────── 뉴스용 Gemini 요약 함수 ─────────────────
@@ -2105,5 +2089,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
