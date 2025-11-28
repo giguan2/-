@@ -1574,7 +1574,7 @@ async def crawl_daum_news_common(
 
 # ───────────────── mazgtv 분석 공통 (내일 경기 → today/tomorrow 시트, JSON/API 버전) ─────────────────
 
-MAZ_LIST_API = "https://mazgtv1.com/api/board/list?page={page}&perpage=20&boardType=2&category=1&sort=b.game_start_at+DESC,+b.created_at+DESC"
+MAZ_LIST_API = "https://mazgtv1.com/api/board/list"
 # 상세 API 실제 경로에 맞게 여기만 수정하면 됨
 MAZ_DETAIL_API_TEMPLATE = "https://mazgtv1.com/api/board/{board_id}"
 
@@ -1634,40 +1634,40 @@ async def crawl_maz_analysis_common(
 
             # 1) 리스트 페이지(1~max_pages) 순회
             for page in range(1, max_pages + 1):
-                # 네트워크 탭에서 확인한 파라미터를 그대로 맞춰주는 게 제일 안전함
                 params = {
                     "page": page,
                     "perpage": 20,
                     "boardType": 2,
-                    "category": 1,  # 해외축구 분석 카테고리
-                    # time, sort 는 없어도 되면 빼고, 필요하면 네가 실제 값 그대로 넣어도 됨
-                    "sort": "b_game_start_at+DESC,+b.created_at+DESC",
+                    "category": 1,
+                    # DevTools 에서 본 그대로 맞춰주는 게 제일 안전
+                    "sort": "b.game_start_at+DESC,+b.created_at+DESC",
+                    # time 파라미터가 있으면 여기서 같이 넣어줘도 됨
+                    # "time": "1764215660",
                 }
 
-                try:
-                    r = await client.get(MAZ_LIST_API, params=params, timeout=10.0)
-                    r.raise_for_status()
-                except Exception as e:
-                    print(f"[MAZ][LIST] page={page} 요청 실패: {e}")
-                    continue
+                r = await client.get(MAZ_LIST_API, params=params, timeout=10.0)
 
-                try:
-                    data = r.json()
-                except Exception as e:
-                    print(f"[MAZ][LIST] JSON 파싱 실패(page={page}): {e}")
-                    continue
 
-                # 응답 구조에 따라 rows/list/items 중 하나일 것이라 가정
-                items = (
-                    data.get("rows")
-                    or data.get("list")
-                    or data.get("items")
-                    or data
-                )
+               try:
+                   data = r.json()
+               except Exception as e:
+                   print(f"[MAZ][LIST] JSON 파싱 실패(page={page}): {e}")
+                   continue
 
-                if not isinstance(items, list) or not items:
-                    print(f"[MAZ][LIST] page={page} 항목 없음 → 반복 종료")
-                    break
+               items = None
+               if isinstance(data, dict):
+                   items = (
+                       data.get("rows")
+                       or (data.get("data") or {}).get("rows")
+                       or data.get("list")
+                       or data.get("items")
+                   )
+               else:
+                   items = data
+
+               if not isinstance(items, list) or not items:
+                   print(f"[MAZ][LIST] page={page} 항목 없음 → 반복 종료")
+                   break
 
                 for item in items:
                     if not isinstance(item, dict):
@@ -1749,6 +1749,19 @@ async def crawl_maz_analysis_common(
             f"mazgtv {sport_label} 분석에서 내일({tomorrow_str}) 경기 분석글을 찾지 못했습니다."
         )
         return
+           
+    ok = append_analysis_rows(day_key, rows_to_append)
+    if not ok:
+        await update.message.reply_text("구글시트에 분석 데이터를 저장하지 못했습니다.")
+        return
+
+    reload_analysis_from_sheet()
+
+    await update.message.reply_text(
+        f"mazgtv {sport_label} 분석에서 내일({tomorrow_str}) 경기 분석 {len(rows_to_append)}건을 "
+        f"'{day_key}' 시트에 저장했습니다.\n"
+        "텔레그램에서 경기 분석픽 메뉴를 열어 확인해보세요."
+    )
 
 # ───────────────── 종목별 (Daum 뉴스) 크롤링 명령어 ─────────────────
 
@@ -1962,6 +1975,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
