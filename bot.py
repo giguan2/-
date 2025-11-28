@@ -899,81 +899,6 @@ def simple_summarize(text: str, max_chars: int = 400) -> str:
 
     return text[:max_chars] + "..."
 
-def build_analysis_fallback_body(
-    full_text_clean: str,
-    home_label: str,
-    away_label: str,
-    max_chars: int = 900,
-) -> str:
-    """
-    Gemini가 형식을 안 지켰거나 429 등으로 실패했을 때 사용하는
-    고정 포맷 폴백 본문.
-    홈팀 / 원정팀 / 🎯 픽 구조를 무조건 맞춘다.
-    """
-    core = simple_summarize(full_text_clean, max_chars=max_chars - 200)
-
-    # 대충 반으로 쪼개서 홈/원정에 나눠 넣기 (완벽 X, 형식 유지가 우선)
-    mid = len(core) // 2
-    home_text = core[:mid].strip()
-    away_text = core[mid:].strip()
-
-    if not home_text:
-        home_text = core
-    if not away_text:
-        away_text = core
-
-    body = (
-        f"{home_label}:\n"
-        f"{home_text}\n\n"
-        f"{away_label}:\n"
-        f"{away_text}\n\n"
-        "🎯 픽\n"
-        "➡️ 경기 흐름 참고용 텍스트입니다.\n"
-        "➡️ 실제 베팅 전 라인·부상 정보를 반드시 다시 확인해야 합니다.\n"
-        "➡️ 세부 추천픽은 별도 분석이 필요합니다."
-    )
-
-    if len(body) > max_chars + 200:
-        body = simple_summarize(body, max_chars=max_chars + 100)
-
-    return body
-
-def is_bad_gemini_analysis_output(
-    body: str,
-    full_text_clean: str,
-    home_label: str,
-    away_label: str,
-    max_chars: int,
-) -> bool:
-    """
-    Gemini가 형식을 안 지켰거나, 원문을 거의 그대로 토해냈는지 판단.
-    True면 폴백으로 다시 만드는 게 좋다는 의미.
-    """
-    if not body:
-        return True
-
-    # 너무 길면 그냥 실패로 간주
-    if len(body) > max_chars * 2:
-        return True
-
-    clean_full = clean_maz_text(full_text_clean)
-    clean_body = clean_maz_text(body)
-
-    # 1) body 앞부분이 원문에 그대로 포함돼 있으면 → 원문 복붙으로 간주
-    head = clean_body[:200]
-    if len(head) >= 60 and head in clean_full:
-        return True
-
-    # 2) 프롬프트에 들어간 구분선이 그대로 나오면 실패
-    if "===== 경기 분석 원문 =====" in body:
-        return True
-
-    # 3) 필수 섹션(홈/원정/픽) 없으면 실패
-    if home_label + ":" not in body or away_label + ":" not in body or "🎯 픽" not in body:
-        return True
-
-    return False
-
 # 🔹 mazgtv 홍보 문구/해시태그 공통 제거용 패턴
 MAZ_REMOVE_PATTERNS = [
     # 기본 홍보 문구
@@ -1092,33 +1017,45 @@ def summarize_analysis_with_gemini(
     """
     경기 분석 전용 요약 함수.
 
-    - Gemini가 형식을 잘 지키면 그대로 사용
-    - 형식을 안 지키거나, 원문 거의 그대로일 경우
-      → build_analysis_fallback_body() 로 강제 포맷 적용
+    - Gemini가 정상 응답을 주면 그대로 사용
+    - 429 등으로 아예 실패(예외)가 난 경우에만 simple_summarize 폴백 사용
     """
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
+    # 기본 제목
     if home_team and away_team:
         base_title = f"[{league}] {home_team} vs {away_team} 경기 분석"
     else:
         base_title = f"[{league}] 해외축구 경기 분석"
 
+    # 원문 정리 (홍보 문구 제거)
     full_text_clean = clean_maz_text(full_text or "").strip()
+
     home_label = home_team or "홈팀"
     away_label = away_team or "원정팀"
 
-    # ── 키가 없으면 바로 폴백 ──
+    # ───── Gemini 키가 없을 때: 폴백 ─────
     if not GEMINI_API_KEY:
-        print("[GEMINI][ANALYSIS] GEMINI_API_KEY 미설정 → 폴백 포맷 사용")
-        body = build_analysis_fallback_body(
-            full_text_clean, home_label, away_label, max_chars=max_chars
+        print("[GEMINI][ANALYSIS] GEMINI_API_KEY 미설정 → simple_summarize 폴백 사용")
+
+        core = simple_summarize(full_text_clean, max_chars=max_chars)
+
+        body = (
+            f"{home_label} & {away_label}:\n"
+            f"{core}\n\n"
+            "🎯 픽\n"
+            "➡️ 경기 흐름 참고용 텍스트입니다.\n"
+            "➡️ 실제 베팅 전 라인·부상 정보를 반드시 다시 확인해야 합니다.\n"
+            "➡️ 세부 추천픽은 별도 분석이 필요합니다."
         )
         return (base_title or "[경기 분석]", body)
 
+    # 원문 길이 제한
     trimmed = full_text_clean
     if len(trimmed) > 7000:
         trimmed = trimmed[:7000]
 
+    # ───── Gemini 프롬프트 ─────
     prompt = (
         "다음은 해외축구 경기 분석 글 원문이다.\n"
         "전체 내용을 이해한 뒤, 아래 형식에 맞게 한국어로 다시 작성해줘.\n"
@@ -1191,7 +1128,7 @@ def summarize_analysis_with_gemini(
         if not text_out:
             raise ValueError("empty response (analysis)")
 
-        # ── 제목 / 본문 분리 ──
+        # ───── 1단계: 제목/본문 분리 (제목: / 요약:) ─────
         new_title = ""
         body = ""
 
@@ -1210,56 +1147,33 @@ def summarize_analysis_with_gemini(
 
         # 제목이 본문 맨 앞에 또 나오면 제거
         body = remove_title_prefix(new_title, body)
+
+        # 불필요 문구/공백 정리
         body = clean_maz_text(body)
 
-        # ── 1단계: 형식 검사 → 이상하면 폴백으로 재생성 ──
-        if is_bad_gemini_analysis_output(
-            body, full_text_clean, home_label, away_label, max_chars
-        ):
-            print("[GEMINI][ANALYSIS] 형식 불일치 또는 원문 복붙 → 폴백 포맷 사용")
-            body = build_analysis_fallback_body(
-                full_text_clean, home_label, away_label, max_chars=max_chars
-            )
-        else:
-            # ── 2단계: 형식은 괜찮음 → 줄바꿈/섹션 포맷 강제 ──
+        # 🎯 픽 앞에는 항상 한 줄 띄우기
+        body = re.sub(r"\s*🎯\s*픽", "\n\n🎯 픽", body)
+        body = re.sub(r"\n{3,}", "\n\n", body)
 
-            # (1) 홈/원정 레이블 뒤에는 항상 줄바꿈 1개
-            for label in [home_label, away_label]:
-                # label: 뒤에 오는 공백들 싹 정리해서 'label:\n' 로 맞추기
-                body = re.sub(
-                    rf"{re.escape(label)}:\s*",
-                    label + ":\n",
-                    body
-                )
-
-            # (2) 홈/원정 레이블이 문단 중간에 붙어 있으면 한 줄 위로 올리기
-            for label in [home_label, away_label]:
-                pattern = rf"(?<!^)(?<!\n){re.escape(label)}:"
-                body = re.sub(
-                    pattern,
-                    "\n" + label + ":",
-                    body,
-                    flags=re.MULTILINE,
-                )
-
-            # (3) 🎯 픽 앞에는 항상 공백 줄 하나
-            body = re.sub(r"\s*🎯\s*픽", "\n\n🎯 픽", body)
-
-            # (4) 줄바꿈 3개 이상은 2개로 통일
-            body = re.sub(r"\n{3,}", "\n\n", body)
-
-            # (5) 전체 길이 한 번 더 정리
-            if len(body) > max_chars + 200:
-                body = simple_summarize(body, max_chars=max_chars + 100)
+        if len(body) > max_chars + 200:
+            body = simple_summarize(body, max_chars=max_chars + 100)
 
         print("[GEMINI][ANALYSIS] 제목/본문 생성 완료")
         return (new_title, body)
 
     except Exception as e:
-        # 429 포함 모든 예외 → 폴백
-        print(f"[GEMINI][ANALYSIS] 실패 → 폴백 포맷 사용: {e}")
-        body = build_analysis_fallback_body(
-            full_text_clean, home_label, away_label, max_chars=max_chars
+        # 429 등 진짜 에러일 때만 폴백
+        print(f"[GEMINI][ANALYSIS] 실패 → simple_summarize 폴백: {e}")
+
+        core = simple_summarize(full_text_clean, max_chars=max_chars)
+
+        body = (
+            f"{home_label} & {away_label}:\n"
+            f"{core}\n\n"
+            "🎯 픽\n"
+            "➡️ 경기 흐름 참고용 텍스트입니다.\n"
+            "➡️ 실제 베팅 전 라인·부상 정보를 반드시 다시 확인해야 합니다.\n"
+            "➡️ 세부 추천픽은 별도 분석이 필요합니다."
         )
         return (base_title or "[경기 분석]", body)
 
@@ -2181,6 +2095,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
