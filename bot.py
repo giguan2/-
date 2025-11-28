@@ -828,7 +828,7 @@ async def newsclean(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("뉴스 시트를 초기화했습니다. (헤더만 남겨둠) ✅")
 
     except Exception as e:
-        await update.message.reply_text(f"시트 초기화 중 오류가 발생했습니다: {e}")
+        await update.message.reply_text(f"시트 초기화 중 오류: {e}")
         return
 
 
@@ -1715,6 +1715,25 @@ async def crawl_maz_analysis_common(
                     full_text = soup.get_text("\n", strip=True)
                     full_text = re.sub(r"\s+", " ", full_text).strip()
 
+                    # 🔥 홍보/배너 공통 문구 제거
+                    remove_patterns = [
+                        r"실시간\s*스포츠중계",
+                        r"스포츠중계",
+                        r"스포츠분석",
+                        r"스포츠정보",
+                        r"마징가티비",
+                        r"무료중계",
+                        r"배너",
+                        r"스포츠중계\s*바로가기",
+                        r"#\S+",  # 해시태그 전체
+                    ]
+
+                    for pattern in remove_patterns:
+                        full_text = re.sub(pattern, "", full_text, flags=re.IGNORECASE)
+
+                    # 공백 다시 정리
+                    full_text = re.sub(r"\s+", " ", full_text).strip()
+
                     if not full_text:
                         print(f"[MAZ][DETAIL] id={board_id} 본문 텍스트 없음")
                         continue
@@ -1972,15 +1991,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
-
