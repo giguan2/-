@@ -1634,15 +1634,14 @@ async def crawl_maz_analysis_common(
 
             # 1) 리스트 페이지(1~max_pages) 순회
             for page in range(1, max_pages + 1):
-                params = {
-                    "page": page,
-                    "perpage": 20,
-                    "boardType": 2,
-                    "category": 1,
-                    "sort": "b.game_start_at+DESC,+b.created_at+DESC",
-                }
+                # ✅ params 쓰지 말고 URL을 직접 조립해서 + 기호가 그대로 가도록 함
+                list_url = (
+                    f"{MAZ_LIST_API}"
+                    f"?page={page}&perpage=20&boardType=2&category=1"
+                    f"&sort=b.game_start_at+DESC,+b.created_at+DESC"
+                )
 
-                r = await client.get(MAZ_LIST_API, params=params, timeout=10.0)
+                r = await client.get(list_url, timeout=10.0)
                 r.raise_for_status()
 
                 # JSON 파싱
@@ -1973,6 +1972,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
