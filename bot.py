@@ -899,6 +899,33 @@ def simple_summarize(text: str, max_chars: int = 400) -> str:
 
     return text[:max_chars] + "..."
 
+# 🔹 mazgtv 홍보 문구/해시태그 공통 제거용 패턴
+MAZ_REMOVE_PATTERNS = [
+    r"실시간\s*스포츠중계",
+    r"스포츠중계",
+    r"스포츠분석",
+    r"스포츠정보",
+    r"마징가티비",
+    r"마징가\s*티비",
+    r"무료\s*중계",
+    r"무료스포츠중계",
+    r"배너",
+    r"스포츠중계\s*바로가기",
+    r"#\S+",
+]
+
+def clean_maz_text(text: str) -> str:
+    """
+    mazgtv 원문/요약에서 홍보 문구, 해시태그 등을 제거하고
+    공백을 정리해서 돌려준다.
+    """
+    if not text:
+        return ""
+    for pattern in MAZ_REMOVE_PATTERNS:
+        text = re.sub(pattern, "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
 def extract_mmdd_from_kickoff(kickoff: str) -> tuple[int | None, int | None]:
     """
     '11-28 (금) 02:45' 같은 문자열에서 (month, day)를 뽑는다.
@@ -948,12 +975,16 @@ def summarize_analysis_with_gemini(
     if not home_team or not away_team:
         base_title = f"[{league}] 해외축구 경기 분석"
 
+    # 🔹 원문 먼저 정리 (홍보 문구 제거)
+    full_text_clean = clean_maz_text(full_text or "")
+
     if not GEMINI_API_KEY:
         print("[GEMINI][ANALYSIS] GEMINI_API_KEY 미설정 → simple_summarize 사용")
-        fb = simple_summarize(full_text, max_chars=max_chars)
+        fb = simple_summarize(full_text_clean, max_chars=max_chars)
+        fb = clean_maz_text(fb)
         return (base_title or "[경기 분석]", fb)
 
-    trimmed = (full_text or "").strip()
+    trimmed = full_text_clean.strip()
     if len(trimmed) > 7000:
         trimmed = trimmed[:7000]
 
@@ -1021,29 +1052,59 @@ def summarize_analysis_with_gemini(
         if not text_out:
             raise ValueError("empty response (analysis)")
 
+        # ── 1단계: 제목/본문 느슨하게 파싱 ──
         new_title = ""
         body = ""
-        lines = text_out.splitlines()
-        mode = None
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            if line.startswith("제목:"):
-                new_title = line[len("제목:"):].strip(" ：:")
-                mode = None
-            elif line.startswith("본문:"):
-                mode = "body"
-            else:
-                if mode == "body":
-                    body += line + "\n"
+
+        # 1) "제목: ..." 패턴 먼저 찾기
+        m_title = re.search(r"제목\s*[:：]\s*(.+)", text_out)
+        if m_title:
+            new_title = m_title.group(1).strip()
+
+        # 2) "본문:" 또는 "요약:" 이후를 본문으로
+        m_body = re.search(r"(본문|요약)\s*[:：]\s*(.+)", text_out, flags=re.S)
+        if m_body:
+            body = m_body.group(2).strip()
+        else:
+            # 3) 형식이 많이 깨졌을 때 라인 단위로 다시 한 번 시도
+            lines = text_out.splitlines()
+            tmp_title = ""
+            tmp_body = ""
+            mode = None
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                # "## 제목:" / "**제목:**" 포함해서 인식
+                if re.match(r"^[#\*\s]*제목\s*[:：]", line):
+                    tmp_title = re.sub(r"^[#\*\s]*제목\s*[:：]\s*", "", line).strip()
+                    mode = None
+                elif re.match(r"^[#\*\s]*본문\s*[:：]", line):
+                    mode = "body"
+                    line_clean = re.sub(r"^[#\*\s]*본문\s*[:：]\s*", "", line).strip()
+                    if line_clean:
+                        tmp_body += line_clean + "\n"
+                else:
+                    if mode == "body":
+                        tmp_body += line + "\n"
+
+            if tmp_title:
+                new_title = tmp_title
+            if tmp_body:
+                body = tmp_body.strip()
 
         if not new_title:
             new_title = base_title or "[경기 분석]"
         if not body:
             body = text_out
 
-        body = body.strip()
+        # ── 2단계: 본문에서 제목이 앞에 한 번 더 나오면 잘라내기 ──
+        body = remove_title_prefix(new_title, body)
+
+        # ── 3단계: maz 홍보 문구/해시태그 한 번 더 제거 ──
+        body = clean_maz_text(body)
+
+        # ── 4단계: 길이 제한 ──
         if len(body) > max_chars + 200:
             body = body[: max_chars + 200]
 
@@ -1052,7 +1113,8 @@ def summarize_analysis_with_gemini(
 
     except Exception as e:
         print(f"[GEMINI][ANALYSIS] 실패 → simple_summarize 폴백: {e}")
-        fb = simple_summarize(full_text, max_chars=max_chars)
+        fb = simple_summarize(full_text_clean, max_chars=max_chars)
+        fb = clean_maz_text(fb)
         return (base_title or "[경기 분석]", fb)
 
 
@@ -1070,6 +1132,7 @@ def summarize_with_gemini(full_text: str, orig_title: str = "", max_chars: int =
     if not GEMINI_API_KEY:
         print("[GEMINI] GEMINI_API_KEY 미설정 → simple_summarize 사용")
         fb_summary = simple_summarize(full_text, max_chars=max_chars)
+        fb_summary = clean_maz_text(fb_summary)
         return (orig_title or "[제목 없음]", fb_summary)
 
     trimmed = (full_text or "").strip()
@@ -1159,6 +1222,7 @@ def summarize_with_gemini(full_text: str, orig_title: str = "", max_chars: int =
     except Exception as e:
         print(f"[GEMINI] 요약 실패 → simple_summarize로 폴백: {e}")
         fb_summary = simple_summarize(full_text, max_chars=max_chars)
+        fb_summary = clean_maz_text(fb_summary)
         return (orig_title or "[제목 없음]", fb_summary)
 
 def summarize_analysis_from_info(
@@ -1713,26 +1777,7 @@ async def crawl_maz_analysis_common(
                         pass
 
                     full_text = soup.get_text("\n", strip=True)
-                    full_text = re.sub(r"\s+", " ", full_text).strip()
-
-                    # 🔥 홍보/배너 공통 문구 제거
-                    remove_patterns = [
-                        r"실시간\s*스포츠중계",
-                        r"스포츠중계",
-                        r"스포츠분석",
-                        r"스포츠정보",
-                        r"마징가티비",
-                        r"무료중계",
-                        r"배너",
-                        r"스포츠중계\s*바로가기",
-                        r"#\S+",  # 해시태그 전체
-                    ]
-
-                    for pattern in remove_patterns:
-                        full_text = re.sub(pattern, "", full_text, flags=re.IGNORECASE)
-
-                    # 공백 다시 정리
-                    full_text = re.sub(r"\s+", " ", full_text).strip()
+                    full_text = clean_maz_text(full_text)
 
                     if not full_text:
                         print(f"[MAZ][DETAIL] id={board_id} 본문 텍스트 없음")
