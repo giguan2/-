@@ -1641,34 +1641,40 @@ async def crawl_maz_analysis_common(
                     "category": 1,
                     # DevTools 에서 본 그대로 맞춰주는 게 제일 안전
                     "sort": "b.game_start_at+DESC,+b.created_at+DESC",
-                    # time 파라미터가 있으면 여기서 같이 넣어줘도 됨
-                    # "time": "1764215660",
+                    # "time": "1764215660",  # 필요하면 추가
                 }
 
-                r = await client.get(MAZ_LIST_API, params=params, timeout=10.0)
+                # 리스트 API 호출
+                try:
+                    r = await client.get(MAZ_LIST_API, params=params, timeout=10.0)
+                    r.raise_for_status()
+                except Exception as e:
+                    print(f"[MAZ][LIST] page={page} 요청 실패: {e}")
+                    continue
 
+                # JSON 파싱
+                try:
+                    data = r.json()
+                except Exception as e:
+                    print(f"[MAZ][LIST] JSON 파싱 실패(page={page}): {e}")
+                    continue
 
-               try:
-                   data = r.json()
-               except Exception as e:
-                   print(f"[MAZ][LIST] JSON 파싱 실패(page={page}): {e}")
-                   continue
+                # rows / data.rows / list / items 중에서 실제 리스트 찾아보기
+                if isinstance(data, dict):
+                    items = (
+                        data.get("rows")
+                        or (data.get("data") or {}).get("rows")
+                        or data.get("list")
+                        or data.get("items")
+                    )
+                else:
+                    items = data
 
-               items = None
-               if isinstance(data, dict):
-                   items = (
-                       data.get("rows")
-                       or (data.get("data") or {}).get("rows")
-                       or data.get("list")
-                       or data.get("items")
-                   )
-               else:
-                   items = data
+                if not isinstance(items, list) or not items:
+                    print(f"[MAZ][LIST] page={page} 항목 없음 → 반복 종료")
+                    break
 
-               if not isinstance(items, list) or not items:
-                   print(f"[MAZ][LIST] page={page} 항목 없음 → 반복 종료")
-                   break
-
+                # 2) 각 항목 처리
                 for item in items:
                     if not isinstance(item, dict):
                         continue
@@ -1975,6 +1981,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
