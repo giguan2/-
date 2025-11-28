@@ -908,15 +908,11 @@ def build_analysis_fallback_body(
     """
     Gemini가 형식을 안 지켰거나 429 등으로 실패했을 때 사용하는
     고정 포맷 폴백 본문.
+    홈팀 / 원정팀 / 🎯 픽 구조를 무조건 맞춘다.
     """
-    # 전체를 두 덩어리로 나눠서 간단 요약
-    half = max_chars // 2 - 60
-    if half < 100:
-        half = 100
-
     core = simple_summarize(full_text_clean, max_chars=max_chars - 200)
 
-    # 대충 반쯤 잘라서 홈/원정에 나눠 넣기 (완벽할 필요 X, 형식 유지가 우선)
+    # 대충 반으로 쪼개서 홈/원정에 나눠 넣기 (완벽 X, 형식 유지가 우선)
     mid = len(core) // 2
     home_text = core[:mid].strip()
     away_text = core[mid:].strip()
@@ -937,7 +933,6 @@ def build_analysis_fallback_body(
         "➡️ 세부 추천픽은 별도 분석이 필요합니다."
     )
 
-    # 길이 마무리 정리
     if len(body) > max_chars + 200:
         body = simple_summarize(body, max_chars=max_chars + 100)
 
@@ -957,18 +952,23 @@ def is_bad_gemini_analysis_output(
     if not body:
         return True
 
-    # 너무 긴 경우
+    # 너무 길면 그냥 실패로 간주
     if len(body) > max_chars * 2:
         return True
 
-    clean_full_head = clean_maz_text(full_text_clean[:400])
-    clean_body_head = clean_maz_text(body[:400])
+    clean_full = clean_maz_text(full_text_clean)
+    clean_body = clean_maz_text(body)
 
-    # 원문 앞부분과 거의 동일하면 실패로 간주
-    if clean_full_head and clean_body_head and clean_body_head.startswith(clean_full_head[:120]):
+    # 1) body 앞부분이 원문에 그대로 포함돼 있으면 → 원문 복붙으로 간주
+    head = clean_body[:200]
+    if len(head) >= 60 and head in clean_full:
         return True
 
-    # 우리가 원하는 섹션 레이블이 없으면 실패로 간주
+    # 2) 프롬프트에 들어간 구분선이 그대로 나오면 실패
+    if "===== 경기 분석 원문 =====" in body:
+        return True
+
+    # 3) 필수 섹션(홈/원정/픽) 없으면 실패
     if home_label + ":" not in body or away_label + ":" not in body or "🎯 픽" not in body:
         return True
 
@@ -1212,20 +1212,43 @@ def summarize_analysis_with_gemini(
         body = remove_title_prefix(new_title, body)
         body = clean_maz_text(body)
 
-        # 형식 검사 – 형식이 안 맞으면 폴백 포맷으로 재생성
+        # ── 1단계: 형식 검사 → 이상하면 폴백으로 재생성 ──
         if is_bad_gemini_analysis_output(
             body, full_text_clean, home_label, away_label, max_chars
         ):
-            print("[GEMINI][ANALYSIS] 형식 불일치 → 폴백 포맷 사용")
+            print("[GEMINI][ANALYSIS] 형식 불일치 또는 원문 복붙 → 폴백 포맷 사용")
             body = build_analysis_fallback_body(
                 full_text_clean, home_label, away_label, max_chars=max_chars
             )
         else:
-            # 형식이 대충 맞으면 단락/길이만 정리
-            # 🎯 픽 앞에는 항상 한 줄 띄우기
-            body = body.replace("🎯 픽", "\n\n🎯 픽")
+            # ── 2단계: 형식은 괜찮음 → 줄바꿈/섹션 포맷 강제 ──
 
-            # 너무 길면 마지막 '다.' 기준으로 자르기
+            # (1) 홈/원정 레이블 뒤에는 항상 줄바꿈 1개
+            for label in [home_label, away_label]:
+                # label: 뒤에 오는 공백들 싹 정리해서 'label:\n' 로 맞추기
+                body = re.sub(
+                    rf"{re.escape(label)}:\s*",
+                    label + ":\n",
+                    body
+                )
+
+            # (2) 홈/원정 레이블이 문단 중간에 붙어 있으면 한 줄 위로 올리기
+            for label in [home_label, away_label]:
+                pattern = rf"(?<!^)(?<!\n){re.escape(label)}:"
+                body = re.sub(
+                    pattern,
+                    "\n" + label + ":",
+                    body,
+                    flags=re.MULTILINE,
+                )
+
+            # (3) 🎯 픽 앞에는 항상 공백 줄 하나
+            body = re.sub(r"\s*🎯\s*픽", "\n\n🎯 픽", body)
+
+            # (4) 줄바꿈 3개 이상은 2개로 통일
+            body = re.sub(r"\n{3,}", "\n\n", body)
+
+            # (5) 전체 길이 한 번 더 정리
             if len(body) > max_chars + 200:
                 body = simple_summarize(body, max_chars=max_chars + 100)
 
@@ -2158,6 +2181,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
