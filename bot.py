@@ -1153,6 +1153,12 @@ def summarize_analysis_with_gemini(
 
         # 🎯 픽 앞에는 항상 한 줄 띄우기
         body = re.sub(r"\s*🎯\s*픽", "\n\n🎯 픽", body)
+
+        # 모든 '➡' 앞에는 줄바꿈 하나 붙이기
+        # (공백/기존 줄바꿈 싹 지우고 \n➡ 로 통일)
+        body = re.sub(r"\s*➡", "\n➡", body)
+
+        # 줄바꿈 3개 이상은 2개로 정리
         body = re.sub(r"\n{3,}", "\n\n", body)
 
         if len(body) > max_chars + 200:
@@ -1167,13 +1173,16 @@ def summarize_analysis_with_gemini(
 
         core = simple_summarize(full_text_clean, max_chars=max_chars)
 
+        # 폴백도 형식은 최대한 맞춰서
         body = (
-            f"{home_label} & {away_label}:\n"
+            f"{home_label}:\n"
+            f"{core}\n\n"
+            f"{away_label}:\n"
             f"{core}\n\n"
             "🎯 픽\n"
-            "➡️ 경기 흐름 참고용 텍스트입니다.\n"
-            "➡️ 실제 베팅 전 라인·부상 정보를 반드시 다시 확인해야 합니다.\n"
-            "➡️ 세부 추천픽은 별도 분석이 필요합니다."
+            "➡ 경기 흐름 참고용 텍스트입니다.\n"
+            "➡ 실제 베팅 전 라인·부상 정보를 반드시 다시 확인해야 합니다.\n"
+            "➡ 세부 추천픽은 별도 분석이 필요합니다."
         )
         return (base_title or "[경기 분석]", body)
 
@@ -2095,6 +2104,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
