@@ -1598,7 +1598,7 @@ async def crawl_maz_analysis_common(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     *,
-    base_url: str,        # ❗ 이제는 쓰지 않지만 인터페이스 유지용 (무시해도 됨)
+    base_url: str,        # 이제는 쓰지 않지만 인터페이스 유지용
     sport_label: str,     # 시트에 들어갈 sport (예: "축구", "야구")
     league_default: str,  # Gemini 프롬프트에 쓸 기본 리그명 (예: "해외축구")
     day_key: str = "tomorrow",  # "today" or "tomorrow"
@@ -1608,7 +1608,7 @@ async def crawl_maz_analysis_common(
     mazgtv 분석 페이지 공통 크롤러 (JSON API 버전).
 
     1) MAZ_LIST_API 에서 분석 글 리스트를 JSON으로 가져온 뒤,
-       gameStartAt 기준으로 '내일 경기'만 필터링한다.
+       gameStartAt 문자열이 '내일 날짜(YYYY-MM-DD)' 로 시작하는 것만 필터링한다.
     2) 각 경기의 id로 MAZ_DETAIL_API_TEMPLATE 호출 → content(HTML) 수집
     3) HTML을 텍스트로 변환 후, Gemini로 요약해서 today/tomorrow 시트에 저장.
     """
@@ -1616,12 +1616,12 @@ async def crawl_maz_analysis_common(
         await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
         return
 
+    # 한국 기준 내일 날짜
     tomorrow_date = get_kst_now().date() + timedelta(days=1)
-    tomorrow_str = tomorrow_date.strftime("%Y-%m-%d")
+    tomorrow_ymd = tomorrow_date.strftime("%Y-%m-%d")
 
     await update.message.reply_text(
-        f"mazgtv {sport_label} 분석 페이지에서 "
-        f"내일({tomorrow_str}) 경기 분석글을 가져옵니다. 잠시만 기다려 주세요..."
+        f"mazgtv {sport_label} 분석 페이지에서 내일({tomorrow_date}) 경기 분석글을 가져옵니다. 잠시만 기다려 주세요..."
     )
 
     rows_to_append: list[list[str]] = []
@@ -1639,27 +1639,20 @@ async def crawl_maz_analysis_common(
                     "perpage": 20,
                     "boardType": 2,
                     "category": 1,
-                    # DevTools 에서 본 그대로 맞춰주는 게 제일 안전
                     "sort": "b.game_start_at+DESC,+b.created_at+DESC",
-                    # "time": "1764215660",  # 필요하면 추가
                 }
 
-                # 리스트 API 호출
-                try:
-                    r = await client.get(MAZ_LIST_API, params=params, timeout=10.0)
-                    r.raise_for_status()
-                except Exception as e:
-                    print(f"[MAZ][LIST] page={page} 요청 실패: {e}")
-                    continue
+                r = await client.get(MAZ_LIST_API, params=params, timeout=10.0)
+                r.raise_for_status()
 
                 # JSON 파싱
                 try:
                     data = r.json()
                 except Exception as e:
                     print(f"[MAZ][LIST] JSON 파싱 실패(page={page}): {e}")
+                    print("  응답 일부:", r.text[:200])
                     continue
 
-                # rows / data.rows / list / items 중에서 실제 리스트 찾아보기
                 if isinstance(data, dict):
                     items = (
                         data.get("rows")
@@ -1674,21 +1667,19 @@ async def crawl_maz_analysis_common(
                     print(f"[MAZ][LIST] page={page} 항목 없음 → 반복 종료")
                     break
 
-                # 2) 각 항목 처리
                 for item in items:
                     if not isinstance(item, dict):
                         continue
 
-                    game_start_at = item.get("gameStartAt") or item.get("gameStartAtText")
-                    game_date = _parse_game_start_date(game_start_at or "")
+                    game_start_at = (
+                        item.get("gameStartAt")
+                        or item.get("gameStartAtText")
+                        or ""
+                    )
+                    game_start_at = str(game_start_at).strip()
 
-                    # 날짜 파싱 실패 → 건너뜀(로그만)
-                    if game_date is None:
-                        print(f"[MAZ][LIST] gameStartAt 파싱 실패: {game_start_at!r}")
-                        continue
-
-                    # 내일 경기만 선택
-                    if game_date != tomorrow_date:
+                    # 내일(YYYY-MM-DD)로 시작하는 경기만 사용
+                    if not game_start_at.startswith(tomorrow_ymd):
                         continue
 
                     board_id = item.get("id")
@@ -1710,7 +1701,7 @@ async def crawl_maz_analysis_common(
                         continue
 
                     content_html = detail.get("content") or ""
-                    if not content_html:
+                    if not str(content_html).strip():
                         print(f"[MAZ][DETAIL] id={board_id} content 없음")
                         continue
 
@@ -1718,9 +1709,10 @@ async def crawl_maz_analysis_common(
                     soup = BeautifulSoup(content_html, "html.parser")
                     try:
                         for bad in soup.select("script, style, .ad, .banner"):
-                            bad.extract()
+                            bad.decompose()
                     except Exception:
                         pass
+
                     full_text = soup.get_text("\n", strip=True)
                     full_text = re.sub(r"\s+", " ", full_text).strip()
 
@@ -1744,18 +1736,18 @@ async def crawl_maz_analysis_common(
                         new_body,
                     ])
 
-            # for page ...
-
     except Exception as e:
         await update.message.reply_text(f"요청 오류가 발생했습니다: {e}")
         return
 
+    # 내일 경기 분석이 한 건도 없으면
     if not rows_to_append:
         await update.message.reply_text(
-            f"mazgtv {sport_label} 분석에서 내일({tomorrow_str}) 경기 분석글을 찾지 못했습니다."
+            f"mazgtv {sport_label} 분석에서 내일({tomorrow_date}) 경기 분석글을 찾지 못했습니다."
         )
         return
-           
+
+    # 4) 시트에 저장
     ok = append_analysis_rows(day_key, rows_to_append)
     if not ok:
         await update.message.reply_text("구글시트에 분석 데이터를 저장하지 못했습니다.")
@@ -1764,7 +1756,7 @@ async def crawl_maz_analysis_common(
     reload_analysis_from_sheet()
 
     await update.message.reply_text(
-        f"mazgtv {sport_label} 분석에서 내일({tomorrow_str}) 경기 분석 {len(rows_to_append)}건을 "
+        f"mazgtv {sport_label} 분석에서 내일({tomorrow_date}) 경기 분석 {len(rows_to_append)}건을 "
         f"'{day_key}' 시트에 저장했습니다.\n"
         "텔레그램에서 경기 분석픽 메뉴를 열어 확인해보세요."
     )
@@ -1981,6 +1973,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
