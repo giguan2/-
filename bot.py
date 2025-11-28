@@ -948,6 +948,9 @@ MAZ_REMOVE_PATTERNS = [
     r"마무리\s*코멘트",
     r"마무리\s*정리",
 
+    # 사이트로 유도하는 꼬리 문구
+    r"에서\s*확인하세요[^\n]*",
+
     # 픽 라인 (승/무/패, 핸디, 언더오버)
     r"\[승/무/패\][^\n]+",
     r"\[핸디\][^\n]+",
@@ -1028,6 +1031,7 @@ def summarize_analysis_with_gemini(
     # 🔹 원문 먼저 정리 (홍보 문구 제거)
     full_text_clean = clean_maz_text(full_text or "")
 
+    # Gemini 키 없으면 바로 폴백
     if not GEMINI_API_KEY:
         print("[GEMINI][ANALYSIS] GEMINI_API_KEY 미설정 → simple_summarize 사용")
         fb = simple_summarize(full_text_clean, max_chars=max_chars)
@@ -1074,25 +1078,40 @@ def summarize_analysis_with_gemini(
     )
     headers = {"Content-Type": "application/json"}
     params = {"key": GEMINI_API_KEY}
-    payload = {
-        "contents": [
-            {"parts": [{"text": prompt}]}
-        ]
-    }
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
 
     try:
         print("[GEMINI][ANALYSIS] 요청 시작")
-        resp = requests.post(
-            url,
-            headers=headers,
-            params=params,
-            json=payload,
-            timeout=25,
-        )
-        print("[GEMINI][ANALYSIS] HTTP status:", resp.status_code)
-        resp.raise_for_status()
-        data = resp.json()
 
+        # 🔁 429 대비: 최대 3번까지 재시도 (지수 백오프)
+        resp = None
+        for attempt in range(3):
+            try:
+                resp = requests.post(
+                    url,
+                    headers=headers,
+                    params=params,
+                    json=payload,
+                    timeout=25,
+                )
+                print("[GEMINI][ANALYSIS] HTTP status:", resp.status_code)
+                resp.raise_for_status()
+                break
+            except requests.exceptions.HTTPError as e:
+                status = getattr(e.response, "status_code", None)
+                # 429면 잠깐 쉬고 재시도
+                if status == 429 and attempt < 2:
+                    wait_sec = 3 * (attempt + 1)
+                    print(f"[GEMINI][ANALYSIS] 429 Too Many Requests → {wait_sec}초 대기 후 재시도 ({attempt+1}/3)")
+                    time.sleep(wait_sec)
+                    continue
+                # 그 외 에러는 바로 폴백으로
+                raise
+
+        if resp is None:
+            raise RuntimeError("No response from Gemini")
+
+        data = resp.json()
         candidates = data.get("candidates") or []
         if not candidates:
             raise ValueError("no candidates from Gemini (analysis)")
@@ -2086,4 +2105,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
