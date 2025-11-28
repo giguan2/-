@@ -1151,8 +1151,18 @@ def summarize_analysis_with_gemini(
         # 불필요 문구/공백 정리
         body = clean_maz_text(body)
 
-        # 각 팀 레이블은 항상 단독 줄 시작되도록 강제
-        body = re.sub(r"(?<!^)(?<!\n)([가-힣A-Za-z0-9 .]+:)", r"\n\1", body)
+        # 팀 이름(홈 / 원정)은 항상 줄 맨 앞에서 시작하도록 강제
+        for label in [home_label, away_label]:
+            if label:
+                # 공백 + 팀명 + 콜론 패턴을 모두 '\n팀명:' 으로 통일
+                body = re.sub(
+                    r"\s*" + re.escape(label) + r"\s*:",
+                    "\n" + label + ":",
+                    body
+                )
+
+        # 맨 앞에 쓸데없는 개행이 생겼으면 한 번 정리
+        body = body.lstrip()
 
         # 🎯 픽 앞에는 항상 한 줄 띄우기
         body = re.sub(r"\s*🎯\s*픽", "\n\n🎯 픽", body)
@@ -2107,6 +2117,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
