@@ -2193,6 +2193,28 @@ async def crawlmazsoccer_tomorrow(update: Update, context: ContextTypes.DEFAULT_
         max_pages=5,
     )
 
+async def crawlmazsoccer_kr_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await crawl_maz_analysis_common(
+        update,
+        context,
+        base_url="https://mazgtv1.com/analyze/asia",
+        sport_label="K리그",
+        league_default="K리그",
+        day_key="tomorrow",
+        max_pages=5,
+    )
+
+async def crawlmazsoccer_jp_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await crawl_maz_analysis_common(
+        update,
+        context,
+        base_url="https://mazgtv1.com/analyze/asia",
+        sport_label="J리그",
+        league_default="J리그",
+        day_key="tomorrow",
+        max_pages=5,
+    )
+
 # ───────────────── 실행부 ─────────────────
 
 def main():
@@ -2222,6 +2244,9 @@ def main():
 
     # mazgtv 해외축구 분석 (내일 경기 → tomorrow 시트)
     app.add_handler(CommandHandler("crawlmazsoccer_tomorrow", crawlmazsoccer_tomorrow))
+    app.add_handler(CommandHandler("crawlmazsoccer_kr_tomorrow", crawlmazsoccer_kr_tomorrow))
+    app.add_handler(CommandHandler("crawlmazsoccer_jp_tomorrow", crawlmazsoccer_jp_tomorrow))
+
 
     app.add_handler(CallbackQueryHandler(on_callback))
 
@@ -2236,6 +2261,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
