@@ -6,6 +6,7 @@ import requests
 import httpx
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
+from openai import OpenAI
 
 from telegram import (
     Update,
@@ -899,6 +900,56 @@ def simple_summarize(text: str, max_chars: int = 400) -> str:
 
     return text[:max_chars] + "..."
 
+# 🔹 OpenAI 클라이언트 (요약용)
+_openai_client = None
+
+def get_openai_client():
+    """
+    OPENAI_API_KEY 환경변수 기반으로 OpenAI 클라이언트를 초기화해서 돌려준다.
+    키가 없으면 None을 리턴하고, 에러 시 simple_summarize 폴백을 사용한다.
+    """
+    global _openai_client
+    if _openai_client is not None:
+        return _openai_client
+
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        print("[OPENAI] OPENAI_API_KEY 미설정 → simple_summarize 폴백 사용")
+        return None
+
+    try:
+        _openai_client = OpenAI(api_key=api_key)
+        print("[OPENAI] OpenAI 클라이언트 초기화 완료")
+    except Exception as e:
+        print(f"[OPENAI] 클라이언트 초기화 실패: {e}")
+        _openai_client = None
+    return _openai_client
+
+def ensure_team_line_breaks(body: str, home_team: str, away_team: str) -> str:
+    """
+    요약 본문에서 '홈팀: ... 원정팀:' 이 한 줄에 붙어 있을 때
+    홈팀 블록 / 원정팀 블록 / 🎯 픽 사이에 빈 줄을 강제로 넣어 준다.
+    """
+    if not body:
+        return body
+
+    # 홈팀: ... 원정팀: → 중간에 빈 줄 삽입
+    if home_team:
+        pattern = rf"({re.escape(home_team)}:[^\n]+)\s+({re.escape(away_team)}:)"
+        body = re.sub(pattern, r"\1\n\n\2", body)
+
+    # 원정팀: ... 🎯 픽 → 중간에 빈 줄
+    if away_team:
+        pattern2 = rf"({re.escape(away_team)}:[^\n]+)\s+🎯\s*픽"
+        body = re.sub(pattern2, r"\1\n\n🎯 픽", body)
+
+    # 🎯 픽 라인 자체가 한 줄에 뭉쳐 있으면 줄바꿈 정리
+    body = re.sub(r"🎯\s*픽\s*[\n ]*➡", "🎯 픽\n➡", body)
+
+    # 여러 개 공백을 일반 공백으로 정리
+    body = re.sub(r"[ \t]+", " ", body)
+    return body.strip()
+
 # 🔹 mazgtv 홍보 문구/해시태그 공통 제거용 패턴
 MAZ_REMOVE_PATTERNS = [
     # 기본 홍보 문구
@@ -1015,12 +1066,26 @@ def summarize_analysis_with_gemini(
     max_chars: int = 900,
 ) -> tuple[str, str]:
     """
-    경기 분석 전용 요약 함수.
+    👉 이제는 Gemini 대신 OpenAI(gpt-4.1-mini)를 사용해서
+       '제목 + 팀별 요약 + 🎯 픽' 형식으로 경기 분석을 생성한다.
 
-    - Gemini가 정상 응답을 주면 그대로 사용
-    - 429 등으로 아예 실패(예외)가 난 경우에만 simple_summarize 폴백 사용
+    - return:
+        new_title: 시트 title 컬럼에 들어갈 제목
+        summary  : 아래와 같은 포맷의 텍스트
+
+        홈팀이름:
+        ...
+
+        원정팀이름:
+        ...
+
+        🎯 픽
+        ➡️ ...
+        ➡️ ...
+        ➡️ ...
     """
-    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+
+    client_oa = get_openai_client()
 
     # 기본 제목
     if home_team and away_team:
@@ -1030,16 +1095,15 @@ def summarize_analysis_with_gemini(
 
     # 원문 정리 (홍보 문구 제거)
     full_text_clean = clean_maz_text(full_text or "").strip()
+    if len(full_text_clean) > 7000:
+        full_text_clean = full_text_clean[:7000]
 
-    home_label = home_team or "홈팀"
-    away_label = away_team or "원정팀"
-
-    # ───── Gemini 키가 없을 때: 폴백 ─────
-    if not GEMINI_API_KEY:
-        print("[GEMINI][ANALYSIS] GEMINI_API_KEY 미설정 → simple_summarize 폴백 사용")
-
+    # 🔸 OpenAI 키 없거나 클라이언트 실패 → 예전 simple_summarize 폴백
+    if not client_oa:
+        print("[OPENAI][ANALYSIS] 클라이언트 없음 → simple_summarize 폴백")
+        home_label = home_team or "홈팀"
+        away_label = away_team or "원정팀"
         core = simple_summarize(full_text_clean, max_chars=max_chars)
-
         body = (
             f"{home_label} & {away_label}:\n"
             f"{core}\n\n"
@@ -1050,19 +1114,17 @@ def summarize_analysis_with_gemini(
         )
         return (base_title or "[경기 분석]", body)
 
-    # 원문 길이 제한
-    trimmed = full_text_clean
-    if len(trimmed) > 7000:
-        trimmed = trimmed[:7000]
+    # ───── OpenAI 프롬프트 ─────
+    home_label = home_team or "홈팀"
+    away_label = away_team or "원정팀"
 
-    # ───── Gemini 프롬프트 ─────
     prompt = (
-        "다음은 해외축구 경기 분석 글 원문이다.\n"
-        "전체 내용을 이해한 뒤, 아래 형식에 맞게 한국어로 다시 작성해줘.\n"
+        "다음은 해외축구 경기 분석 원문이다.\n"
+        "전체 내용을 이해한 뒤, 아래 '정확한 형식'에 맞게 한국어로 다시 작성해줘.\n"
         "문장은 간결하고 직설적으로 쓰고, 원문 문장을 그대로 복사하지 말 것.\n"
-        f"전체 길이는 공백 포함 {max_chars}자 내외.\n"
+        f"전체 길이는 공백 포함 {max_chars}자 내외로 맞춰라.\n"
         "\n"
-        "반드시 아래 형식을 그대로 지켜서 출력해:\n"
+        "❗ 반드시 이 형식을 그대로 지켜서 출력해:\n"
         "제목: [리그] 홈팀 vs 원정팀 경기 분석\n"
         "요약:\n"
         "홈팀이름:\n"
@@ -1074,59 +1136,34 @@ def summarize_analysis_with_gemini(
         "🎯 픽\n"
         "➡️ 홈/원정 승, 핸디, 언더/오버 등 3줄 정도로 베팅 관점 코멘트\n"
         "\n"
-        "예시 형식:\n"
-        "제목: [라리가] 오사수나 vs 소시에다드 경기 분석\n"
-        "요약:\n"
-        "오사수나:\n"
-        "쓰리백 기반 + 세컨드볼 압박 강점. 부디미르 롱볼 연계 탄탄, 2선 침투 활발. "
-        "홈에서는 후반 압박 강도와 에너지 레벨이 더 올라가는 편.\n"
-        "\n"
-        "소시에다드:\n"
-        "점유율 중심 4-1-4-1. 전반 빌드업과 1차 압박은 안정적이지만, 후반 세컨드볼 대처가 흔들리며 "
-        "중원 간격이 벌어지고 역습·세컨드 찬스를 허용하는 패턴이 반복됨.\n"
-        "\n"
-        "🎯 픽\n"
-        "➡️ 오사수나 승(주력)\n"
-        "➡️ 핸디 승(추천)\n"
-        "➡️ 언더(대안 선택)\n"
+        "각 블록 사이에는 반드시 빈 줄을 한 줄 넣어라.\n"
+        "특히 '홈팀이름:' 블록과 '원정팀이름:' 블록, 그리고 '🎯 픽' 앞에는 빈 줄을 꼭 넣어라.\n"
         "\n"
         f"리그: {league}\n"
         f"홈팀: {home_label}\n"
         f"원정팀: {away_label}\n"
         "\n"
         "===== 경기 분석 원문 =====\n"
-        f"{trimmed}\n"
+        f"{full_text_clean}\n"
     )
-
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        "gemini-2.0-flash-001:generateContent"
-    )
-    headers = {"Content-Type": "application/json"}
-    params = {"key": GEMINI_API_KEY}
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
 
     try:
-        print("[GEMINI][ANALYSIS] 요청 시작")
-        resp = requests.post(
-            url,
-            headers=headers,
-            params=params,
-            json=payload,
-            timeout=25,
+        resp = client_oa.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL_ANALYSIS", "gpt-4.1-mini"),
+            messages=[
+                {
+                    "role": "system",
+                    "content": "너는 축구 경기 분석을 요약해서 정리하는 한국어 전문가다. "
+                               "문장은 간결하고 직설적으로 쓰고, 형식을 반드시 지킨다.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.4,
+            max_completion_tokens=700,
         )
-        print("[GEMINI][ANALYSIS] HTTP status:", resp.status_code)
-        resp.raise_for_status()
-        data = resp.json()
-
-        candidates = data.get("candidates") or []
-        if not candidates:
-            raise ValueError("no candidates from Gemini (analysis)")
-
-        parts = (candidates[0].get("content") or {}).get("parts") or []
-        text_out = "".join(p.get("text", "") for p in parts).strip()
+        text_out = (resp.choices[0].message.content or "").strip()
         if not text_out:
-            raise ValueError("empty response (analysis)")
+            raise ValueError("empty response from OpenAI (analysis)")
 
         # ───── 1단계: 제목/본문 분리 (제목: / 요약:) ─────
         new_title = ""
@@ -1145,57 +1182,29 @@ def summarize_analysis_with_gemini(
         if not new_title:
             new_title = base_title or "[경기 분석]"
 
-        # 제목이 본문 맨 앞에 또 나오면 제거
         body = remove_title_prefix(new_title, body)
-
-        # 불필요 문구/공백 정리
         body = clean_maz_text(body)
 
-        # 팀 이름(홈 / 원정)은 항상 줄 맨 앞에서 시작하도록 강제
-        for label in [home_label, away_label]:
-            if label:
-                # 공백 + 팀명 + 콜론 패턴을 모두 '\n팀명:' 으로 통일
-                body = re.sub(
-                    r"\s*" + re.escape(label) + r"\s*:",
-                    "\n" + label + ":",
-                    body
-                )
-
-        # 맨 앞에 쓸데없는 개행이 생겼으면 한 번 정리
-        body = body.lstrip()
-
-        # 🎯 픽 앞에는 항상 한 줄 띄우기
-        body = re.sub(r"\s*🎯\s*픽", "\n\n🎯 픽", body)
-
-        # 모든 '➡' 앞에는 줄바꿈 하나 붙이기
-        # (공백/기존 줄바꿈 싹 지우고 \n➡ 로 통일)
-        body = re.sub(r"\s*➡", "\n➡", body)
-
-        # 줄바꿈 3개 이상은 2개로 정리
-        body = re.sub(r"\n{3,}", "\n\n", body)
+        # 팀별 줄바꿈 강제
+        body = ensure_team_line_breaks(body, home_label, away_label)
 
         if len(body) > max_chars + 200:
-            body = simple_summarize(body, max_chars=max_chars + 100)
+            body = body[: max_chars + 200]
 
-        print("[GEMINI][ANALYSIS] 제목/본문 생성 완료")
         return (new_title, body)
 
     except Exception as e:
-        # 429 등 진짜 에러일 때만 폴백
-        print(f"[GEMINI][ANALYSIS] 실패 → simple_summarize 폴백: {e}")
-
+        print(f"[OPENAI][ANALYSIS] 실패 → simple_summarize 폴백: {e}")
+        home_label = home_team or "홈팀"
+        away_label = away_team or "원정팀"
         core = simple_summarize(full_text_clean, max_chars=max_chars)
-
-        # 폴백도 형식은 최대한 맞춰서
         body = (
-            f"{home_label}:\n"
-            f"{core}\n\n"
-            f"{away_label}:\n"
+            f"{home_label} & {away_label}:\n"
             f"{core}\n\n"
             "🎯 픽\n"
-            "➡ 경기 흐름 참고용 텍스트입니다.\n"
-            "➡ 실제 베팅 전 라인·부상 정보를 반드시 다시 확인해야 합니다.\n"
-            "➡ 세부 추천픽은 별도 분석이 필요합니다."
+            "➡️ 경기 정보 참고용 텍스트입니다.\n"
+            "➡️ 실제 베팅 전 라인·부상 정보를 반드시 다시 확인해야 합니다.\n"
+            "➡️ 세부 추천픽은 별도 분석이 필요합니다."
         )
         return (base_title or "[경기 분석]", body)
 
@@ -1203,29 +1212,28 @@ def summarize_analysis_with_gemini(
 
 def summarize_with_gemini(full_text: str, orig_title: str = "", max_chars: int = 400) -> tuple[str, str]:
     """
-    Gemini API를 사용해서 '새로운 기사 제목 + 요약문' 을 생성한다.
-    실패하면 (기존 제목, simple_summarize(full_text)) 으로 폴백.
-    반환값: (new_title, summary)
+    뉴스 기사용 요약 함수.
+    이제 OpenAI(gpt-4.1-mini)를 사용해서
+    '제목: ... / 요약: ...' 형식으로 리라이팅한다.
     """
-    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-
-    # 키 없으면 폴백
-    if not GEMINI_API_KEY:
-        print("[GEMINI] GEMINI_API_KEY 미설정 → simple_summarize 사용")
-        fb_summary = simple_summarize(full_text, max_chars=max_chars)
-        fb_summary = clean_maz_text(fb_summary)
-        return (orig_title or "[제목 없음]", fb_summary)
-
+    client_oa = get_openai_client()
     trimmed = (full_text or "").strip()
     if len(trimmed) > 6000:
         trimmed = trimmed[:6000]
 
-    # 제목 + 요약을 한 번에 뽑도록 프롬프트
+    # 키 없으면 폴백
+    if not client_oa:
+        print("[OPENAI][NEWS] 클라이언트 없음 → simple_summarize 사용")
+        fb_summary = simple_summarize(trimmed, max_chars=max_chars)
+        fb_summary = clean_maz_text(fb_summary)
+        return (orig_title or "[제목 없음]", fb_summary)
+
     prompt = (
         "다음은 스포츠 뉴스 기사 원문과 기존 제목이다.\n"
         "전체 내용을 이해한 뒤, 새로운 한국어 뉴스 헤드라인 1개와 2~3문장짜리 요약을 작성해줘.\n"
         "기사 앞부분을 그대로 복사하지 말 것.\n"
         f"요약 길이는 공백 포함 {max_chars}자 내외.\n"
+        "\n"
         "반드시 아래 형식으로만 출력해:\n"
         "제목: (여기에 새 제목)\n"
         "요약: (여기에 요약문)\n"
@@ -1238,71 +1246,48 @@ def summarize_with_gemini(full_text: str, orig_title: str = "", max_chars: int =
         f"{trimmed}\n"
     )
 
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        "gemini-2.0-flash-001:generateContent"
-    )
-    headers = {"Content-Type": "application/json"}
-    params = {"key": GEMINI_API_KEY}
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": prompt}
-                ]
-            }
-        ]
-    }
-
     try:
-        print("[GEMINI] 요청 시작")
-        resp = requests.post(
-            url,
-            headers=headers,
-            params=params,
-            json=payload,
-            timeout=20,
+        resp = client_oa.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL_NEWS", "gpt-4.1-mini"),
+            messages=[
+                {
+                    "role": "system",
+                    "content": "너는 스포츠 뉴스를 간결하게 요약하는 한국어 기자다. "
+                               "형식을 정확히 지키고, 중복 표현은 줄인다.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.5,
+            max_completion_tokens=450,
         )
-        print("[GEMINI] HTTP status:", resp.status_code)
-        resp.raise_for_status()
-        data = resp.json()
-
-        candidates = data.get("candidates") or []
-        if not candidates:
-            raise ValueError("no candidates from Gemini")
-
-        parts = (candidates[0].get("content") or {}).get("parts") or []
-        text_out = "".join(p.get("text", "") for p in parts).strip()
+        text_out = (resp.choices[0].message.content or "").strip()
         if not text_out:
-            raise ValueError("empty response")
+            raise ValueError("empty response from OpenAI (news)")
 
-        # ---- 출력 파싱 (제목 / 요약 분리) ----
         new_title = ""
         summary = ""
         for line in text_out.splitlines():
             line = line.strip()
             if line.startswith("제목:"):
-                new_title = line[len("제목:"):].strip(" ：:")  # 콜론/공백 제거
+                new_title = line[len("제목:"):].strip(" ：:")
             elif line.startswith("요약:"):
                 summary = line[len("요약:"):].strip(" ：:")
 
-        # 혹시 형식을 안 지켰으면, 전체를 요약으로 보고 제목은 기존 제목 사용
         if not summary:
             summary = text_out
 
-        # 길이 제한
         if len(summary) > max_chars + 100:
             summary = summary[: max_chars + 100]
 
         if not new_title:
             new_title = orig_title or "[제목 없음]"
 
-        print("[GEMINI] 요청 성공, 제목/요약 생성 완료")
+        summary = clean_maz_text(summary)
         return (new_title, summary)
 
     except Exception as e:
-        print(f"[GEMINI] 요약 실패 → simple_summarize로 폴백: {e}")
-        fb_summary = simple_summarize(full_text, max_chars=max_chars)
+        print(f"[OPENAI][NEWS] 요약 실패 → simple_summarize로 폴백: {e}")
+        fb_summary = simple_summarize(trimmed, max_chars=max_chars)
         fb_summary = clean_maz_text(fb_summary)
         return (orig_title or "[제목 없음]", fb_summary)
 
@@ -2117,6 +2102,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
