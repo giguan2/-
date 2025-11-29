@@ -1819,11 +1819,12 @@ async def crawl_maz_analysis_common(
     context: ContextTypes.DEFAULT_TYPE,
     *,
     base_url: str,        # 이제는 쓰지 않지만 인터페이스 유지용
-    sport_label: str,     # 기본 종목 라벨 (예: "축구", "야구")
-    league_default: str,  # 리그명 기본값 (예: "해외축구")
+    sport_label: str,     # "축구" 또는 "야구" 처럼 대분류 이름
+    league_default: str,  # 프롬프트에 쓸 기본 리그명 (예: "해외축구", "해외야구")
     day_key: str = "tomorrow",  # "today" or "tomorrow"
     max_pages: int = 5,
-    category: int = 1,    # ✅ maz 리스트 API category (1: 해외, 2: 아시아 등)
+    board_type: int = 2,       # ⚠️ 리그별 boardType (축구=2, 야구=3 로 가정)
+    category: int = 1,         # ⚠️ 리그별 category (해외/국내 구분)
 ):
     """
     mazgtv 분석 페이지 공통 크롤러 (JSON API 버전).
@@ -1832,6 +1833,9 @@ async def crawl_maz_analysis_common(
        gameStartAt 문자열이 '내일 날짜(YYYY-MM-DD)' 로 시작하는 것만 필터링한다.
     2) 각 경기의 id로 MAZ_DETAIL_API_TEMPLATE 호출 → content(HTML) 수집
     3) HTML을 텍스트로 변환 후, OpenAI로 요약해서 today/tomorrow 시트에 저장.
+
+    ⚠ board_type / category 값은 크롬 개발자도구 Network 탭에서
+      /api/board/list 요청을 보고 실제 값으로 맞춰줘야 한다.
     """
     if not is_admin(update):
         await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
@@ -1855,10 +1859,11 @@ async def crawl_maz_analysis_common(
 
             # 1) 리스트 페이지(1~max_pages) 순회
             for page in range(1, max_pages + 1):
-                # ✅ category 값을 인자로 받아서 사용
+                # ✅ boardType / category 를 파라미터로 받을 수 있게 수정
                 list_url = (
                     f"{MAZ_LIST_API}"
-                    f"?page={page}&perpage=20&boardType=2&category={category}"
+                    f"?page={page}&perpage=20"
+                    f"&boardType={board_type}&category={category}"
                     f"&sort=b.game_start_at+DESC,+b.created_at+DESC"
                 )
 
@@ -1949,20 +1954,33 @@ async def crawl_maz_analysis_common(
                         max_chars=900,
                     )
 
-                    # ✅ 축구인 경우: 리그명으로 세부 카테고리 분리
+                    # 🔻 여기서 시트의 sport 컬럼을 세부 카테고리(해외/국내)로 분리
+                    row_sport = sport_label  # 기본값 ("축구" 또는 "야구")
+
                     if sport_label == "축구":
+                        # 해외축구 / K리그 / J리그 분리
                         if "K리그" in league:
                             row_sport = "K리그"
                         elif "J리그" in league:
                             row_sport = "J리그"
                         else:
                             row_sport = "해외축구"
-                    else:
-                        # 축구 외 종목은 기존 sport_label 그대로 사용
-                        row_sport = sport_label
+
+                    elif sport_label == "야구":
+                        # 해외야구 / KBO / NPB 분리
+                        upper_league = league.upper()
+                        if "KBO" in upper_league:
+                            row_sport = "KBO"
+                        elif "NPB" in upper_league:
+                            row_sport = "NPB"
+                        elif "MLB" in upper_league:
+                            row_sport = "해외야구"
+                        else:
+                            # 혹시 애매하면 기본은 해외야구로 처리
+                            row_sport = "해외야구"
 
                     rows_to_append.append([
-                        row_sport,  # 시트의 sport 컬럼 (해외축구 / K리그 / J리그 / 농구 / 야구 등)
+                        row_sport,  # sport 열 (텔레그램 카테고리와 연결됨)
                         "",         # id (비워두면 로딩 시 자동 생성)
                         new_title,
                         new_body,
@@ -2209,30 +2227,50 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-# 해외축구 분석 (내일 경기 → tomorrow 시트)
+# 해외축구 + K리그 + J리그 분석 (내일 경기 → tomorrow 시트)
 async def crawlmazsoccer_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv1.com/analyze/overseas",  # 의미상 표시용
-        sport_label="축구",       # ✅ 여기서는 "축구"로 두고, 내부에서 해외/K/J로 나눔
+        base_url="https://mazgtv1.com/analyze/overseas",  # 실제로는 API만 사용
+        sport_label="축구",          # ⚠️ 대분류 "축구" (세부 분리는 함수 안에서 처리)
         league_default="해외축구",
         day_key="tomorrow",
         max_pages=5,
-        category=1,              # 🔴 해외 리스트 카테고리 (기존 값)
+        board_type=2,                # ⚠️ 축구 boardType
+        category=1,                  # ⚠️ 축구 category(해외/아시아 통합일 가능성)
     )
 
-# K리그 / J리그 포함 아시아 축구 분석 (내일 경기 → tomorrow 시트)
-async def crawlmazsoccer_kr_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    # 해외야구(MLB)
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv1.com/analyze/asia",  # 의미상 표시용
-        sport_label="축구",         # ✅ 여기서도 "축구" → 내부에서 K리그/J리그로 분리
-        league_default="아시아축구",
+        base_url="https://mazgtv1.com/analyze/mlb",
+        sport_label="야구",      
+        league_default="해외야구",
         day_key="tomorrow",
         max_pages=5,
-        category=2,                # 🔴 asia 리스트 카테고리 (F12로 확인해서 필요시 수정)
+        board_type=3,
+        category=1,
+    )
+
+    # KBO + NPB
+    await crawl_maz_analysis_common(
+        update,
+        context,
+        base_url="https://mazgtv1.com/analyze/baseball",
+        sport_label="야구",
+        league_default="KBO/NPB",
+        day_key="tomorrow",
+        max_pages=5,
+        board_type=3,
+        category=2,
+    )
+
+    await update.message.reply_text(
+        "⚾ 야구(MLB · KBO · NPB) 내일 경기 분석을 모두 불러왔습니다!"
     )
 
 async def crawlmazsoccer_jp_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2292,6 +2330,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
