@@ -2240,7 +2240,7 @@ async def crawlmazsoccer_tomorrow(update: Update, context: ContextTypes.DEFAULT_
 
 async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ✅ 테스트용: 2024-10-30 경기만 가져오기
-    test_date = "2024-10-30"
+    test_date = "2025-10-30"
 
     # 해외야구(MLB)
     await crawl_maz_analysis_common(
@@ -2331,6 +2331,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
