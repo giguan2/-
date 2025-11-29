@@ -2037,53 +2037,58 @@ async def crawlvolleyball(update: Update, context: ContextTypes.DEFAULT_TYPE):
         max_articles=10,
     )
 
-
 # 4) 인라인 버튼 콜백 처리 (분석/뉴스 팝업)
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     data = q.data or ""
     await q.answer()
 
+    # 아무 동작 안 하는 더미 콜백
     if data == "noop":
-        await q.answer()  # 아무 말 없이 무시
         return
-    
+
+    # 메인 메뉴로
     if data == "back_main":
         await q.edit_message_reply_markup(reply_markup=build_main_inline_menu())
         return
 
-    # 축구 하위 카테고리(해외축구 / K리그 / J리그) 선택 시
-    if data.startswith("soccer_cat:"):
-        _, key, subsport = data.split(":", 2)
-        # subsport 값: "해외축구", "K리그", "J리그"
-        await q.edit_message_reply_markup(
-            reply_markup=build_analysis_match_menu(key, subsport)
-        )
-        return
- 
+    # 분석 루트 (오늘/내일 선택 후 종목 선택 화면)
     if data.startswith("analysis_root:"):
-        _, key = data.split(":", 1)
-        await q.edit_message_reply_markup(reply_markup=build_analysis_category_menu(key))
-        return
-
-if data.startswith("analysis_cat:"):
-    _, key, sport = data.split(":", 2)
-
-    # ⚽ 축구 선택 → 해외축구/K리그/J리그 하위 메뉴로 이동
-    if sport == "축구":
+        _, key = data.split(":", 1)  # key = today / tomorrow
         await q.edit_message_reply_markup(
-            reply_markup=build_soccer_subcategory_menu(key)
+            reply_markup=build_analysis_category_menu(key)
         )
         return
 
-    # 그 외 종목 → 기존처럼 바로 첫 페이지 열기
-    await q.edit_message_reply_markup(
-        reply_markup=build_analysis_match_menu(key, sport, page=1)
-    )
-    return
+    # 종목 선택 (축구/농구/야구/배구) → 축구만 2단계, 나머지는 바로 리스트
+    if data.startswith("analysis_cat:"):
+        _, key, sport = data.split(":", 2)  # 예: analysis_cat:today:축구
+
+        # ⚽ 축구 → 해외축구 / K리그 / J리그 서브 카테고리
+        if sport == "축구":
+            await q.edit_message_reply_markup(
+                reply_markup=build_soccer_subcategory_menu(key)
+            )
+            return
+
+        # 그 외 종목 → 바로 경기 리스트 1페이지
+        await q.edit_message_reply_markup(
+            reply_markup=build_analysis_match_menu(key, sport, page=1)
+        )
+        return
+
+    # 축구 하위 카테고리 (해외축구 / K리그 / J리그)
+    if data.startswith("soccer_cat:"):
+        # 예: soccer_cat:today:해외축구
+        _, key, subsport = data.split(":", 2)
+        await q.edit_message_reply_markup(
+            reply_markup=build_analysis_match_menu(key, subsport, page=1)
+        )
+        return
 
     # 경기 리스트 페이지 이동
     if data.startswith("match_page:"):
+        # 예: match_page:today:해외축구:2
         _, key, sport, page_str = data.split(":", 3)
         try:
             page = int(page_str)
@@ -2094,8 +2099,10 @@ if data.startswith("analysis_cat:"):
             reply_markup=build_analysis_match_menu(key, sport, page=page)
         )
         return
-    
+
+    # 개별 경기 선택 → 분석 내용 출력
     if data.startswith("match:"):
+        # 예: match:today:해외축구:축구_1
         _, key, sport, match_id = data.split(":", 3)
         items = ANALYSIS_DATA_MAP.get(key, {}).get(sport, [])
 
@@ -2119,15 +2126,18 @@ if data.startswith("analysis_cat:"):
         await q.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
         return
 
+    # 뉴스 루트
     if data == "news_root":
         await q.edit_message_reply_markup(reply_markup=build_news_category_menu())
         return
 
+    # 뉴스 종목 선택
     if data.startswith("news_cat:"):
         sport = data.split(":", 1)[1]
         await q.edit_message_reply_markup(reply_markup=build_news_list_menu(sport))
         return
 
+    # 뉴스 개별 항목
     if data.startswith("news_item:"):
         try:
             _, sport, news_id = data.split(":", 2)
@@ -2213,6 +2223,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
