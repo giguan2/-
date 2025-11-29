@@ -1803,8 +1803,8 @@ async def crawl_maz_analysis_common(
     context: ContextTypes.DEFAULT_TYPE,
     *,
     base_url: str,        # 이제는 쓰지 않지만 인터페이스 유지용
-    sport_label: str,     # 시트에 들어갈 sport (예: "축구", "야구")
-    league_default: str,  # Gemini 프롬프트에 쓸 기본 리그명 (예: "해외축구")
+    sport_label: str,     # 안내문구용(예: "축구", "야구")
+    league_default: str,  # 프롬프트 기본 리그명 (예: "해외축구")
     day_key: str = "tomorrow",  # "today" or "tomorrow"
     max_pages: int = 5,
 ):
@@ -1814,7 +1814,7 @@ async def crawl_maz_analysis_common(
     1) MAZ_LIST_API 에서 분석 글 리스트를 JSON으로 가져온 뒤,
        gameStartAt 문자열이 '내일 날짜(YYYY-MM-DD)' 로 시작하는 것만 필터링한다.
     2) 각 경기의 id로 MAZ_DETAIL_API_TEMPLATE 호출 → content(HTML) 수집
-    3) HTML을 텍스트로 변환 후, Gemini로 요약해서 today/tomorrow 시트에 저장.
+    3) HTML을 텍스트로 변환 후, OpenAI로 요약해서 today/tomorrow 시트에 저장.
     """
     if not is_admin(update):
         await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
@@ -1923,7 +1923,7 @@ async def crawl_maz_analysis_common(
                         print(f"[MAZ][DETAIL] id={board_id} 본문 텍스트 없음")
                         continue
 
-                    # 3) Gemini로 제목/본문 요약 생성
+                    # 3) OpenAI로 제목/본문 요약 생성
                     new_title, new_body = summarize_analysis_with_gemini(
                         full_text,
                         league=league,
@@ -1932,9 +1932,22 @@ async def crawl_maz_analysis_common(
                         max_chars=900,
                     )
 
+                    # 🔥 리그명 기반으로 시트 sport 컬럼 분류
+                    #   - 해외축구
+                    #   - K리그
+                    #   - J리그
+                    league_str = str(league)
+
+                    if "K리그" in league_str:
+                        row_sport = "K리그"
+                    elif "J리그" in league_str or league_str.startswith("J1") or league_str.startswith("J2"):
+                        row_sport = "J리그"
+                    else:
+                        row_sport = "해외축구"
+
                     rows_to_append.append([
-                        sport_label,  # sport
-                        "",           # id (비워두면 로딩 시 자동 생성)
+                        row_sport,   # sport: 해외축구 / K리그 / J리그
+                        "",          # id (비워두면 로딩 시 자동 생성)
                         new_title,
                         new_body,
                     ])
@@ -2223,6 +2236,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
