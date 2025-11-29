@@ -1803,10 +1803,11 @@ async def crawl_maz_analysis_common(
     context: ContextTypes.DEFAULT_TYPE,
     *,
     base_url: str,        # 이제는 쓰지 않지만 인터페이스 유지용
-    sport_label: str,     # 안내문구용(예: "축구", "야구")
-    league_default: str,  # 프롬프트 기본 리그명 (예: "해외축구")
+    sport_label: str,     # 기본 종목 라벨 (예: "축구", "야구")
+    league_default: str,  # 리그명 기본값 (예: "해외축구")
     day_key: str = "tomorrow",  # "today" or "tomorrow"
     max_pages: int = 5,
+    category: int = 1,    # ✅ maz 리스트 API category (1: 해외, 2: 아시아 등)
 ):
     """
     mazgtv 분석 페이지 공통 크롤러 (JSON API 버전).
@@ -1838,10 +1839,10 @@ async def crawl_maz_analysis_common(
 
             # 1) 리스트 페이지(1~max_pages) 순회
             for page in range(1, max_pages + 1):
-                # ✅ params 쓰지 말고 URL을 직접 조립해서 + 기호가 그대로 가도록 함
+                # ✅ category 값을 인자로 받아서 사용
                 list_url = (
                     f"{MAZ_LIST_API}"
-                    f"?page={page}&perpage=20&boardType=2&category=1"
+                    f"?page={page}&perpage=20&boardType=2&category={category}"
                     f"&sort=b.game_start_at+DESC,+b.created_at+DESC"
                 )
 
@@ -1932,22 +1933,21 @@ async def crawl_maz_analysis_common(
                         max_chars=900,
                     )
 
-                    # 🔥 리그명 기반으로 시트 sport 컬럼 분류
-                    #   - 해외축구
-                    #   - K리그
-                    #   - J리그
-                    league_str = str(league)
-
-                    if "K리그" in league_str:
-                        row_sport = "K리그"
-                    elif "J리그" in league_str or league_str.startswith("J1") or league_str.startswith("J2"):
-                        row_sport = "J리그"
+                    # ✅ 축구인 경우: 리그명으로 세부 카테고리 분리
+                    if sport_label == "축구":
+                        if "K리그" in league:
+                            row_sport = "K리그"
+                        elif "J리그" in league:
+                            row_sport = "J리그"
+                        else:
+                            row_sport = "해외축구"
                     else:
-                        row_sport = "해외축구"
+                        # 축구 외 종목은 기존 sport_label 그대로 사용
+                        row_sport = sport_label
 
                     rows_to_append.append([
-                        row_sport,   # sport: 해외축구 / K리그 / J리그
-                        "",          # id (비워두면 로딩 시 자동 생성)
+                        row_sport,  # 시트의 sport 컬럼 (해외축구 / K리그 / J리그 / 농구 / 야구 등)
+                        "",         # id (비워두면 로딩 시 자동 생성)
                         new_title,
                         new_body,
                     ])
@@ -2186,22 +2186,25 @@ async def crawlmazsoccer_tomorrow(update: Update, context: ContextTypes.DEFAULT_
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv1.com/analyze/overseas",  # 이제는 사실상 의미 없음
-        sport_label="해외축구",
+        base_url="https://mazgtv1.com/analyze/overseas",  # 의미상 표시용
+        sport_label="축구",       # ✅ 여기서는 "축구"로 두고, 내부에서 해외/K/J로 나눔
         league_default="해외축구",
         day_key="tomorrow",
         max_pages=5,
+        category=1,              # 🔴 해외 리스트 카테고리 (기존 값)
     )
 
+# K리그 / J리그 포함 아시아 축구 분석 (내일 경기 → tomorrow 시트)
 async def crawlmazsoccer_kr_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv1.com/analyze/asia",
-        sport_label="K리그",
-        league_default="K리그",
+        base_url="https://mazgtv1.com/analyze/asia",  # 의미상 표시용
+        sport_label="축구",         # ✅ 여기서도 "축구" → 내부에서 K리그/J리그로 분리
+        league_default="아시아축구",
         day_key="tomorrow",
         max_pages=5,
+        category=2,                # 🔴 asia 리스트 카테고리 (F12로 확인해서 필요시 수정)
     )
 
 async def crawlmazsoccer_jp_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2245,7 +2248,7 @@ def main():
     # mazgtv 해외축구 분석 (내일 경기 → tomorrow 시트)
     app.add_handler(CommandHandler("crawlmazsoccer_tomorrow", crawlmazsoccer_tomorrow))
     app.add_handler(CommandHandler("crawlmazsoccer_kr_tomorrow", crawlmazsoccer_kr_tomorrow))
-    app.add_handler(CommandHandler("crawlmazsoccer_jp_tomorrow", crawlmazsoccer_jp_tomorrow))
+
 
 
     app.add_handler(CallbackQueryHandler(on_callback))
@@ -2261,6 +2264,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
