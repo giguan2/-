@@ -925,31 +925,6 @@ def get_openai_client():
         _openai_client = None
     return _openai_client
 
-def ensure_team_line_breaks(body: str, home_team: str, away_team: str) -> str:
-    """
-    요약 본문에서 '홈팀: ... 원정팀:' 이 한 줄에 붙어 있을 때
-    홈팀 블록 / 원정팀 블록 / 🎯 픽 사이에 빈 줄을 강제로 넣어 준다.
-    """
-    if not body:
-        return body
-
-    # 홈팀: ... 원정팀: → 중간에 빈 줄 삽입
-    if home_team:
-        pattern = rf"({re.escape(home_team)}:[^\n]+)\s+({re.escape(away_team)}:)"
-        body = re.sub(pattern, r"\1\n\n\2", body)
-
-    # 원정팀: ... 🎯 픽 → 중간에 빈 줄
-    if away_team:
-        pattern2 = rf"({re.escape(away_team)}:[^\n]+)\s+🎯\s*픽"
-        body = re.sub(pattern2, r"\1\n\n🎯 픽", body)
-
-    # 🎯 픽 라인 자체가 한 줄에 뭉쳐 있으면 줄바꿈 정리
-    body = re.sub(r"🎯\s*픽\s*[\n ]*➡", "🎯 픽\n➡", body)
-
-    # 여러 개 공백을 일반 공백으로 정리
-    body = re.sub(r"[ \t]+", " ", body)
-    return body.strip()
-
 # 🔹 mazgtv 홍보 문구/해시태그 공통 제거용 패턴
 MAZ_REMOVE_PATTERNS = [
     # 기본 홍보 문구
@@ -1055,7 +1030,58 @@ def extract_mmdd_from_kickoff(kickoff: str) -> tuple[int | None, int | None]:
     except ValueError:
         return (None, None)
 
-# ───────────────── 경기 분석용 Gemini 요약 함수 (팀별 + 픽 형식) ─────────────────
+def ensure_team_line_breaks(body: str, home_team: str, away_team: str) -> str:
+    """
+    요약 본문에서 '홈팀: ... 원정팀:' 이 한 줄에 붙어 있을 때
+    홈팀 블록 / 원정팀 블록 / 🎯 픽 사이에 빈 줄을 강제로 넣어 준다.
+    """
+    if not body:
+        return body
+
+    body = body.replace("\r\n", "\n")
+
+    # 홈팀: ... 원정팀: 이 한 줄에 붙어 있으면 강제 분리
+    if home_team and away_team:
+        pattern = rf"({re.escape(home_team)}:[^\n]+)\s+({re.escape(away_team)}:)"
+        body = re.sub(pattern, r"\1\n\n\2", body)
+
+    # 원정팀: ... 🎯 픽 붙어 있으면 분리
+    if away_team:
+        pattern2 = rf"({re.escape(away_team)}:[^\n]+)\s+🎯\s*픽"
+        body = re.sub(pattern2, r"\1\n\n🎯 픽", body)
+
+    # 🎯 픽 라인을 항상 단독 줄로
+    body = re.sub(r"\s*🎯\s*픽\s*", "\n\n🎯 픽\n", body)
+
+    # 여러 공백 정리
+    body = re.sub(r"[ \t]+", " ", body)
+    return body.strip()
+
+
+def _postprocess_analysis_body(body: str, home_label: str, away_label: str) -> str:
+    """
+    - 팀별 블록 사이 줄바꿈 강제
+    - 🎯 픽 아래는 '➡' 로 시작하는 3줄만 남기기
+    """
+    body = ensure_team_line_breaks(body, home_label, away_label)
+
+    if "🎯 픽" in body:
+        head, tail = body.split("🎯 픽", 1)
+        lines = [ln.strip() for ln in tail.splitlines() if ln.strip()]
+
+        # ➡ 로 시작하는 줄만 골라서 최대 3줄
+        picks = [ln for ln in lines if ln.startswith("➡")]
+        picks = picks[:3]
+
+        if picks:
+            tail_norm = "🎯 픽\n" + "\n".join(picks)
+            body = head.rstrip() + "\n\n" + tail_norm
+        else:
+            # 픽이 이상하게 나오면 그냥 잘라버림
+            body = head.rstrip()
+
+    return body.strip()
+
 
 def summarize_analysis_with_gemini(
     full_text: str,
@@ -1066,25 +1092,9 @@ def summarize_analysis_with_gemini(
     max_chars: int = 900,
 ) -> tuple[str, str]:
     """
-    👉 이제는 Gemini 대신 OpenAI(gpt-4.1-mini)를 사용해서
+    👉 이제는 OpenAI(gpt-4.1-mini)를 사용해서
        '제목 + 팀별 요약 + 🎯 픽' 형식으로 경기 분석을 생성한다.
-
-    - return:
-        new_title: 시트 title 컬럼에 들어갈 제목
-        summary  : 아래와 같은 포맷의 텍스트
-
-        홈팀이름:
-        ...
-
-        원정팀이름:
-        ...
-
-        🎯 픽
-        ➡️ ...
-        ➡️ ...
-        ➡️ ...
     """
-
     client_oa = get_openai_client()
 
     # 기본 제목
@@ -1093,20 +1103,19 @@ def summarize_analysis_with_gemini(
     else:
         base_title = f"[{league}] 해외축구 경기 분석"
 
-    # 원문 정리 (홍보 문구 제거)
+    home_label = home_team or "홈팀"
+    away_label = away_team or "원정팀"
+
+    # 원문 정리
     full_text_clean = clean_maz_text(full_text or "").strip()
     if len(full_text_clean) > 7000:
         full_text_clean = full_text_clean[:7000]
 
-    # 🔸 OpenAI 키 없거나 클라이언트 실패 → 예전 simple_summarize 폴백
+    # OpenAI 키 없으면 간단 폴백
     if not client_oa:
-        print("[OPENAI][ANALYSIS] 클라이언트 없음 → simple_summarize 폴백")
-        home_label = home_team or "홈팀"
-        away_label = away_team or "원정팀"
         core = simple_summarize(full_text_clean, max_chars=max_chars)
         body = (
-            f"{home_label} & {away_label}:\n"
-            f"{core}\n\n"
+            f"{home_label}:\n{core}\n\n"
             "🎯 픽\n"
             "➡️ 경기 흐름 참고용 텍스트입니다.\n"
             "➡️ 실제 베팅 전 라인·부상 정보를 반드시 다시 확인해야 합니다.\n"
@@ -1114,25 +1123,22 @@ def summarize_analysis_with_gemini(
         )
         return (base_title or "[경기 분석]", body)
 
-    # ───── OpenAI 프롬프트 ─────
-    home_label = home_team or "홈팀"
-    away_label = away_team or "원정팀"
-
+    # ── 프롬프트 ──
     prompt = f"""
 다음은 해외축구 경기 분석 원문이다.
 전체 내용을 이해한 뒤, 아래에 제시한 ‘엄격한 형식’ 그대로 작성하라.
-⚠️ 원문 문장 그대로 베끼지 말고 반드시 재작성하고, 형식에서 벗어나는 텍스트는 절대 출력하지 마라.
+원문 문장을 그대로 복사하지 말고 반드시 재작성하고, 형식에서 벗어나는 텍스트는 절대 출력하지 마라.
 
 출력 형식은 아래를 정확히 지켜라:
 
 제목: [리그] 홈팀 vs 원정팀 경기 분석
 요약:
-홈팀:
+{home_label}:
 - 문장1
 - 문장2
 (문장 수는 2~3개, 반드시 줄바꿈으로 구분)
 
-원정팀:
+{away_label}:
 - 문장1
 - 문장2
 (문장 수는 2~3개)
@@ -1144,21 +1150,20 @@ def summarize_analysis_with_gemini(
 
 ❗ 절대 금지:
 - 픽 섹션에 설명문 추가 금지
-- 픽을 3줄 초과하거나 fewer than 3줄 금지
-- 홈팀/원정팀 블록 사이 줄바꿈 누락 금지
-- 홈팀과 원정팀 이름 없이 분석 시작 금지
+- 픽을 3줄 초과하거나 3줄보다 적게 쓰는 것 금지
+- {home_label}/{away_label} 블록 사이 줄바꿈 누락 금지
+- 팀 이름 없이 분석 시작 금지
 - 🎯 픽 위에 불필요한 텍스트 출력 금지
 - 형식과 다른 여분 문장 출력 금지
 
 아래는 리그/팀 정보다.
-        "\n"
-        f"리그: {league}\n"
-        f"홈팀: {home_label}\n"
-        f"원정팀: {away_label}\n"
-        "\n"
-        "===== 경기 분석 원문 =====\n"
-        f"{full_text_clean}\n"
-    )
+리그: {league}
+홈팀: {home_label}
+원정팀: {away_label}
+
+===== 경기 분석 원문 =====
+{full_text_clean}
+""".strip()
 
     try:
         resp = client_oa.chat.completions.create(
@@ -1166,8 +1171,10 @@ def summarize_analysis_with_gemini(
             messages=[
                 {
                     "role": "system",
-                    "content": "너는 축구 경기 분석을 요약해서 정리하는 한국어 전문가다. "
-                               "문장은 간결하고 직설적으로 쓰고, 형식을 반드시 지킨다.",
+                    "content": (
+                        "너는 축구 경기 분석을 요약해서 정리하는 한국어 전문가다. "
+                        "문장은 간결하고 직설적으로 쓰고, 형식을 반드시 지킨다."
+                    ),
                 },
                 {"role": "user", "content": prompt},
             ],
@@ -1178,28 +1185,21 @@ def summarize_analysis_with_gemini(
         if not text_out:
             raise ValueError("empty response from OpenAI (analysis)")
 
-        # ───── 1단계: 제목/본문 분리 (제목: / 요약:) ─────
-        new_title = ""
-        body = ""
-
+        # 제목 / 요약 분리
         m_title = re.search(r"제목\s*[:：]\s*(.+)", text_out)
-        if m_title:
-            new_title = m_title.group(1).strip()
-
         m_body = re.search(r"요약\s*[:：]\s*(.+)", text_out, flags=re.S)
-        if m_body:
-            body = m_body.group(1).strip()
-        else:
-            body = text_out
+
+        new_title = (m_title.group(1).strip() if m_title else "").strip()
+        body = (m_body.group(1).strip() if m_body else text_out).strip()
 
         if not new_title:
             new_title = base_title or "[경기 분석]"
 
+        # 제목이 본문에 또 반복되면 잘라내기
         body = remove_title_prefix(new_title, body)
-        body = clean_maz_text(body)
 
-        # 팀별 줄바꿈 강제
-        body = ensure_team_line_breaks(body, home_label, away_label)
+        # 형식 강제 후처리 (팀별 줄바꿈 + 픽 3줄)
+        body = _postprocess_analysis_body(body, home_label, away_label)
 
         if len(body) > max_chars + 200:
             body = body[: max_chars + 200]
@@ -1208,14 +1208,11 @@ def summarize_analysis_with_gemini(
 
     except Exception as e:
         print(f"[OPENAI][ANALYSIS] 실패 → simple_summarize 폴백: {e}")
-        home_label = home_team or "홈팀"
-        away_label = away_team or "원정팀"
         core = simple_summarize(full_text_clean, max_chars=max_chars)
         body = (
-            f"{home_label} & {away_label}:\n"
-            f"{core}\n\n"
+            f"{home_label}:\n{core}\n\n"
             "🎯 픽\n"
-            "➡️ 경기 정보 참고용 텍스트입니다.\n"
+            "➡️ 경기 흐름 참고용 텍스트입니다.\n"
             "➡️ 실제 베팅 전 라인·부상 정보를 반드시 다시 확인해야 합니다.\n"
             "➡️ 세부 추천픽은 별도 분석이 필요합니다."
         )
@@ -2115,6 +2112,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
