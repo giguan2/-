@@ -1845,6 +1845,14 @@ async def crawl_maz_analysis_common(
     tomorrow_date = get_kst_now().date() + timedelta(days=1)
     tomorrow_ymd = tomorrow_date.strftime("%Y-%m-%d")
 
+    # 🎯 날짜 필터 기준 설정
+    #   - 야구 테스트용: 2024-10-30 고정
+    #   - 나머지(축구 등): 내일 날짜
+    if sport_label in ("야구", "KBO", "NPB", "해외야구"):
+        target_ymd = "2024-10-30"   # 테스트 끝나면 tomorrow_ymd 로 바꾸면 됨
+    else:
+        target_ymd = tomorrow_ymd
+
     await update.message.reply_text(
         f"mazgtv {sport_label} 분석 페이지에서 내일({tomorrow_date}) 경기 분석글을 가져옵니다. 잠시만 기다려 주세요..."
     )
@@ -1903,17 +1911,14 @@ async def crawl_maz_analysis_common(
                     )
                     game_start_at = str(game_start_at).strip()
 
-                    # 🔥 야구만 특정 날짜 필터 적용 (10월 30일)
-                    if sport_label in ("야구", "KBO", "NPB", "해외야구"):
-                        target_date = "2025-10-30"
-                        if not game_start_at.startswith(target_date):
-                            continue
+                    # ✅ 공통 날짜 필터 (야구는 2024-10-30, 나머지는 내일)
+                    if not game_start_at.startswith(target_ymd):
+                        continue
                     
                     # 축구는 원래대로 "내일 경기만"
                     else:
                         if not game_start_at.startswith(tomorrow_ymd):
                             continue
-                    # ---------------------------------------
 
                     board_id = item.get("id")
                     if not board_id:
@@ -2014,7 +2019,7 @@ async def crawl_maz_analysis_common(
     reload_analysis_from_sheet()
 
     await update.message.reply_text(
-        f"mazgtv {sport_label} 분석에서 내일({tomorrow_date}) 경기 분석 {len(rows_to_append)}건을 "
+        f"mazgtv {sport_label} 분석에서 {target_ymd} 경기 분석 {len(rows_to_append)}건을 "
         f"'{day_key}' 시트에 저장했습니다.\n"
         "텔레그램에서 경기 분석픽 메뉴를 열어 확인해보세요."
     )
@@ -2338,6 +2343,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
