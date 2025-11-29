@@ -1905,7 +1905,7 @@ async def crawl_maz_analysis_common(
 
                     # 🔥 야구만 특정 날짜 필터 적용 (10월 30일)
                     if sport_label in ("야구", "KBO", "NPB", "해외야구"):
-                        target_date = "2024-10-30"
+                        target_date = "2025-10-30"
                         if not game_start_at.startswith(target_date):
                             continue
                     
@@ -2338,6 +2338,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
