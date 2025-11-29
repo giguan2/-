@@ -1813,6 +1813,57 @@ def _parse_game_start_date(game_start_at: str) -> date | None:
     except Exception:
         return None
 
+def detect_game_date_from_item(item: dict, target_year: int) -> date | None:
+    """
+    mazgtv 리스트 JSON 한 건(item) 전체를 훑으면서
+    'YYYY-MM-DD' 또는 'MM-DD', '10월 30일' 같은 날짜 패턴을 찾아
+    date 객체로 돌려준다.
+    target_year 는 'MM-DD' 처럼 연도가 없는 패턴일 때 보완용.
+    """
+
+    def _iter_values(x):
+        if isinstance(x, dict):
+            for v in x.values():
+                yield from _iter_values(v)
+        elif isinstance(x, list):
+            for v in x:
+                yield from _iter_values(v)
+        else:
+            yield x
+
+    text_values = [v for v in _iter_values(item) if isinstance(v, str)]
+
+    # 1) YYYY-MM-DD 우선
+    for text in text_values:
+        m = re.search(r"(\d{4})-(\d{2})-(\d{2})", text)
+        if m:
+            y, mth, d = map(int, m.groups())
+            try:
+                return date(y, mth, d)
+            except ValueError:
+                continue
+
+    # 2) MM-DD (예: 10-30)
+    for text in text_values:
+        m = re.search(r"(\d{1,2})-(\d{1,2})", text)
+        if m:
+            mth, d = map(int, m.groups())
+            try:
+                return date(target_year, mth, d)
+            except ValueError:
+                continue
+
+    # 3) '10월 30일' 패턴
+    for text in text_values:
+        m = re.search(r"(\d{1,2})\s*월\s*(\d{1,2})\s*일", text)
+        if m:
+            mth, d = map(int, m.groups())
+            try:
+                return date(target_year, mth, d)
+            except ValueError:
+                continue
+
+    return None
 
 async def crawl_maz_analysis_common(
     update: Update,
@@ -1896,23 +1947,13 @@ async def crawl_maz_analysis_common(
                     if not isinstance(item, dict):
                         continue
 
-                    game_start_at_raw = item.get("gameStartAt") or ""
-                    game_start_at_text = item.get("gameStartAtText") or ""
-                
-                    game_start_at_raw = str(game_start_at_raw).strip()
-                    game_start_at_text = str(game_start_at_text).strip()
+                    # 🔍 JSON 전체에서 날짜 자동 감지
+                    item_date = detect_game_date_from_item(item, target_year=target_date.year)
+                    print(f"[MAZ][DEBUG_DATE] page={page} id={board_id} item_date={item_date}")
 
-                    # 🔍 디버그: 1페이지에서 날짜가 어떻게 들어오는지 로그로 확인
-                    print(
-                        "[MAZ][DEBUG] page=%s id=%s gameStartAt=%r gameStartAtText=%r"
-                        % (page, item.get("id"), game_start_at_raw, game_start_at_text)
-                    )
-
-                    # 기존 필터 대신 임시로 아주 느슨하게만 통과시켜서,
-                    # 일단 시트에 뭐가 들어오는지 확인해도 됨.
-                    # 일단 지금은 날짜 필터 주석 처리:
-                    # if not game_start_at_raw.startswith(target_ymd):
-                    #     continue
+                    # 이 날짜가 우리가 원하는 날짜가 아니면 스킵
+                    if item_date != target_date:
+                        continue
 
                     board_id = item.get("id")
                     if not board_id:
@@ -2246,7 +2287,7 @@ async def crawlmazsoccer_tomorrow(update: Update, context: ContextTypes.DEFAULT_
     )
 
 async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ✅ 테스트용: 2024-10-30 경기만 가져오기
+    # ✅ 테스트용: 2025-10-30 경기만 가져오기
     test_date = "2025-10-30"
 
     # 해외야구(MLB)
@@ -2338,6 +2379,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
