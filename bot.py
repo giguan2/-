@@ -1825,36 +1825,29 @@ async def crawl_maz_analysis_common(
     max_pages: int = 5,
     board_type: int = 2,       # ⚠️ 리그별 boardType (축구=2, 야구=3 로 가정)
     category: int = 1,         # ⚠️ 리그별 category (해외/국내 구분)
+    target_ymd: str | None = None,  # ✅ 특정 날짜 강제 (예: "2024-10-30") - 없으면 day_key 기준
 ):
     """
     mazgtv 분석 페이지 공통 크롤러 (JSON API 버전).
 
     1) MAZ_LIST_API 에서 분석 글 리스트를 JSON으로 가져온 뒤,
-       gameStartAt 문자열이 '내일 날짜(YYYY-MM-DD)' 로 시작하는 것만 필터링한다.
+       gameStartAt 문자열이 target_ymd(YYYY-MM-DD) 로 시작하는 것만 필터링한다.
     2) 각 경기의 id로 MAZ_DETAIL_API_TEMPLATE 호출 → content(HTML) 수집
     3) HTML을 텍스트로 변환 후, OpenAI로 요약해서 today/tomorrow 시트에 저장.
-
-    ⚠ board_type / category 값은 크롬 개발자도구 Network 탭에서
-      /api/board/list 요청을 보고 실제 값으로 맞춰줘야 한다.
     """
     if not is_admin(update):
         await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
         return
 
-    # 한국 기준 내일 날짜
-    tomorrow_date = get_kst_now().date() + timedelta(days=1)
-    tomorrow_ymd = tomorrow_date.strftime("%Y-%m-%d")
-
-    # 🎯 날짜 필터 기준 설정
-    #   - 야구 테스트용: 2024-10-30 고정
-    #   - 나머지(축구 등): 내일 날짜
-    if sport_label in ("야구", "KBO", "NPB", "해외야구"):
-        target_ymd = "2024-10-30"   # 테스트 끝나면 tomorrow_ymd 로 바꾸면 됨
-    else:
-        target_ymd = tomorrow_ymd
+    # ✅ 날짜 기준 설정
+    if target_ymd is None:
+        base_date = get_kst_now().date()
+        if day_key == "tomorrow":
+            base_date += timedelta(days=1)
+        target_ymd = base_date.strftime("%Y-%m-%d")
 
     await update.message.reply_text(
-        f"mazgtv {sport_label} 분석 페이지에서 내일({tomorrow_date}) 경기 분석글을 가져옵니다. 잠시만 기다려 주세요..."
+        f"mazgtv {sport_label} 분석 페이지에서 {target_ymd} 경기 분석글을 가져옵니다. 잠시만 기다려 주세요..."
     )
 
     rows_to_append: list[list[str]] = []
@@ -1867,7 +1860,6 @@ async def crawl_maz_analysis_common(
 
             # 1) 리스트 페이지(1~max_pages) 순회
             for page in range(1, max_pages + 1):
-                # ✅ boardType / category 를 파라미터로 받을 수 있게 수정
                 list_url = (
                     f"{MAZ_LIST_API}"
                     f"?page={page}&perpage=20"
@@ -1911,14 +1903,9 @@ async def crawl_maz_analysis_common(
                     )
                     game_start_at = str(game_start_at).strip()
 
-                    # ✅ 공통 날짜 필터 (야구는 2024-10-30, 나머지는 내일)
+                    # ✅ 날짜 필터 : "2024-10-30T..." 같은 것도 앞 10자리 비교
                     if not game_start_at.startswith(target_ymd):
                         continue
-                    
-                    # 축구는 원래대로 "내일 경기만"
-                    else:
-                        if not game_start_at.startswith(tomorrow_ymd):
-                            continue
 
                     board_id = item.get("id")
                     if not board_id:
@@ -1967,11 +1954,10 @@ async def crawl_maz_analysis_common(
                         max_chars=900,
                     )
 
-                    # 🔻 여기서 시트의 sport 컬럼을 세부 카테고리(해외/국내)로 분리
-                    row_sport = sport_label  # 기본값 ("축구" 또는 "야구")
+                    # ✅ 시트 sport 컬럼: 세부 카테고리 분리
+                    row_sport = sport_label  # 기본값
 
                     if sport_label == "축구":
-                        # 해외축구 / K리그 / J리그 분리
                         if "K리그" in league:
                             row_sport = "K리그"
                         elif "J리그" in league:
@@ -1980,7 +1966,6 @@ async def crawl_maz_analysis_common(
                             row_sport = "해외축구"
 
                     elif sport_label == "야구":
-                        # 해외야구 / KBO / NPB 분리
                         upper_league = league.upper()
                         if "KBO" in upper_league:
                             row_sport = "KBO"
@@ -1989,11 +1974,10 @@ async def crawl_maz_analysis_common(
                         elif "MLB" in upper_league:
                             row_sport = "해외야구"
                         else:
-                            # 혹시 애매하면 기본은 해외야구로 처리
                             row_sport = "해외야구"
 
                     rows_to_append.append([
-                        row_sport,  # sport 열 (텔레그램 카테고리와 연결됨)
+                        row_sport,  # sport 열
                         "",         # id (비워두면 로딩 시 자동 생성)
                         new_title,
                         new_body,
@@ -2003,10 +1987,10 @@ async def crawl_maz_analysis_common(
         await update.message.reply_text(f"요청 오류가 발생했습니다: {e}")
         return
 
-    # 내일 경기 분석이 한 건도 없으면
+    # 해당 날짜 경기 없을 때
     if not rows_to_append:
         await update.message.reply_text(
-            f"mazgtv {sport_label} 분석에서 내일({tomorrow_date}) 경기 분석글을 찾지 못했습니다."
+            f"mazgtv {sport_label} 분석에서 {target_ymd} 경기 분석글을 찾지 못했습니다."
         )
         return
 
@@ -2255,18 +2239,21 @@ async def crawlmazsoccer_tomorrow(update: Update, context: ContextTypes.DEFAULT_
     )
 
 async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ✅ 테스트용: 2024-10-30 경기만 가져오기
+    test_date = "2024-10-30"
 
     # 해외야구(MLB)
     await crawl_maz_analysis_common(
         update,
         context,
         base_url="https://mazgtv1.com/analyze/mlb",
-        sport_label="야구",      
+        sport_label="야구",
         league_default="해외야구",
         day_key="tomorrow",
         max_pages=5,
         board_type=3,
         category=1,
+        target_ymd=test_date,   # 🔴 여기!
     )
 
     # KBO + NPB
@@ -2280,10 +2267,11 @@ async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAUL
         max_pages=5,
         board_type=3,
         category=2,
+        target_ymd=test_date,   # 🔴 여기!
     )
 
     await update.message.reply_text(
-        "⚾ 야구(MLB · KBO · NPB) 내일 경기 분석을 모두 불러왔습니다!"
+        f"⚾ 야구(MLB · KBO · NPB) {test_date} 경기 분석 크롤링 명령을 모두 실행했습니다."
     )
 
 async def crawlmazsoccer_jp_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2343,6 +2331,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
