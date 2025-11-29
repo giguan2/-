@@ -2313,7 +2313,7 @@ def main():
 
     # mazgtv 해외축구 분석 (내일 경기 → tomorrow 시트)
     app.add_handler(CommandHandler("crawlmazsoccer_tomorrow", crawlmazsoccer_tomorrow))
-    app.add_handler(CommandHandler("crawlmazsoccer_kr_tomorrow", crawlmazsoccer_kr_tomorrow))
+    app.add_handler(CommandHandler("crawlmazbaseball_tomorrow", crawlmazbaseball_tomorrow))
 
 
 
@@ -2330,6 +2330,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
