@@ -1896,16 +1896,23 @@ async def crawl_maz_analysis_common(
                     if not isinstance(item, dict):
                         continue
 
-                    game_start_at = (
-                        item.get("gameStartAt")
-                        or item.get("gameStartAtText")
-                        or ""
-                    )
-                    game_start_at = str(game_start_at).strip()
+                    game_start_at_raw = item.get("gameStartAt") or ""
+                    game_start_at_text = item.get("gameStartAtText") or ""
+                
+                    game_start_at_raw = str(game_start_at_raw).strip()
+                    game_start_at_text = str(game_start_at_text).strip()
 
-                    # ✅ 날짜 필터 : "2024-10-30T..." 같은 것도 앞 10자리 비교
-                    if not game_start_at.startswith(target_ymd):
-                        continue
+                    # 🔍 디버그: 1페이지에서 날짜가 어떻게 들어오는지 로그로 확인
+                    print(
+                        "[MAZ][DEBUG] page=%s id=%s gameStartAt=%r gameStartAtText=%r"
+                        % (page, item.get("id"), game_start_at_raw, game_start_at_text)
+                    )
+
+                    # 기존 필터 대신 임시로 아주 느슨하게만 통과시켜서,
+                    # 일단 시트에 뭐가 들어오는지 확인해도 됨.
+                    # 일단 지금은 날짜 필터 주석 처리:
+                    # if not game_start_at_raw.startswith(target_ymd):
+                    #     continue
 
                     board_id = item.get("id")
                     if not board_id:
@@ -2331,6 +2338,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
