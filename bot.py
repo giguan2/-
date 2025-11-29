@@ -641,6 +641,21 @@ def build_analysis_category_menu(key: str) -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(buttons)
 
+def build_soccer_subcategory_menu(key: str) -> InlineKeyboardMarkup:
+    """
+    축구 선택 후 나오는 2단계 메뉴:
+    해외축구 / K리그 / J리그
+    key = "today" 또는 "tomorrow"
+    """
+    buttons = [
+        [InlineKeyboardButton("해외축구", callback_data=f"soccer_cat:{key}:해외축구")],
+        [InlineKeyboardButton("K리그", callback_data=f"soccer_cat:{key}:K리그")],
+        [InlineKeyboardButton("J리그", callback_data=f"soccer_cat:{key}:J리그")],
+        [InlineKeyboardButton("◀ 종목 선택으로", callback_data=f"analysis_root:{key}")],
+        [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
+    ]
+    return InlineKeyboardMarkup(buttons)
+
 def build_analysis_match_menu(key: str, sport: str, page: int = 1) -> InlineKeyboardMarkup:
     """종목 선택 후 → 해당 종목 경기 리스트 메뉴 (10개씩 페이지 나누기)"""
     items = ANALYSIS_DATA_MAP.get(key, {}).get(sport, [])
@@ -2037,17 +2052,35 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_reply_markup(reply_markup=build_main_inline_menu())
         return
 
+    # 축구 하위 카테고리(해외축구 / K리그 / J리그) 선택 시
+    if data.startswith("soccer_cat:"):
+        _, key, subsport = data.split(":", 2)
+        # subsport 값: "해외축구", "K리그", "J리그"
+        await q.edit_message_reply_markup(
+            reply_markup=build_analysis_match_menu(key, subsport)
+        )
+        return
+ 
     if data.startswith("analysis_root:"):
         _, key = data.split(":", 1)
         await q.edit_message_reply_markup(reply_markup=build_analysis_category_menu(key))
         return
 
-    if data.startswith("analysis_cat:"):
-        _, key, sport = data.split(":", 2)
+if data.startswith("analysis_cat:"):
+    _, key, sport = data.split(":", 2)
+
+    # ⚽ 축구 선택 → 해외축구/K리그/J리그 하위 메뉴로 이동
+    if sport == "축구":
         await q.edit_message_reply_markup(
-            reply_markup=build_analysis_match_menu(key, sport, page=1)
+            reply_markup=build_soccer_subcategory_menu(key)
         )
         return
+
+    # 그 외 종목 → 기존처럼 바로 첫 페이지 열기
+    await q.edit_message_reply_markup(
+        reply_markup=build_analysis_match_menu(key, sport, page=1)
+    )
+    return
 
     # 경기 리스트 페이지 이동
     if data.startswith("match_page:"):
@@ -2131,7 +2164,7 @@ async def crawlmazsoccer_tomorrow(update: Update, context: ContextTypes.DEFAULT_
         update,
         context,
         base_url="https://mazgtv1.com/analyze/overseas",  # 이제는 사실상 의미 없음
-        sport_label="축구",
+        sport_label="해외축구",
         league_default="해외축구",
         day_key="tomorrow",
         max_pages=5,
@@ -2180,6 +2213,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
