@@ -4,6 +4,7 @@ import time
 import re
 import requests
 import httpx
+import math
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from openai import OpenAI
@@ -640,19 +641,67 @@ def build_analysis_category_menu(key: str) -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(buttons)
 
-
-def build_analysis_match_menu(key: str, sport: str) -> InlineKeyboardMarkup:
-    """종목 선택 후 → 해당 종목 경기 리스트 메뉴"""
+def build_analysis_match_menu(key: str, sport: str, page: int = 1) -> InlineKeyboardMarkup:
+    """종목 선택 후 → 해당 종목 경기 리스트 메뉴 (10개씩 페이지 나누기)"""
     items = ANALYSIS_DATA_MAP.get(key, {}).get(sport, [])
-    buttons = []
-    for item in items:
+    per_page = 10
+
+    if page < 1:
+        page = 1
+
+    total = len(items)
+    total_pages = max(1, math.ceil(total / per_page))
+
+    if page > total_pages:
+        page = total_pages
+
+    start = (page - 1) * per_page
+    end = start + per_page
+    page_items = items[start:end]
+
+    buttons: list[list[InlineKeyboardButton]] = []
+
+    # 현재 페이지의 경기들만 버튼으로
+    for item in page_items:
         cb = f"match:{key}:{sport}:{item['id']}"
         buttons.append([InlineKeyboardButton(item["title"], callback_data=cb)])
 
-    buttons.append([InlineKeyboardButton("◀ 종목 선택으로", callback_data=f"analysis_root:{key}")])
-    buttons.append([InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")])
-    return InlineKeyboardMarkup(buttons)
+    # 페이지 이동 버튼 (이전 / 현재페이지 / 다음)
+    if total_pages > 1:
+        nav_row: list[InlineKeyboardButton] = []
 
+        if page > 1:
+            nav_row.append(
+                InlineKeyboardButton(
+                    "◀ 이전",
+                    callback_data=f"match_page:{key}:{sport}:{page-1}",
+                )
+            )
+
+        nav_row.append(
+            InlineKeyboardButton(
+                f"{page}/{total_pages}",
+                callback_data="noop",  # 눌러도 아무 동작 안 하는 용도
+            )
+        )
+
+        if page < total_pages:
+            nav_row.append(
+                InlineKeyboardButton(
+                    "다음 ▶",
+                    callback_data=f"match_page:{key}:{sport}:{page+1}",
+                )
+            )
+
+        buttons.append(nav_row)
+
+    # 공통 하단 버튼
+    buttons.append(
+        [InlineKeyboardButton("◀ 종목 선택으로", callback_data=f"analysis_root:{key}")]
+    )
+    buttons.append([InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")])
+
+    return InlineKeyboardMarkup(buttons)
 
 def build_news_category_menu() -> InlineKeyboardMarkup:
     """스포츠 뉴스 요약 → 종목 선택 메뉴"""
@@ -1980,6 +2029,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data or ""
     await q.answer()
 
+    if data == "noop":
+        await q.answer()  # 아무 말 없이 무시
+        return
+    
     if data == "back_main":
         await q.edit_message_reply_markup(reply_markup=build_main_inline_menu())
         return
@@ -1991,9 +2044,24 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("analysis_cat:"):
         _, key, sport = data.split(":", 2)
-        await q.edit_message_reply_markup(reply_markup=build_analysis_match_menu(key, sport))
+        await q.edit_message_reply_markup(
+            reply_markup=build_analysis_match_menu(key, sport, page=1)
+        )
         return
 
+    # 경기 리스트 페이지 이동
+    if data.startswith("match_page:"):
+        _, key, sport, page_str = data.split(":", 3)
+        try:
+            page = int(page_str)
+        except ValueError:
+            page = 1
+
+        await q.edit_message_reply_markup(
+            reply_markup=build_analysis_match_menu(key, sport, page=page)
+        )
+        return
+    
     if data.startswith("match:"):
         _, key, sport, match_id = data.split(":", 3)
         items = ANALYSIS_DATA_MAP.get(key, {}).get(sport, [])
@@ -2112,6 +2180,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
