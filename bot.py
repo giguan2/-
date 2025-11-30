@@ -1897,6 +1897,9 @@ async def crawl_maz_analysis_common(
             base_date += timedelta(days=1)
         target_ymd = base_date.strftime("%Y-%m-%d")
 
+    # 🔴 여기서 target_date 만들어 줌
+    target_date = datetime.strptime(target_ymd, "%Y-%m-%d").date()    
+
     await update.message.reply_text(
         f"mazgtv {sport_label} 분석 페이지에서 {target_ymd} 경기 분석글을 가져옵니다. 잠시만 기다려 주세요..."
     )
@@ -1947,16 +1950,24 @@ async def crawl_maz_analysis_common(
                     if not isinstance(item, dict):
                         continue
 
+                    board_id = item.get("id")
+                    if not board_id:
+                        continue
+
+                    # 기존 디버그 그대로 둬도 됨
+                    game_start_at = str(item.get("gameStartAt") or "").strip()
+                    game_start_at_text = str(item.get("gameStartAtText") or "").strip()
+                    print(
+                        f"[MAZ][DEBUG] page={page} id={board_id} "
+                        f"gameStartAt='{game_start_at}' gameStartAtText='{game_start_at_text}'"
+                    )
+                    
                     # 🔍 JSON 전체에서 날짜 자동 감지
                     item_date = detect_game_date_from_item(item, target_year=target_date.year)
                     print(f"[MAZ][DEBUG_DATE] page={page} id={board_id} item_date={item_date}")
 
                     # 이 날짜가 우리가 원하는 날짜가 아니면 스킵
                     if item_date != target_date:
-                        continue
-
-                    board_id = item.get("id")
-                    if not board_id:
                         continue
 
                     league = item.get("leagueName") or league_default
@@ -2379,6 +2390,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
