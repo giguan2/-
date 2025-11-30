@@ -1962,12 +1962,21 @@ async def crawl_maz_analysis_common(
                         f"gameStartAt='{game_start_at}' gameStartAtText='{game_start_at_text}'"
                     )
                     
-                    # 🔍 JSON 전체에서 날짜 자동 감지
                     item_date = detect_game_date_from_item(item, target_year=target_date.year)
                     print(f"[MAZ][DEBUG_DATE] page={page} id={board_id} item_date={item_date}")
+                    
+                    # 날짜를 못 뽑은 카드면 패스
+                    if not item_date:
+                        continue
 
-                    # 이 날짜가 우리가 원하는 날짜가 아니면 스킵
-                    if item_date != target_date:
+                    # 🔴 “같은 주” 안에 있는 카드만 통과시키기
+                    #   - item_date: maz 카드 기준 날짜 (보통 월요일)
+                    #   - target_date: 우리가 원하는 경기 날짜 (예: 2025-10-30)
+                    delta_days = (target_date - item_date).days
+
+                    # item_date 가 target_date 이후이거나 (미래)
+                    # 7일 이상 차이나면 다른 주 카드이므로 스킵
+                    if delta_days < 0 or delta_days >= 7:
                         continue
 
                     league = item.get("leagueName") or league_default
@@ -2390,6 +2399,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
