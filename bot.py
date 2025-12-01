@@ -1381,126 +1381,6 @@ def summarize_with_gemini(full_text: str, orig_title: str = "", max_chars: int =
         fb_summary = clean_maz_text(fb_summary)
         return (orig_title or "[제목 없음]", fb_summary)
 
-def summarize_analysis_from_info(
-    league: str,
-    home_team: str,
-    away_team: str,
-    kickoff_str: str,
-    max_chars: int = 900,
-) -> tuple[str, str]:
-    """
-    실제 원문 분석글을 긁어오지 못해도,
-    '리그 / 홈 / 원정 / 시간' 정보만으로
-    프리뷰 형식의 분석 텍스트를 Gemini로 생성한다.
-
-    실패하면 간단한 문장으로 폴백.
-    """
-    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-    title_fallback = f"[{league}] {home_team} vs {away_team}".strip()
-
-    # 키 없으면 폴백
-    if not GEMINI_API_KEY:
-        body = (
-            f"{league} {home_team}와 {away_team}의 맞대결이다. "
-            f"경기 일정은 {kickoff_str}로 예정되어 있다. "
-            "양 팀의 세부 전력 분석은 추후 업데이트 예정이며, "
-            "현재는 경기 일정 안내용 프리뷰 텍스트만 제공된다."
-        )
-        if len(body) > max_chars:
-            body = simple_summarize(body, max_chars=max_chars)
-        return (title_fallback or "[제목 없음]", body)
-
-    # Gemini 프롬프트
-    prompt = (
-        "다음 정보를 기반으로 한국어 축구 경기 분석 프리뷰를 작성해줘.\n"
-        "실제 스탯 데이터가 없어도 일반적인 축구 분석 표현으로 자연스럽게 추론해서 써도 된다.\n\n"
-        f"리그: {league}\n"
-        f"홈팀: {home_team}\n"
-        f"원정팀: {away_team}\n"
-        f"경기 시간(표기 문자열): {kickoff_str}\n\n"
-        "요구사항:\n"
-        "- 제목 1개와 요약형 분석 본문을 작성할 것\n"
-        "- 제목에는 반드시 '홈팀 vs 원정팀' 형태가 포함될 것\n"
-        "- 본문은 3~6문장, 공백 포함 "
-        f"{max_chars}자 내외로 작성할 것\n"
-        "- 베팅 참고용으로, 양 팀의 스타일/최근 흐름/전술적 포인트를 자연스럽게 추론해 서술\n"
-        "- 실제 특정 경기 결과를 단정하지 말고, '유리해 보인다', '우세할 가능성이 크다' 식으로 표현\n\n"
-        "출력 형식은 꼭 아래처럼만 써줘:\n"
-        "제목: (제목)\n"
-        "요약: (본문)\n"
-        "그 외의 문장은 절대 쓰지 마.\n"
-    )
-
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        "gemini-2.0-flash-001:generateContent"
-    )
-    headers = {"Content-Type": "application/json"}
-    params = {"key": GEMINI_API_KEY}
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": prompt}
-                ]
-            }
-        ]
-    }
-
-    try:
-        print("[GEMINI][ANALYSIS] 요청 시작")
-        resp = requests.post(
-            url,
-            headers=headers,
-            params=params,
-            json=payload,
-            timeout=20,
-        )
-        print("[GEMINI][ANALYSIS] HTTP status:", resp.status_code)
-        resp.raise_for_status()
-        data = resp.json()
-
-        candidates = data.get("candidates") or []
-        if not candidates:
-            raise ValueError("no candidates from Gemini")
-
-        parts = (candidates[0].get("content") or {}).get("parts") or []
-        text_out = "".join(p.get("text", "") for p in parts).strip()
-        if not text_out:
-            raise ValueError("empty response")
-
-        new_title = ""
-        summary = ""
-        for line in text_out.splitlines():
-            line = line.strip()
-            if line.startswith("제목:"):
-                new_title = line[len("제목:"):].strip(" ：:")
-            elif line.startswith("요약:"):
-                summary = line[len("요약:"):].strip(" ：:")
-
-        if not summary:
-            summary = text_out
-
-        if len(summary) > max_chars + 200:
-            summary = summary[: max_chars + 200]
-
-        if not new_title:
-            new_title = title_fallback or "[제목 없음]"
-
-        print("[GEMINI][ANALYSIS] 제목/요약 생성 완료")
-        return (new_title, summary)
-
-    except Exception as e:
-        print(f"[GEMINI][ANALYSIS] 실패 → 폴백 사용: {e}")
-        body = (
-            f"{league} {home_team}와 {away_team}의 경기다. "
-            f"경기 시간은 {kickoff_str}로 예정되어 있다. "
-            "상세 분석은 추후 업데이트 예정이다."
-        )
-        if len(body) > max_chars:
-            body = simple_summarize(body, max_chars=max_chars)
-        return (title_fallback or "[제목 없음]", body)
-
 def extract_main_text_from_html(soup: BeautifulSoup) -> str:
     """
     mazgtv 분석 상세 페이지에서 본문 텍스트를 최대한 잘 뽑아서 리턴.
@@ -1686,6 +1566,7 @@ async def crawl_daum_news_common(
                 url = str(url).strip()
 
                 if url.startswith("/"):
+
                     url = urljoin("https://sports.daum.net", url)
 
                 articles.append({"title": title, "link": url})
@@ -1876,7 +1757,7 @@ async def crawl_maz_analysis_common(
     max_pages: int = 5,
     board_type: int = 2,       # ⚠️ 리그별 boardType (축구=2, 야구=3 로 가정)
     category: int = 1,         # ⚠️ 리그별 category (해외/국내 구분)
-    target_ymd: str | None = None,  # ✅ 특정 날짜 강제 (예: "2024-10-30") - 없으면 day_key 기준
+    target_ymd: str | None = None,  # 특정 날짜 강제 (예: "2024-10-30") - 없으면 day_key 기준
 ):
     """
     mazgtv 분석 페이지 공통 크롤러 (JSON API 버전).
@@ -1969,9 +1850,9 @@ async def crawl_maz_analysis_common(
                     if not item_date:
                         continue
 
-                    # 🔴 “같은 주” 안에 있는 카드만 통과시키기
+                    # “같은 주” 안에 있는 카드만 통과시키기
                     #   - item_date: maz 카드 기준 날짜 (보통 월요일)
-                    #   - target_date: 우리가 원하는 경기 날짜 (예: 2025-10-30)
+                    #   - target_date: 우리가 원하는 경기 날짜
                     delta_days = (target_date - item_date).days
 
                     # item_date 가 target_date 이후이거나 (미래)
@@ -2074,153 +1955,6 @@ async def crawl_maz_analysis_common(
         f"mazgtv {sport_label} 분석에서 {target_ymd} 경기 분석 {len(rows_to_append)}건을 "
         f"'{day_key}' 시트에 저장했습니다.\n"
         "텔레그램에서 경기 분석픽 메뉴를 열어 확인해보세요."
-    )
-
-async def crawl_maz_analysis_smoketest(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    *,
-    sport_label: str,
-    league_default: str,
-    board_type: int,
-    category: int,
-    limit: int = 3,      # 최근 글 몇 개만 테스트할지
-):
-    """날짜 신경 안 쓰고, 해당 게시판에서 최근 글 몇 개만 요약해서 시트에 넣는 간단 테스트용."""
-    if not is_admin(update):
-        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
-        return
-
-    await update.message.reply_text(
-        f"mazgtv {sport_label} 분석글 {limit}건을 날짜 필터 없이 테스트로 가져옵니다. 잠시만 기다려 주세요..."
-    )
-
-    rows_to_append: list[list[str]] = []
-
-    try:
-        async with httpx.AsyncClient(
-            headers={"User-Agent": "Mozilla/5.0"},
-            follow_redirects=True,
-        ) as client:
-
-            picked = 0
-            page = 1
-
-            while picked < limit and page <= 5:
-                list_url = (
-                    f"{MAZ_LIST_API}"
-                    f"?page={page}&perpage=20"
-                    f"&boardType={board_type}&category={category}"
-                    f"&sort=b.game_start_at+DESC,+b.created_at+DESC"
-                )
-
-                r = await client.get(list_url, timeout=10.0)
-                r.raise_for_status()
-                data = r.json()
-
-                if isinstance(data, dict):
-                    items = (
-                        data.get("rows")
-                        or (data.get("data") or {}).get("rows")
-                        or data.get("list")
-                        or data.get("items")
-                    )
-                else:
-                    items = data
-
-                if not isinstance(items, list) or not items:
-                    break
-
-                for item in items:
-                    if picked >= limit:
-                        break
-                    if not isinstance(item, dict):
-                        continue
-
-                    bid = item.get("id")
-                    if not bid:
-                        continue
-
-                    league = item.get("leagueName") or league_default
-                    home = item.get("homeTeamName") or ""
-                    away = item.get("awayTeamName") or ""
-
-                    # 상세 JSON
-                    detail_url = MAZ_DETAIL_API_TEMPLATE.format(board_id=bid)
-                    try:
-                        r2 = await client.get(detail_url, timeout=10.0)
-                        r2.raise_for_status()
-                        detail = r2.json()
-                    except Exception as e:
-                        print(f"[MAZ][SMOKE][DETAIL] id={bid} 요청 실패: {e}")
-                        continue
-
-                    # 상세 메타로 덮어쓰기
-                    league = detail.get("leagueName") or league
-                    home = detail.get("homeTeamName") or home
-                    away = detail.get("awayTeamName") or away
-
-                    content_html = detail.get("content") or ""
-                    if not str(content_html).strip():
-                        print(f"[MAZ][SMOKE][DETAIL] id={bid} content 없음")
-                        continue
-
-                    soup = BeautifulSoup(content_html, "html.parser")
-                    try:
-                        for bad in soup.select("script, style, .ad, .banner"):
-                            bad.decompose()
-                    except Exception:
-                        pass
-
-                    full_text = soup.get_text("\n", strip=True)
-                    full_text = clean_maz_text(full_text)
-                    if not full_text:
-                        print(f"[MAZ][SMOKE][DETAIL] id={bid} 본문 텍스트 없음")
-                        continue
-
-                    new_title, new_body = summarize_analysis_with_gemini(
-                        full_text,
-                        league=league,
-                        home_team=home,
-                        away_team=away,
-                        max_chars=900,
-                    )
-
-                    row_sport = sport_label
-                    upper_league = (league or "").upper()
-                    if sport_label == "야구":
-                        if "KBO" in upper_league:
-                            row_sport = "KBO"
-                        elif "NPB" in upper_league:
-                            row_sport = "NPB"
-                        elif "MLB" in upper_league:
-                            row_sport = "해외야구"
-
-                    rows_to_append.append([row_sport, "", new_title, new_body])
-                    picked += 1
-
-                page += 1
-
-    except Exception as e:
-        await update.message.reply_text(f"요청 오류가 발생했습니다: {e}")
-        return
-
-    if not rows_to_append:
-        await update.message.reply_text(
-            f"mazgtv {sport_label} 분석에서 테스트용으로 가져올 글을 찾지 못했습니다."
-        )
-        return
-
-    ok = append_analysis_rows("tomorrow", rows_to_append)
-    if not ok:
-        await update.message.reply_text("구글시트에 분석 데이터를 저장하지 못했습니다.")
-        return
-
-    reload_analysis_from_sheet()
-
-    await update.message.reply_text(
-        f"mazgtv {sport_label} 분석글 {len(rows_to_append)}건을 테스트용으로 'tomorrow' 시트에 저장했습니다.\n"
-        "야구 메뉴에서 잘 보이는지만 확인해 보면 돼."
     )
 
 # ───────────────── 종목별 (Daum 뉴스) 크롤링 명령어 ─────────────────
@@ -2453,10 +2187,12 @@ async def crawlmazsoccer_tomorrow(update: Update, context: ContextTypes.DEFAULT_
         category=1,                  # ⚠️ 축구 category(해외/아시아 통합일 가능성)
     )
 
+# 야구(MLB · KBO · NPB) 분석 (내일 경기 → tomorrow 시트)
 async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ✅ 테스트용: 2025-10-30 경기만 가져오기
-    test_date = "2025-10-30"
-
+    """
+    mazgtv 야구(MLB / KBO / NPB) 내일 경기 분석을 크롤링해서
+    'tomorrow' 시트에 저장한다. 축구용과 동일한 구조.
+    """
     # 해외야구(MLB)
     await crawl_maz_analysis_common(
         update,
@@ -2468,7 +2204,6 @@ async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAUL
         max_pages=5,
         board_type=3,
         category=1,
-        target_ymd=test_date,   # 🔴 여기!
     )
 
     # KBO + NPB
@@ -2482,38 +2217,11 @@ async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAUL
         max_pages=5,
         board_type=3,
         category=2,
-        target_ymd=test_date,   # 🔴 여기!
     )
 
     await update.message.reply_text(
-        f"⚾ 야구(MLB · KBO · NPB) {test_date} 경기 분석 크롤링 명령을 모두 실행했습니다."
+        "⚾ 야구(MLB · KBO · NPB) 내일 경기 분석 크롤링 명령을 모두 실행했습니다."
     )
-
-async def crawlmazbaseball_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # MLB 탭 (지금 쓰고 있는 boardType/category 그대로)
-    await crawl_maz_analysis_smoketest(
-        update,
-        context,
-        sport_label="야구",
-        league_default="해외야구",
-        board_type=3,
-        category=1,
-        limit=2,   # MLB 글 2개 정도만
-    )
-
-    # KBO/NPB 탭 – 여기 boardType/category 값은
-    # 크롬 DevTools → /api/board/list 요청에서 실제 값 그대로 넣어줘야 함.
-    await crawl_maz_analysis_smoketest(
-        update,
-        context,
-        sport_label="야구",
-        league_default="KBO/NPB",
-        board_type=3,  # ← 실제 값으로 수정
-        category=2,    # ← 실제 값으로 수정
-        limit=2,
-    )
-
-    await update.message.reply_text("야구(MLB · KBO · NPB) 테스트 크롤링을 모두 실행했습니다.")
 
 async def crawlmazsoccer_jp_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await crawl_maz_analysis_common(
@@ -2553,12 +2261,9 @@ def main():
     app.add_handler(CommandHandler("crawlbasketball", crawlbasketball))     # 농구
     app.add_handler(CommandHandler("crawlvolleyball", crawlvolleyball))     # 배구
 
-    # mazgtv 해외축구 분석 (내일 경기 → tomorrow 시트)
+    # mazgtv 분석 (내일 경기 → tomorrow 시트)
     app.add_handler(CommandHandler("crawlmazsoccer_tomorrow", crawlmazsoccer_tomorrow))
     app.add_handler(CommandHandler("crawlmazbaseball_tomorrow", crawlmazbaseball_tomorrow))
-
-    app.add_handler(CommandHandler("crawlmazbaseball_test", crawlmazbaseball_test))
-
 
     app.add_handler(CallbackQueryHandler(on_callback))
 
@@ -2573,35 +2278,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
