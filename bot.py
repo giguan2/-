@@ -1842,9 +1842,38 @@ async def crawl_maz_analysis_common(
                         f"[MAZ][DEBUG] page={page} id={board_id} "
                         f"gameStartAt='{game_start_at}' gameStartAtText='{game_start_at_text}'"
                     )
-                    
-                    item_date = detect_game_date_from_item(item, target_year=target_date.year)
+
+                    # 👇 여기부터 '내일 경기만' 필터
+                    item_date: date | None = None
+    
+                    # 1) gameStartAt 에 '2024-11-30T05:00:00' 같이 들어오는 경우 우선 사용
+                    if game_start_at:
+                        dt = _parse_game_start_date(game_start_at)
+                        if dt and dt == target_date:
+                            item_date = dt
+
+                    # 2) 위에서 못 찾았으면 gameStartAtText (예: '11-30(토) 05:00') 에서 MM-DD 뽑기
+                    if not item_date and game_start_at_text:
+                        mm, dd = extract_mmdd_from_kickoff(game_start_at_text)
+                        if mm and dd:
+                            try:
+                                cand = date(target_date.year, mm, dd)
+                                if cand == target_date:
+                                    item_date = cand
+                            except ValueError:
+                                pass
+
+                    # 3) 그래도 없으면 JSON 전체에서 날짜 패턴 찾아서, target_date 와 '완전 일치' 하는 것만 사용
+                    if not item_date:
+                        tmp = detect_game_date_from_item(item, target_year=target_date.year)
+                        if tmp == target_date:
+                            item_date = tmp
+
                     print(f"[MAZ][DEBUG_DATE] page={page} id={board_id} item_date={item_date}")
+
+                # ❗ 최종적으로 target_date 와 날짜가 맞는 경기만 남김 (= 내일 경기만)
+                if not item_date:
+                    continue
                     
                     # 날짜를 못 뽑은 카드면 패스
                     if not item_date:
@@ -2278,3 +2307,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
