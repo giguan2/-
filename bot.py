@@ -1864,20 +1864,30 @@ async def crawl_maz_analysis_common(
                                 pass
 
                     # 3) 그래도 없으면 JSON 전체에서 날짜 패턴 찾아서, target_date 와 '완전 일치' 하는 것만 사용
-                    if not item_date:
-                        tmp = detect_game_date_from_item(item, target_year=target_date.year)
-                        if tmp == target_date:
-                            item_date = tmp
+                if not item_date:
+                    tmp = detect_game_date_from_item(item, target_year=target_date.year)
+                    # ❗ 여기서는 "날짜를 하나라도 찾으면" 그냥 item_date 로만 세팅
+                    if tmp:
+                        item_date = tmp
 
-                    print(f"[MAZ][DEBUG_DATE] page={page} id={board_id} item_date={item_date}")
+                print(f"[MAZ][DEBUG_DATE] page={page} id={board_id} item_date={item_date}")
 
-                # ❗ 최종적으로 target_date 와 날짜가 맞는 경기만 남김 (= 내일 경기만)
+                # 날짜를 못 뽑은 카드면 패스
                 if not item_date:
                     continue
-                    
-                    # 날짜를 못 뽑은 카드면 패스
-                    if not item_date:
+
+                # ⚾ 야구: 주간 카드(월~일)라서 '같은 주'만 허용
+                if sport_label == "야구":
+                    delta_days = (target_date - item_date).days
+                    # item_date 가 target_date 이후(미래)이거나
+                    # 7일 이상 차이나면 다른 주 카드 → 스킵
+                    if delta_days < 0 or delta_days >= 7:
                         continue
+                else:
+                    # ⚽ 축구 / J리그 등: '내일 날짜'와 정확히 같은 경기만 사용
+                    if item_date != target_date:
+                        continue
+
 
                     # “같은 주” 안에 있는 카드만 통과시키기
                     #   - item_date: maz 카드 기준 날짜 (보통 월요일)
@@ -2307,4 +2317,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
