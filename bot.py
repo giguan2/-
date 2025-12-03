@@ -912,6 +912,161 @@ async def newsclean(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"시트 초기화 중 오류: {e}")
         return
 
+async def _analysis_clean_by_sports(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    sports_to_clear: set[str] | None,
+    label: str,
+):
+    """
+    tomorrow 시트에서 sport 컬럼 기준으로 특정 종목만 지우거나,
+    sports_to_clear 가 None 이면 전체(헤더 제외) 삭제.
+    """
+    if not is_admin(update):
+        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+
+    client_gs = get_gs_client()
+    spreadsheet_id = os.getenv("SPREADSHEET_ID")
+
+    if not (client_gs and spreadsheet_id):
+        await update.message.reply_text(
+            "구글시트 설정(GOOGLE_SERVICE_KEY 또는 SPREADSHEET_ID)이 없어 시트를 초기화할 수 없습니다."
+        )
+        return
+
+    try:
+        sh = client_gs.open_by_key(spreadsheet_id)
+        ws = sh.worksheet(os.getenv("SHEET_TOMORROW_NAME", "tomorrow"))
+    except Exception as e:
+        await update.message.reply_text(f"tomorrow 시트를 열지 못했습니다: {e}")
+        return
+
+    try:
+        rows = ws.get_all_values()
+    except Exception as e:
+        await update.message.reply_text(f"시트 읽기 오류: {e}")
+        return
+
+    # 데이터가 아예 없으면 헤더만 복구
+    if not rows:
+        header = ["sport", "id", "title", "summary"]
+        try:
+            ws.clear()
+            ws.update("A1", [header])
+        except Exception as e:
+            await update.message.reply_text(f"시트 초기화 중 오류: {e}")
+            return
+        reload_analysis_from_sheet()
+        await update.message.reply_text(f"tomorrow 시트를 초기화했습니다. ({label})")
+        return
+
+    header = rows[0]
+    data_rows = rows[1:]
+
+    # sport 컬럼 인덱스 찾기 (기본은 0)
+    try:
+        idx_sport = header.index("sport")
+    except ValueError:
+        idx_sport = 0
+
+    kept_rows = [header]
+    deleted_count = 0
+
+    if sports_to_clear is None:
+        # 전체 삭제 (헤더만 남김)
+        deleted_count = len(data_rows)
+    else:
+        # 해당 종목만 제외하고 유지
+        for row in data_rows:
+            sport_val = row[idx_sport] if len(row) > idx_sport else ""
+            if sport_val in sports_to_clear:
+                deleted_count += 1
+                continue
+            kept_rows.append(row)
+
+    try:
+        ws.clear()
+        ws.update("A1", kept_rows)
+    except Exception as e:
+        await update.message.reply_text(f"시트 쓰기 오류: {e}")
+        return
+
+    reload_analysis_from_sheet()
+
+    if sports_to_clear is None:
+        await update.message.reply_text(
+            f"tomorrow 시트의 분석 데이터를 전체 초기화했습니다. (삭제된 행: {deleted_count}개)"
+        )
+    else:
+        await update.message.reply_text(
+            f"tomorrow 시트에서 {label} 분석 데이터만 초기화했습니다. (삭제된 행: {deleted_count}개)"
+        )
+
+# ⚽ 축구 계열(해외축구 / K리그 / J리그)만 삭제
+async def soccerclean(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sports = {"해외축구", "K리그", "J리그"}
+    await _analysis_clean_by_sports(
+        update,
+        context,
+        sports_to_clear=sports,
+        label="축구(해외축구/K리그/J리그)",
+    )
+
+
+# ⚾ 야구 계열(해외야구 / KBO / NPB)만 삭제
+async def baseballclean(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sports = {"해외야구", "KBO", "NPB"}
+    await _analysis_clean_by_sports(
+        update,
+        context,
+        sports_to_clear=sports,
+        label="야구(해외야구/KBO/NPB)",
+    )
+
+
+# 🏀 농구만 삭제
+async def basketclean(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sports = {"농구"}
+    await _analysis_clean_by_sports(
+        update,
+        context,
+        sports_to_clear=sports,
+        label="농구",
+    )
+
+
+# 🏐 배구만 삭제
+async def volleyclean(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sports = {"배구"}
+    await _analysis_clean_by_sports(
+        update,
+        context,
+        sports_to_clear=sports,
+        label="배구",
+    )
+
+
+# 기타 종목만 삭제 (기타 / 기타종 / 기타종목)
+async def etcclean(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sports = {"기타", "기타종", "기타종목"}
+    await _analysis_clean_by_sports(
+        update,
+        context,
+        sports_to_clear=sports,
+        label="기타 종목",
+    )
+
+
+# tomorrow 시트 전체 분석 데이터 삭제 (헤더만 남김)
+async def analysisclean(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _analysis_clean_by_sports(
+        update,
+        context,
+        sports_to_clear=None,
+        label="전체 분석",
+    )
 
 # 🔹 4) /rollover – 내일 분석 → 오늘 분석으로 복사
 async def rollover(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2288,6 +2443,14 @@ def main():
     # 뉴스 시트 전체 초기화
     app.add_handler(CommandHandler("newsclean", newsclean))
 
+    # 분석 시트 부분 초기화 명령어들 (모두 tomorrow 시트 기준)
+    app.add_handler(CommandHandler("soccerclean", soccerclean))
+    app.add_handler(CommandHandler("baseballclean", baseballclean))
+    app.add_handler(CommandHandler("basketclean", basketclean))
+    app.add_handler(CommandHandler("volleyclean", volleyclean))
+    app.add_handler(CommandHandler("etcclean", etcclean))
+    app.add_handler(CommandHandler("analysisclean", analysisclean))
+
     app.add_handler(CommandHandler("rollover", rollover))
 
     # 뉴스 크롤링 명령어들 (Daum)
@@ -2315,6 +2478,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
