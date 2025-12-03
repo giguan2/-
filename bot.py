@@ -2479,8 +2479,8 @@ async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAUL
         league_default="해외야구",
         day_key="tomorrow",
         max_pages=5,
-        board_type=3,
-        category=1,
+        board_type=2,
+        category=3,
     )
 
     # KBO + NPB
@@ -2492,8 +2492,8 @@ async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAUL
         league_default="KBO/NPB",
         day_key="tomorrow",
         max_pages=5,
-        board_type=3,
-        category=2,
+        board_type=2,
+        category=4,
     )
 
     await update.message.reply_text(
@@ -2518,8 +2518,8 @@ async def bvcrawl_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         league_default="NBA",
         day_key="tomorrow",
         max_pages=5,
-        board_type=4,                # ⚠️ 실제 boardType 값으로 수정 필요
-        category=1,                  # ⚠️ 실제 category 값으로 수정 필요
+        board_type=2,                # ⚠️ 실제 boardType 값으로 수정 필요
+        category=5,                  # ⚠️ 실제 category 값으로 수정 필요
         # target_ymd=None → 자동으로 '내일' 날짜 사용
     )
 
@@ -2532,8 +2532,8 @@ async def bvcrawl_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         league_default="국내농구/배구",
         day_key="tomorrow",
         max_pages=5,
-        board_type=4,                # ⚠️ 실제 boardType 값으로 수정 필요
-        category=2,                  # ⚠️ 실제 category 값으로 수정 필요
+        board_type=2,                # ⚠️ 실제 boardType 값으로 수정 필요
+        category=7,                  # ⚠️ 실제 category 값으로 수정 필요
     )
 
     await update.message.reply_text(
@@ -2595,6 +2595,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
