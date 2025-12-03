@@ -1924,6 +1924,45 @@ def detect_game_date_from_item(item: dict, target_date: date) -> date | None:
 
     return None
 
+def classify_basketball_volleyball_sport(league: str) -> str:
+    """
+    mazgtv leagueName 기준으로 ANALYSIS 시트 sport 값을 결정한다.
+    - NBA      → "NBA"
+    - KBL      → "KBL"
+    - WKBL     → "WKBL"
+    - V-리그   → "V리그"
+    - 그 외 배구 관련 → "배구"
+    - 그 외 농구 관련 → "농구"
+    """
+    if not league:
+        return "농구"
+
+    upper = league.upper()
+
+    # NBA
+    if "NBA" in upper:
+        return "NBA"
+
+    # 국내 농구
+    if "KBL" in upper:
+        return "KBL"
+    if "WKBL" in upper:
+        return "WKBL"
+
+    # 배구 (V리그/해외배구 포함)
+    if any(x in upper for x in ["V-리그", "V리그", "V-LEAGUE", "VOLLEY", "배구"]):
+        # 국내 V리그 표시를 조금 더 명확히 하고 싶으면 여기 분리
+        if "V" in upper or "V-LEAGUE" in upper:
+            return "V리그"
+        return "배구"
+
+    # 나머지는 대충 농구로 묶기
+    if any(x in upper for x in ["BASKET", "농구"]):
+        return "농구"
+
+    # 정말 정보가 없으면 농구로
+    return "농구"
+
 async def crawl_maz_analysis_common(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -2125,6 +2164,10 @@ async def crawl_maz_analysis_common(
                             row_sport = "해외야구"
                         else:
                             row_sport = "해외야구"
+
+                    elif sport_label in ("농구", "농구/배구"):
+                        # NBA / KBL / WKBL / V리그 / 배구 등으로 자동 분류
+                        row_sport = classify_basketball_volleyball_sport(league or "")                    
 
                     rows_to_append.append([
                         row_sport,  # sport 열
@@ -2457,6 +2500,47 @@ async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAUL
         "⚾ 야구(MLB · KBO · NPB) 내일 경기 분석 크롤링 명령을 모두 실행했습니다."
     )
 
+# 🔹 NBA + 국내 농구/배구 (내일 경기) 크롤링
+async def bvcrawl_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    mazgtv 농구/배구 분석:
+    - NBA 분석:    https://mazgtv1.com/analyze/nba
+    - 국내 농구/배구: https://mazgtv1.com/analyze/volleyball
+    두 곳에서 '내일 경기' 분석글을 크롤링해서 tomorrow 시트에 저장한다.
+    """
+
+    # 1) NBA (해외 농구)
+    await crawl_maz_analysis_common(
+        update,
+        context,
+        base_url="https://mazgtv1.com/analyze/nba",
+        sport_label="농구",          # 시트에는 NBA/KBL/WKBL 등으로 나뉨
+        league_default="NBA",
+        day_key="tomorrow",
+        max_pages=5,
+        board_type=4,                # ⚠️ 실제 boardType 값으로 수정 필요
+        category=1,                  # ⚠️ 실제 category 값으로 수정 필요
+        # target_ymd=None → 자동으로 '내일' 날짜 사용
+    )
+
+    # 2) 국내 농구 + 배구 (KBL / WKBL / V리그 등)
+    await crawl_maz_analysis_common(
+        update,
+        context,
+        base_url="https://mazgtv1.com/analyze/volleyball",
+        sport_label="농구/배구",     # 분류 함수에서 KBL/WKBL/V리그/배구 등으로 세분화
+        league_default="국내농구/배구",
+        day_key="tomorrow",
+        max_pages=5,
+        board_type=4,                # ⚠️ 실제 boardType 값으로 수정 필요
+        category=2,                  # ⚠️ 실제 category 값으로 수정 필요
+    )
+
+    await update.message.reply_text(
+        "NBA + 국내 농구/배구(내일 경기) 분석 크롤링을 모두 실행했습니다.\n"
+        "/syncsheet 로 텔레그램 메뉴 데이터를 갱신할 수 있습니다."
+    )
+
 # ───────────────── 실행부 ─────────────────
 
 def main():
@@ -2495,6 +2579,8 @@ def main():
     # mazgtv 분석 (내일 경기 → tomorrow 시트)
     app.add_handler(CommandHandler("crawlmazsoccer_tomorrow", crawlmazsoccer_tomorrow))
     app.add_handler(CommandHandler("crawlmazbaseball_tomorrow", crawlmazbaseball_tomorrow))
+    app.add_handler(CommandHandler("bvcrawl_tomorrow", bvcrawl_tomorrow))
+
 
     app.add_handler(CallbackQueryHandler(on_callback))
 
@@ -2509,6 +2595,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
