@@ -656,6 +656,20 @@ def build_soccer_subcategory_menu(key: str) -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(buttons)
 
+def build_basketball_subcategory_menu(key: str) -> InlineKeyboardMarkup:
+    """
+    농구 선택 후 나오는 2단계 메뉴:
+    NBA / KBL
+    key = "today" 또는 "tomorrow"
+    """
+    buttons = [
+        [InlineKeyboardButton("NBA", callback_data=f"basket_cat:{key}:NBA")],
+        [InlineKeyboardButton("KBL", callback_data=f"basket_cat:{key}:KBL")],
+        [InlineKeyboardButton("◀ 종목 선택으로", callback_data=f"analysis_root:{key}")],
+        [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
+    ]
+    return InlineKeyboardMarkup(buttons)
+
 def build_baseball_subcategory_menu(key: str) -> InlineKeyboardMarkup:
     """
     야구 선택 시 나오는 하위 카테고리 메뉴:
@@ -1028,12 +1042,13 @@ async def baseballclean(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # 🏀 농구만 삭제
 async def basketclean(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sports = {"농구"}
-    await _analysis_clean_by_sports(
+    # 농구 전체: 예전 '농구' + 새 라벨 'NBA', 'KBL'
+    sports = {"농구", "NBA", "KBL"}
+    await _clean_tomorrow_sheet(
         update,
         context,
         sports_to_clear=sports,
-        label="농구",
+        label="농구(NBA/KBL)",
     )
 
 
@@ -2249,6 +2264,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+        # 농구 하위 카테고리 (NBA / KBL)
+    if data.startswith("basket_cat:"):
+        _, key, subsport = data.split(":", 2)
+        # subsport: "NBA", "KBL"
+        await q.edit_message_reply_markup(
+            reply_markup=build_analysis_match_menu(key, subsport, page=1)
+        )
+        return
+
     # 종목 선택으로 돌아가기
     if data.startswith("analysis_root:"):
         _, key = data.split(":", 1)
@@ -2273,12 +2297,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # 그 외 종목(농구/배구 등)은 바로 경기 리스트 1페이지
+        # 🏀 농구 → NBA / KBL 하위 메뉴
+        if sport == "농구":
+            await q.edit_message_reply_markup(
+                reply_markup=build_basketball_subcategory_menu(key)
+            )
+            return
+
+        # 그 외 종목(배구 등)은 바로 경기 리스트 1페이지
         await q.edit_message_reply_markup(
             reply_markup=build_analysis_match_menu(key, sport, page=1)
         )
         return
-
+        
     # 경기 리스트 페이지 이동 (이전/다음)
     if data.startswith("match_page:"):
         _, key, sport, page_str = data.split(":", 3)
@@ -2478,6 +2509,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
