@@ -636,7 +636,7 @@ def build_analysis_category_menu(key: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⚽️축구⚽️", callback_data=f"analysis_cat:{key}:축구")],
         [InlineKeyboardButton("🏀농구🏀", callback_data=f"analysis_cat:{key}:농구")],
         [InlineKeyboardButton("⚾️야구⚾️", callback_data=f"analysis_cat:{key}:야구")],
-        [InlineKeyboardButton("🏐배구🏐", callback_data=f"analysis_cat:{key}:v리그")],
+        [InlineKeyboardButton("🏐배구🏐", callback_data=f"analysis_cat:{key}:배구")],
         [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
     ]
     return InlineKeyboardMarkup(buttons)
@@ -685,6 +685,19 @@ def build_baseball_subcategory_menu(key: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
     ]
     return InlineKeyboardMarkup(buttons)
+
+def build_volleyball_subcategory_menu(key: str) -> InlineKeyboardMarkup:
+    """
+    배구 선택 시 나오는 하위 카테고리 메뉴
+    (현재는 V리그만 있지만, 나중에 해외배구 등을 늘릴 수 있음)
+    """
+    buttons = [
+        [InlineKeyboardButton("V리그", callback_data=f"volley_cat:{key}:V리그")],
+        [InlineKeyboardButton("◀ 종목 선택으로", callback_data=f"analysis_root:{key}")],
+        [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
+    ]
+    return InlineKeyboardMarkup(buttons)
+
 
 def build_analysis_match_menu(key: str, sport: str, page: int = 1) -> InlineKeyboardMarkup:
     """종목 선택 후 → 해당 종목 경기 리스트 메뉴 (10개씩 페이지 나누기)"""
@@ -2316,6 +2329,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # 배구 하위 카테고리 (V리그)
+    if data.startswith("volley_cat:"):
+        _, key, subsport = data.split(":", 2)  # subsport == "V리그"
+        await q.edit_message_reply_markup(
+            reply_markup=build_analysis_match_menu(key, subsport, page=1)
+        )
+        return
+  
     # 종목 선택으로 돌아가기
     if data.startswith("analysis_root:"):
         _, key = data.split(":", 1)
@@ -2346,6 +2367,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=build_basketball_subcategory_menu(key)
             )
             return
+
+        # 🏐 배구 → V리그 하위 메뉴
+        if sport == "배구":
+            await q.edit_message_reply_markup(
+                reply_markup=build_volleyball_subcategory_menu(key)
+            )
+            return        
 
         # 그 외 종목(배구 등)은 바로 경기 리스트 1페이지
         await q.edit_message_reply_markup(
@@ -2718,6 +2746,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
