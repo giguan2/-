@@ -2075,8 +2075,8 @@ async def crawl_maz_analysis_common(
                     
                     print(f"[MAZ][DEBUG_DATE] page={page} id={board_id} item_date={item_date}")
                     
-                    # 날짜를 전혀 못 뽑으면 패스
-                    if not item_date:
+                    # 날짜를 못 뽑았거나, target_date(오늘/내일)와 다르면 스킵
+                    if not item_date or item_date != target_date:
                         continue
 
                     # ⚾ 야구: 주간 카드(월~일)라서 '같은 주'만 허용
@@ -2595,6 +2595,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
