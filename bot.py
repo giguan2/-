@@ -636,7 +636,7 @@ def build_analysis_category_menu(key: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⚽️축구⚽️", callback_data=f"analysis_cat:{key}:축구")],
         [InlineKeyboardButton("🏀농구🏀", callback_data=f"analysis_cat:{key}:농구")],
         [InlineKeyboardButton("⚾️야구⚾️", callback_data=f"analysis_cat:{key}:야구")],
-        [InlineKeyboardButton("🏐배구🏐", callback_data=f"analysis_cat:{key}:배구")],
+        [InlineKeyboardButton("🏐배구🏐", callback_data=f"analysis_cat:{key}:v리그")],
         [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
     ]
     return InlineKeyboardMarkup(buttons)
@@ -1054,12 +1054,12 @@ async def basketclean(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # 🏐 배구만 삭제
 async def volleyclean(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sports = {"배구"}
+    sports = {"배구", "v리그"}
     await _analysis_clean_by_sports(
         update,
         context,
         sports_to_clear=sports,
-        label="배구",
+        label="배구/v리그",
     )
 
 
@@ -2718,6 +2718,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
