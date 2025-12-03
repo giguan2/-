@@ -2204,18 +2204,35 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-# 해외축구 + K리그 + J리그 분석 (내일 경기 → tomorrow 시트)
 async def crawlmazsoccer_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # 1) 해외축구 탭
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv1.com/analyze/overseas",  # 실제로는 API만 사용
-        sport_label="축구",          # ⚠️ 대분류 "축구" (세부 분리는 함수 안에서 처리)
+        base_url="https://mazgtv1.com/analyze/overseas",
+        sport_label="축구",          # 안에서 '해외축구/K리그/J리그'로 다시 분류됨
         league_default="해외축구",
         day_key="tomorrow",
         max_pages=5,
-        board_type=2,                # ⚠️ 축구 boardType
-        category=1,                  # ⚠️ 축구 category(해외/아시아 통합일 가능성)
+        board_type=2,
+        category=1,                  # 해외축구
+    )
+
+    # 2) K리그 / J리그 탭
+    await crawl_maz_analysis_common(
+        update,
+        context,
+        base_url="https://mazgtv1.com/analyze/asia",
+        sport_label="축구",          # 여기도 그대로 "축구" 사용
+        league_default="K리그/J리그",
+        day_key="tomorrow",
+        max_pages=5,
+        board_type=2,
+        category=2,                  # ⭐ DevTools에서 본 K리그/J리그 category 값
+    )
+
+    await update.message.reply_text(
+        "⚽ 해외축구 + K리그/J리그 내일 경기 분석 크롤링을 모두 실행했습니다."
     )
 
 # 야구(MLB · KBO · NPB) 분석 (내일 경기 → tomorrow 시트)
@@ -2252,17 +2269,6 @@ async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAUL
 
     await update.message.reply_text(
         "⚾ 야구(MLB · KBO · NPB) 내일 경기 분석 크롤링 명령을 모두 실행했습니다."
-    )
-
-async def crawlmazsoccer_jp_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await crawl_maz_analysis_common(
-        update,
-        context,
-        base_url="https://mazgtv1.com/analyze/asia",
-        sport_label="J리그",
-        league_default="J리그",
-        day_key="tomorrow",
-        max_pages=5,
     )
 
 # ───────────────── 실행부 ─────────────────
@@ -2309,6 +2315,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
