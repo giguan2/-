@@ -2541,6 +2541,120 @@ async def bvcrawl_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/syncsheet 로 텔레그램 메뉴 데이터를 갱신할 수 있습니다."
     )
 
+async def crawlmazsoccer_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    mazgtv 해외축구 + K리그/J리그 분석 중
+    '오늘 날짜' 경기를 크롤링해서 today 시트에 저장.
+    """
+
+    # 1) 해외축구 탭
+    await crawl_maz_analysis_common(
+        update,
+        context,
+        base_url="https://mazgtv1.com/analyze/overseas",
+        sport_label="축구",          # 안에서 '해외축구/K리그/J리그'로 다시 분류됨
+        league_default="해외축구",
+        day_key="today",            # ✅ today
+        max_pages=5,
+        board_type=2,
+        category=1,                 # 해외축구
+    )
+
+    # 2) K리그 / J리그 탭
+    await crawl_maz_analysis_common(
+        update,
+        context,
+        base_url="https://mazgtv1.com/analyze/asia",
+        sport_label="축구",
+        league_default="K리그/J리그",
+        day_key="today",            # ✅ today
+        max_pages=5,
+        board_type=2,
+        category=2,                 # K리그/J리그
+    )
+
+    await update.message.reply_text(
+        "⚽ 해외축구 + K리그/J리그 오늘 경기 분석 크롤링을 모두 실행했습니다."
+    )
+
+async def crawlmazbaseball_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    mazgtv 야구 분석(MLB + KBO + NPB) 중
+    '오늘 날짜' 경기를 크롤링해서 today 시트에 저장.
+    """
+
+    # 1) 해외야구 (MLB)
+    await crawl_maz_analysis_common(
+        update,
+        context,
+        base_url="https://mazgtv1.com/analyze/mlb",
+        sport_label="야구",          # 시트에서는 해외야구/KBO/NPB로 분리됨
+        league_default="해외야구",
+        day_key="today",            # 🔴 오늘
+        max_pages=5,
+        board_type=2,               # 기존 /crawlmazbaseball_tomorrow 와 동일
+        category=3,                 # MLB 쪽 category 값 (지금 쓰는 값 그대로)
+    )
+
+    # 2) KBO + NPB
+    await crawl_maz_analysis_common(
+        update,
+        context,
+        base_url="https://mazgtv1.com/analyze/baseball",
+        sport_label="야구",
+        league_default="KBO/NPB",
+        day_key="today",            # 🔴 오늘
+        max_pages=5,
+        board_type=2,               # 동일 boardType
+        category=4,                 # KBO/NPB 쪽 category 값 (지금 쓰는 값 그대로)
+    )
+
+    await update.message.reply_text(
+        "⚾ mazgtv 야구(MLB · KBO · NPB) '오늘 경기' 분석 크롤링을 완료했습니다.\n"
+        "today 시트에서 내용을 확인할 수 있습니다."
+    )
+
+# 🔹 NBA + 국내 농구/배구 (오늘 경기) 크롤링
+async def bvcrawl_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    mazgtv 농구/배구 분석:
+    - NBA 분석:    https://mazgtv1.com/analyze/nba
+    - 국내 농구/배구: https://mazgtv1.com/analyze/volleyball
+    두 곳에서 '오늘 경기' 분석글을 크롤링해서 today 시트에 저장한다.
+    """
+
+    # 1) NBA (해외 농구)
+    await crawl_maz_analysis_common(
+        update,
+        context,
+        base_url="https://mazgtv1.com/analyze/nba",
+        sport_label="농구",
+        league_default="NBA",
+        day_key="today",             # ✅ 오늘
+        max_pages=5,
+        board_type=2,                # 👉 tomorrow와 동일 값 유지
+        category=5,
+    )
+
+    # 2) 국내 농구 + 배구 (KBL / WKBL / V리그 등)
+    await crawl_maz_analysis_common(
+        update,
+        context,
+        base_url="https://mazgtv1.com/analyze/volleyball",
+        sport_label="농구/배구",
+        league_default="국내농구/배구",
+        day_key="today",             # ✅ 오늘
+        max_pages=5,
+        board_type=2,                # 👉 tomorrow와 동일 값 유지
+        category=7,
+    )
+
+    await update.message.reply_text(
+        "NBA + 국내 농구/배구(오늘 경기) 분석 크롤링을 모두 실행했습니다.\n"
+        "today 시트에서 내용을 확인할 수 있습니다."
+    )
+
+
 # ───────────────── 실행부 ─────────────────
 
 def main():
@@ -2576,10 +2690,19 @@ def main():
     app.add_handler(CommandHandler("crawlbasketball", crawlbasketball))     # 농구
     app.add_handler(CommandHandler("crawlvolleyball", crawlvolleyball))     # 배구
 
-    # mazgtv 분석 (내일 경기 → tomorrow 시트)
+    # mazgtv 해외축구 분석 (오늘 / 내일 경기 → today / tomorrow 시트)
+    app.add_handler(CommandHandler("crawlmazsoccer_today", crawlmazsoccer_today))
     app.add_handler(CommandHandler("crawlmazsoccer_tomorrow", crawlmazsoccer_tomorrow))
+
+    # mazgtv 야구 분석 (오늘 / 내일)
+    app.add_handler(CommandHandler("crawlmazbaseball_today", crawlmazbaseball_today))
     app.add_handler(CommandHandler("crawlmazbaseball_tomorrow", crawlmazbaseball_tomorrow))
+
+    # mazgtv 농구 + 배구 분석 (오늘 / 내일)
+    app.add_handler(CommandHandler("bvcrawl_today", bvcrawl_today))
     app.add_handler(CommandHandler("bvcrawl_tomorrow", bvcrawl_tomorrow))
+
+
 
 
     app.add_handler(CallbackQueryHandler(on_callback))
@@ -2595,6 +2718,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
