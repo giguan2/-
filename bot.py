@@ -1694,12 +1694,18 @@ def _parse_game_start_date(game_start_at: str) -> date | None:
     except Exception:
         return None
 
-def detect_game_date_from_item(item: dict, target_year: int) -> date | None:
+from datetime import date  # 파일 위쪽에 이미 있을 수도 있음
+
+def detect_game_date_from_item(item: dict, target_date: date) -> date | None:
     """
     mazgtv 리스트 JSON 한 건(item) 전체를 훑으면서
-    'YYYY-MM-DD' 또는 'MM-DD', '10월 30일' 같은 날짜 패턴을 찾아
-    date 객체로 돌려준다.
-    target_year 는 'MM-DD' 처럼 연도가 없는 패턴일 때 보완용.
+    target_date 와 '같은 날짜'가 들어있는지 찾는다.
+
+    아래 패턴들 중 하나라도 target_date 와 같으면 target_date 를 리턴, 
+    하나도 없으면 None:
+    - YYYY-MM-DD
+    - MM-DD
+    - M월 D일 / MM월 DD일
     """
 
     def _iter_values(x):
@@ -1712,37 +1718,39 @@ def detect_game_date_from_item(item: dict, target_year: int) -> date | None:
         else:
             yield x
 
-    text_values = [v for v in _iter_values(item) if isinstance(v, str)]
+    texts = [v for v in _iter_values(item) if isinstance(v, str)]
 
-    # 1) YYYY-MM-DD 우선
-    for text in text_values:
-        m = re.search(r"(\d{4})-(\d{2})-(\d{2})", text)
-        if m:
-            y, mth, d = map(int, m.groups())
+    ty = target_date.year
+
+    # 1) YYYY-MM-DD 패턴들 중에서 target_date 와 같은 날짜가 있는지
+    for text in texts:
+        for yy, mm, dd in re.findall(r"(\d{4})-(\d{2})-(\d{2})", text):
             try:
-                return date(y, mth, d)
+                dt = date(int(yy), int(mm), int(dd))
             except ValueError:
                 continue
+            if dt == target_date:
+                return dt
 
-    # 2) MM-DD (예: 10-30)
-    for text in text_values:
-        m = re.search(r"(\d{1,2})-(\d{1,2})", text)
-        if m:
-            mth, d = map(int, m.groups())
+    # 2) MM-DD (예: 12-03)
+    for text in texts:
+        for mm, dd in re.findall(r"(\d{1,2})-(\d{1,2})", text):
             try:
-                return date(target_year, mth, d)
+                dt = date(ty, int(mm), int(dd))
             except ValueError:
                 continue
+            if dt == target_date:
+                return dt
 
-    # 3) '10월 30일' 패턴
-    for text in text_values:
-        m = re.search(r"(\d{1,2})\s*월\s*(\d{1,2})\s*일", text)
-        if m:
-            mth, d = map(int, m.groups())
+    # 3) '12월 3일' / '12 월 03 일' 패턴
+    for text in texts:
+        for mm, dd in re.findall(r"(\d{1,2})\s*월\s*(\d{1,2})\s*일", text):
             try:
-                return date(target_year, mth, d)
+                dt = date(ty, int(mm), int(dd))
             except ValueError:
                 continue
+            if dt == target_date:
+                return dt
 
     return None
 
@@ -1836,58 +1844,42 @@ async def crawl_maz_analysis_common(
                         continue
 
                     # 기존 디버그 그대로 둬도 됨
-                    game_start_at = str(item.get("gameStartAt") or "").strip()
+                    game_start_at = (
+                        item.get("gameStartAt")
+                        or item.get("game_start_at")
+                        or ""
+                    )
+                    game_start_at = str(game_start_at).strip()
                     game_start_at_text = str(item.get("gameStartAtText") or "").strip()
+                    
                     print(
                         f"[MAZ][DEBUG] page={page} id={board_id} "
                         f"gameStartAt='{game_start_at}' gameStartAtText='{game_start_at_text}'"
                     )
 
-                    # 👇 여기부터 '내일 경기만' 필터
-                    item_date: date | None = None
-    
-                    # 1) gameStartAt 에 '2024-11-30T05:00:00' 같이 들어오는 경우 우선 사용
-                    if game_start_at:
-                        dt = _parse_game_start_date(game_start_at)
-                        if dt and dt == target_date:
-                            item_date = dt
-
-                    # 2) 위에서 못 찾았으면 gameStartAtText (예: '11-30(토) 05:00') 에서 MM-DD 뽑기
-                    if not item_date and game_start_at_text:
-                        mm, dd = extract_mmdd_from_kickoff(game_start_at_text)
-                        if mm and dd:
-                            try:
-                                cand = date(target_date.year, mm, dd)
-                                if cand == target_date:
-                                    item_date = cand
-                            except ValueError:
-                                pass
-
-                    # 3) 그래도 없으면 JSON 전체에서 날짜 패턴 찾아서, target_date 와 '완전 일치' 하는 것만 사용
-                if not item_date:
-                    tmp = detect_game_date_from_item(item, target_year=target_date.year)
-                    # ❗ 여기서는 "날짜를 하나라도 찾으면" 그냥 item_date 로만 세팅
-                    if tmp:
-                        item_date = tmp
-
-                print(f"[MAZ][DEBUG_DATE] page={page} id={board_id} item_date={item_date}")
-
-                # 날짜를 못 뽑은 카드면 패스
-                if not item_date:
-                    continue
-
-                # ⚾ 야구: 주간 카드(월~일)라서 '같은 주'만 허용
-                if sport_label == "야구":
-                    delta_days = (target_date - item_date).days
-                    # item_date 가 target_date 이후(미래)이거나
-                    # 7일 이상 차이나면 다른 주 카드 → 스킵
-                    if delta_days < 0 or delta_days >= 7:
-                        continue
-                else:
-                    # ⚽ 축구 / J리그 등: '내일 날짜'와 정확히 같은 경기만 사용
-                    if item_date != target_date:
+                    # 1차: gameStartAt 에서 날짜 파싱
+                    item_date = _parse_game_start_date(game_start_at)
+                    
+                    # 2차: 아이템 전체 문자열에서 target_date 와 같은 날짜를 찾기
+                    if not item_date:
+                        item_date = detect_game_date_from_item(item, target_date)
+                    
+                    print(f"[MAZ][DEBUG_DATE] page={page} id={board_id} item_date={item_date}")
+                    
+                    # 날짜를 전혀 못 뽑으면 패스
+                    if not item_date:
                         continue
 
+                    # ⚾ 야구: 주간 카드(월~일)라서 '같은 주'만 허용
+                    if sport_label == "야구":
+                        delta_days = (target_date - item_date).days
+                        # item_date 가 target_date 이후(미래)이거나, 7일 이상 차이나면 다른 주 카드 → 스킵
+                        if delta_days < 0 or delta_days >= 7:
+                            continue
+                    else:
+                        # ⚽ 축구 / J리그 등: '내일 날짜'와 정확히 같은 경기만 사용
+                        if item_date != target_date:
+                            continue
 
                     # “같은 주” 안에 있는 카드만 통과시키기
                     #   - item_date: maz 카드 기준 날짜 (보통 월요일)
@@ -2317,5 +2309,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
