@@ -490,6 +490,51 @@ def append_analysis_rows(day_key: str, rows: list[list[str]]) -> bool:
         print(f"[GSHEET][ANALYSIS] append_rows 오류: {e}")
         return False
 
+def get_existing_analysis_ids(day_key: str) -> set[str]:
+    """
+    today / tomorrow 시트에서 이미 저장된 id 값들을 set으로 가져온다.
+    (중복 크롤링 방지용)
+    """
+    client_gs = get_gs_client()
+    spreadsheet_id = os.getenv("SPREADSHEET_ID")
+
+    if not (client_gs and spreadsheet_id):
+        return set()
+
+    sheet_today_name = os.getenv("SHEET_TODAY_NAME", "today")
+    sheet_tomorrow_name = os.getenv("SHEET_TOMORROW_NAME", "tomorrow")
+    sheet_name = sheet_today_name if day_key == "today" else sheet_tomorrow_name
+
+    try:
+        sh = client_gs.open_by_key(spreadsheet_id)
+        ws = sh.worksheet(sheet_name)
+    except Exception:
+        return set()
+
+    rows = ws.get_all_values()
+    if not rows:
+        return set()
+
+    header = rows[0]
+
+    def safe_index(name, default):
+        try:
+            return header.index(name)
+        except ValueError:
+            return default
+
+    idx_sport = safe_index("sport", 0)
+    idx_id = safe_index("id", 1)
+
+    existing: set[str] = set()
+    for row in rows[1:]:
+        if len(row) <= idx_id:
+            continue
+        row_id = (row[idx_id] if len(row) > idx_id else "").strip()
+        if row_id:
+            existing.add(row_id)
+
+    return existing
 
 NEWS_DATA = {}
 
@@ -2016,6 +2061,9 @@ async def crawl_maz_analysis_common(
     )
 
     rows_to_append: list[list[str]] = []
+        # 이미 시트에 들어있는 id (중복 방지용)
+    existing_ids = get_existing_analysis_ids(day_key)
+
 
     try:
         async with httpx.AsyncClient(
@@ -2065,6 +2113,14 @@ async def crawl_maz_analysis_common(
                     if not board_id:
                         continue
 
+                    # 시트에서 쓸 고유 id (문자열로 통일)
+                    row_id = f"maz_{board_id}"
+
+                    # 이미 today/tomorrow 시트에 있는 id면 스킵
+                    if row_id in existing_ids:
+                        print(f"[MAZ][SKIP_DUP] already exists in sheet: {row_id}")
+                        continue
+                        
                     # 기존 디버그 그대로 둬도 됨
                     game_start_at = (
                         item.get("gameStartAt")
@@ -2183,8 +2239,8 @@ async def crawl_maz_analysis_common(
                         row_sport = classify_basketball_volleyball_sport(league or "")                    
 
                     rows_to_append.append([
-                        row_sport,  # sport 열
-                        "",         # id (비워두면 로딩 시 자동 생성)
+                        row_sport,   # sport 열
+                        row_id,      # id 열 → maz 게시글 기준 고유 id
                         new_title,
                         new_body,
                     ])
@@ -2746,6 +2802,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
