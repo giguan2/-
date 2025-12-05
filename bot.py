@@ -984,6 +984,73 @@ async def newsclean(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"시트 초기화 중 오류: {e}")
         return
 
+# 🔹 /allclean – today / tomorrow / news 시트 전체 초기화
+async def allclean(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+
+    client_gs = get_gs_client()
+    spreadsheet_id = os.getenv("SPREADSHEET_ID")
+
+    if not (client_gs and spreadsheet_id):
+        await update.message.reply_text(
+            "구글시트 설정(GOOGLE_SERVICE_KEY 또는 SPREADSHEET_ID)이 없어 시트를 초기화할 수 없습니다."
+        )
+        return
+
+    try:
+        sh = client_gs.open_by_key(spreadsheet_id)
+    except Exception as e:
+        await update.message.reply_text(f"스프레드시트를 열지 못했습니다: {e}")
+        return
+
+    sheet_today_name = os.getenv("SHEET_TODAY_NAME", "today")
+    sheet_tomorrow_name = os.getenv("SHEET_TOMORROW_NAME", "tomorrow")
+    sheet_news_name = os.getenv("SHEET_NEWS_NAME", "news")
+
+    sheet_configs = [
+        (sheet_today_name, "today 분석"),
+        (sheet_tomorrow_name, "tomorrow 분석"),
+        (sheet_news_name, "news 뉴스"),
+    ]
+
+    errors: list[str] = []
+
+    for sheet_name, desc in sheet_configs:
+        try:
+            ws = sh.worksheet(sheet_name)
+        except Exception as e:
+            errors.append(f"{desc} 시트를 열지 못했습니다: {e}")
+            continue
+
+        try:
+            rows = ws.get_all_values()
+            if rows:
+                header = rows[0]
+            else:
+                # today / tomorrow / news 모두 같은 형식 사용
+                header = ["sport", "id", "title", "summary"]
+
+            ws.clear()
+            ws.update("A1", [header])
+        except Exception as e:
+            errors.append(f"{desc} 시트 초기화 중 오류: {e}")
+
+    # 메모리 데이터도 함께 리셋
+    reload_analysis_from_sheet()
+    reload_news_from_sheet()
+
+    if errors:
+        msg = (
+            "일부 시트를 초기화하지 못했습니다.\n\n"
+            + "\n".join(errors)
+        )
+    else:
+        msg = "today / tomorrow / news 시트를 모두 초기화했습니다. (헤더만 남겨둠) ✅"
+
+    await update.message.reply_text(msg)
+
 async def _analysis_clean_by_sports(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -2755,6 +2822,8 @@ def main():
     app.add_handler(CommandHandler("syncsheet", syncsheet))
     # 뉴스 시트 전체 초기화
     app.add_handler(CommandHandler("newsclean", newsclean))
+    # today / tomorrow / news 전체 초기화
+    app.add_handler(CommandHandler("allclean", allclean))    
 
     # 분석 시트 부분 초기화 명령어들 (모두 tomorrow 시트 기준)
     app.add_handler(CommandHandler("soccerclean", soccerclean))
@@ -2802,6 +2871,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
