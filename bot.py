@@ -490,6 +490,177 @@ def append_analysis_rows(day_key: str, rows: list[list[str]]) -> bool:
         print(f"[GSHEET][ANALYSIS] append_rows 오류: {e}")
         return False
 
+def _get_ws_by_name(sh, name: str):
+    try:
+        return sh.worksheet(name)
+    except Exception:
+        return None
+
+def get_site_export_ws():
+    """
+    site_export 탭 워크시트 반환.
+    없으면 생성 시도(권한/환경에 따라 실패 가능).
+    """
+    client_gs = get_gs_client()
+    spreadsheet_id = os.getenv("SPREADSHEET_ID")
+    if not (client_gs and spreadsheet_id):
+        return None
+
+    sheet_name = os.getenv("SHEET_SITE_EXPORT_NAME", "site_export")
+
+    try:
+        sh = client_gs.open_by_key(spreadsheet_id)
+        ws = _get_ws_by_name(sh, sheet_name)
+        if ws:
+            return ws
+
+        # 없으면 생성 시도
+        ws = sh.add_worksheet(title=sheet_name, rows=2000, cols=10)
+        # 헤더 세팅
+        ws.update("A1", [[
+            "day", "sport", "src_id", "title", "body", "creatadAt"
+        ]])
+        return ws
+
+    except Exception as e:
+        print(f"[GSHEET][SITE_EXPORT] 워크시트 준비 실패: {e}")
+        return None
+
+
+def get_existing_site_src_ids(day_value: str | None = None) -> set[str]:
+    """
+    site_export 탭에서 이미 저장된 src_id 목록을 읽어 중복 저장 방지.
+    day_value를 주면 해당 day만 필터링해서 읽는다.
+    """
+    ws = get_site_export_ws()
+    if not ws:
+        return set()
+
+    try:
+        values = ws.get_all_values()
+        if not values or len(values) < 2:
+            return set()
+
+        header = values[0]
+        idx_day = header.index("day") if "day" in header else 0
+        idx_src = header.index("src_id") if "src_id" in header else 2
+
+        out = set()
+        for r in values[1:]:
+            if len(r) <= idx_src:
+                continue
+            rid = (r[idx_src] or "").strip()
+            if not rid:
+                continue
+            if day_value:
+                dv = (r[idx_day] or "").strip() if len(r) > idx_day else ""
+                if dv != day_value:
+                    continue
+            out.add(rid)
+
+        return out
+
+    except Exception as e:
+        print(f"[GSHEET][SITE_EXPORT] existing src_id 로드 실패: {e}")
+        return set()
+
+
+def append_site_export_rows(rows: list[list[str]]) -> bool:
+    """
+    site_export 탭에 rows를 append한다.
+    rows 포맷: [day, sport, src_id, title, body, creatadAt]
+    """
+    ws = get_site_export_ws()
+    if not ws:
+        print("[GSHEET][SITE_EXPORT] 워크시트 없음 → 저장 불가")
+        return False
+
+    try:
+        ws.append_rows(rows, value_input_option="RAW")
+        print(f"[GSHEET][SITE_EXPORT] {len(rows)}건 추가")
+        return True
+    except Exception as e:
+        print(f"[GSHEET][SITE_EXPORT] append_rows 실패: {e}")
+        return False
+
+# ───────────────── site_export 저장 ─────────────────
+
+SITE_EXPORT_SHEET_NAME = os.getenv("SHEET_SITE_EXPORT_NAME", "site_export")
+SITE_EXPORT_HEADER = ["day", "sport", "src_id", "title", "body", "creatadAt"]  # 헤더 오타 포함 그대로
+
+def _ensure_header(ws, header: list[str]) -> None:
+    """시트가 비어있거나 헤더가 없으면 헤더를 1행에 깔아준다."""
+    try:
+        values = ws.get_all_values()
+        if not values:
+            ws.update("A1", [header])
+            return
+        first = values[0]
+        if [c.strip() for c in first] != header:
+            # 헤더가 다르면 강제로 교체하진 않고, 없는 경우만 깔기
+            # (원하면 여기서 강제 교체로 바꿀 수 있음)
+            pass
+    except Exception as e:
+        print(f"[GSHEET][SITE_EXPORT] 헤더 확인 실패: {e}")
+
+def append_site_export_rows(rows: list[list[str]]) -> bool:
+    """
+    site_export 탭에 rows를 append.
+    rows: [ [day, sport, src_id, title, body, createdAt], ... ]
+    """
+    client_gs = get_gs_client()
+    spreadsheet_id = os.getenv("SPREADSHEET_ID")
+    if not (client_gs and spreadsheet_id):
+        print("[GSHEET][SITE_EXPORT] 설정 없음 → 저장 불가")
+        return False
+
+    try:
+        sh = client_gs.open_by_key(spreadsheet_id)
+        ws = sh.worksheet(SITE_EXPORT_SHEET_NAME)
+        _ensure_header(ws, SITE_EXPORT_HEADER)
+    except Exception as e:
+        print(f"[GSHEET][SITE_EXPORT] 시트 '{SITE_EXPORT_SHEET_NAME}' 열기 실패: {e}")
+        return False
+
+    try:
+        ws.append_rows(rows, value_input_option="RAW")
+        print(f"[GSHEET][SITE_EXPORT] {SITE_EXPORT_SHEET_NAME} 에 {len(rows)}건 추가")
+        return True
+    except Exception as e:
+        print(f"[GSHEET][SITE_EXPORT] append_rows 오류: {e}")
+        return False
+
+def get_existing_site_src_ids(day_str: str) -> set[str]:
+    """site_export 탭에서 day가 같은 행들의 src_id를 set으로 가져와 중복 저장 방지."""
+    client_gs = get_gs_client()
+    spreadsheet_id = os.getenv("SPREADSHEET_ID")
+    if not (client_gs and spreadsheet_id):
+        return set()
+
+    try:
+        sh = client_gs.open_by_key(spreadsheet_id)
+        ws = sh.worksheet(SITE_EXPORT_SHEET_NAME)
+        values = ws.get_all_values()
+        if not values or len(values) < 2:
+            return set()
+
+        header = values[0]
+        idx_day = header.index("day") if "day" in header else 0
+        idx_src = header.index("src_id") if "src_id" in header else 2
+
+        out = set()
+        for r in values[1:]:
+            if len(r) <= max(idx_day, idx_src):
+                continue
+            if (r[idx_day] or "").strip() == day_str:
+                sid = (r[idx_src] or "").strip()
+                if sid:
+                    out.add(sid)
+        return out
+    except Exception as e:
+        print(f"[GSHEET][SITE_EXPORT] 기존 src_id 로딩 실패: {e}")
+        return set()
+
 def get_existing_analysis_ids(day_key: str) -> set[str]:
     """
     today / tomorrow 시트에서 이미 저장된 id 값들을 set으로 가져온다.
@@ -1592,6 +1763,97 @@ def summarize_analysis_with_gemini(
             "➡️ 세부 추천픽은 별도 분석이 필요합니다."
         )
         return (base_title or "[경기 분석]", body)
+        
+def rewrite_for_site_openai(
+    full_text: str,
+    *,
+    league: str,
+    home_team: str,
+    away_team: str,
+    max_chars: int = 4500,
+) -> tuple[str, str]:
+    """
+    사이트 게시용: 원문(full_text) 기반 서술형 재작성.
+    - 허구/추측 금지
+    - 원문과 어긋나는 정보 추가 금지
+    - '스포츠분석', '고트티비' 키워드 자연스럽게 1~2회 삽입
+    """
+    text = (full_text or "").strip()
+    if not text or len(text) < 200:
+        raise ValueError("원문이 너무 짧음(사이트용 생성 스킵)")
+
+    client_oa = get_openai_client()
+    if not client_oa:
+        raise ValueError("OPENAI_API_KEY 없음(사이트용 생성 스킵)")
+
+    base_title = f"[{league}] {home_team} vs {away_team} 경기 분석".strip()
+
+    # 너무 길면 컷
+    if len(text) > 9000:
+        text = text[:9000]
+
+    prompt = f"""
+다음은 스포츠 경기 분석 원문이다.
+원문을 기반으로만 한국어로 자연스럽게 재작성하라.
+절대로 원문에 없는 내용을 추가/추측/단정하지 마라.
+
+요구사항:
+- 제목 1개 + 본문(서술형)만 작성
+- 본문은 6~14문단 내에서 자연스럽게 구성(줄바꿈 유지)
+- 팀 전력/핵심 포인트/경기 흐름 전망 중심으로 정리
+- '스포츠분석' 키워드를 본문에 1~2회 자연스럽게 포함
+- '고트티비' 키워드를 본문에 1회 자연스럽게 포함
+- 베팅 픽/배당/확률/승부 단정은 쓰지 말고, 가능성/흐름 중심으로만
+- 원문 문장을 그대로 복사하지 말 것(재작성)
+
+출력 형식(반드시):
+제목: ...
+본문:
+... (여기부터 본문)
+
+리그: {league}
+홈팀: {home_team}
+원정팀: {away_team}
+
+===== 원문 =====
+{text}
+""".strip()
+
+    resp = client_oa.chat.completions.create(
+        model=os.getenv("OPENAI_MODEL_SITE", "gpt-4.1-mini"),
+        messages=[
+            {"role": "system", "content": "너는 스포츠 경기 분석 원문을 기반으로 재작성하는 한국어 에디터다. 허구를 절대 추가하지 않는다."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.35,
+        max_completion_tokens=1200,
+    )
+
+    out = (resp.choices[0].message.content or "").strip()
+    if not out:
+        raise ValueError("site rewrite empty")
+
+    # 파싱
+    title = base_title
+    body = out
+
+    m1 = re.search(r"제목\s*[:：]\s*(.+)", out)
+    m2 = re.search(r"본문\s*[:：]\s*(.+)", out, flags=re.S)
+    if m1:
+        title = m1.group(1).strip()
+    if m2:
+        body = m2.group(1).strip()
+
+    # 길이 제한
+    if len(body) > max_chars:
+        body = body[:max_chars].rstrip()
+
+    return title, body
+
+    except Exception as e:
+        print(f"[OPENAI][SITE] 실패 → simple_summarize 폴백: {e}")
+        body = simple_summarize(text, max_chars=min(max_chars, 1200))
+        return (base_title, body)
 
 # ───────────────── 뉴스용 Gemini 요약 함수 ─────────────────
 
@@ -2092,23 +2354,29 @@ async def crawl_maz_analysis_common(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     *,
-    base_url: str,        # 이제는 쓰지 않지만 인터페이스 유지용
-    sport_label: str,     # "축구" 또는 "야구" 처럼 대분류 이름
-    league_default: str,  # 프롬프트에 쓸 기본 리그명 (예: "해외축구", "해외야구")
-    day_key: str = "tomorrow",  # "today" or "tomorrow"
+    base_url: str,               # 인터페이스 유지용(실제로 API만 사용)
+    sport_label: str,            # "축구", "야구", "농구", "농구/배구" 등
+    league_default: str,         # 기본 리그명
+    day_key: str = "tomorrow",   # "today" or "tomorrow"
     max_pages: int = 5,
-    board_type: int = 2,       # ⚠️ 리그별 boardType (축구=2, 야구=3 로 가정)
-    category: int = 1,         # ⚠️ 리그별 category (해외/국내 구분)
-    target_ymd: str | None = None,  # 특정 날짜 강제 (예: "2024-10-30") - 없으면 day_key 기준
+    board_type: int = 2,
+    category: int = 1,
+    target_ymd: str | None = None,   # 강제 날짜(YYYY-MM-DD)
+    export_site: bool = False,       # ✅ site_export 저장 여부
 ):
     """
-    mazgtv 분석 페이지 공통 크롤러 (JSON API 버전).
+    mazgtv 분석 공통 크롤러(JSON API).
 
-    1) MAZ_LIST_API 에서 분석 글 리스트를 JSON으로 가져온 뒤,
-       gameStartAt 문자열이 target_ymd(YYYY-MM-DD) 로 시작하는 것만 필터링한다.
-    2) 각 경기의 id로 MAZ_DETAIL_API_TEMPLATE 호출 → content(HTML) 수집
-    3) HTML을 텍스트로 변환 후, OpenAI로 요약해서 today/tomorrow 시트에 저장.
+    - 리스트: /api/board/list
+    - 상세:   /api/board/{id}  → content(html)
+    - 날짜 필터:
+        * 축구/농구/배구: item_date == target_date
+        * 야구: 주간카드(월~일) 허용 → 0 <= (target_date - item_date).days < 7
+    - 중복 방지:
+        * today/tomorrow 시트: row_id(maz_{board_id})가 있으면 스킵
+        * export_site=True 시: site_export에도 같은 src_id 있으면 스킵(함수들 존재할 때만)
     """
+
     if not is_admin(update):
         await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
         return
@@ -2120,17 +2388,27 @@ async def crawl_maz_analysis_common(
             base_date += timedelta(days=1)
         target_ymd = base_date.strftime("%Y-%m-%d")
 
-    # 🔴 여기서 target_date 만들어 줌
-    target_date = datetime.strptime(target_ymd, "%Y-%m-%d").date()    
+    target_date = datetime.strptime(target_ymd, "%Y-%m-%d").date()
 
     await update.message.reply_text(
-        f"mazgtv {sport_label} 분석 페이지에서 {target_ymd} 경기 분석글을 가져옵니다. 잠시만 기다려 주세요..."
+        f"mazgtv {sport_label} 분석에서 {target_ymd} 경기 분석글을 가져옵니다. 잠시만 기다려 주세요..."
     )
 
-    rows_to_append: list[list[str]] = []
-        # 이미 시트에 들어있는 id (중복 방지용)
+    # ✅ today/tomorrow 시트 중복 방지
     existing_ids = get_existing_analysis_ids(day_key)
 
+    # ✅ site_export 중복 방지(옵션)
+    day_str = "today" if day_key == "today" else "tomorrow"
+    existing_site = set()
+    site_rows_to_append: list[list[str]] = []
+    if export_site:
+        # 네가 이전에 추가할 함수들이 있을 때만 동작
+        try:
+            existing_site = get_existing_site_src_ids(day_str)
+        except Exception:
+            existing_site = set()
+
+    rows_to_append: list[list[str]] = []
 
     try:
         async with httpx.AsyncClient(
@@ -2138,7 +2416,6 @@ async def crawl_maz_analysis_common(
             follow_redirects=True,
         ) as client:
 
-            # 1) 리스트 페이지(1~max_pages) 순회
             for page in range(1, max_pages + 1):
                 list_url = (
                     f"{MAZ_LIST_API}"
@@ -2150,7 +2427,6 @@ async def crawl_maz_analysis_common(
                 r = await client.get(list_url, timeout=10.0)
                 r.raise_for_status()
 
-                # JSON 파싱
                 try:
                     data = r.json()
                 except Exception as e:
@@ -2169,7 +2445,7 @@ async def crawl_maz_analysis_common(
                     items = data
 
                 if not isinstance(items, list) or not items:
-                    print(f"[MAZ][LIST] page={page} 항목 없음 → 반복 종료")
+                    print(f"[MAZ][LIST] page={page} 항목 없음 → 종료")
                     break
 
                 for item in items:
@@ -2180,67 +2456,56 @@ async def crawl_maz_analysis_common(
                     if not board_id:
                         continue
 
-                    # 시트에서 쓸 고유 id (문자열로 통일)
                     row_id = f"maz_{board_id}"
 
-                    # 이미 today/tomorrow 시트에 있는 id면 스킵
+                    # ✅ today/tomorrow 시트 중복이면 스킵
                     if row_id in existing_ids:
                         print(f"[MAZ][SKIP_DUP] already exists in sheet: {row_id}")
                         continue
-                        
-                    # 기존 디버그 그대로 둬도 됨
-                    game_start_at = (
-                        item.get("gameStartAt")
-                        or item.get("game_start_at")
-                        or ""
-                    )
+
+                    # ✅ site_export 중복이면 스킵(옵션)
+                    if export_site and row_id in existing_site:
+                        print(f"[MAZ][SKIP_DUP_SITE] already exists in site_export: {row_id}")
+                        continue
+
+                    # 날짜 후보
+                    game_start_at = (item.get("gameStartAt") or item.get("game_start_at") or "")
                     game_start_at = str(game_start_at).strip()
                     game_start_at_text = str(item.get("gameStartAtText") or "").strip()
-                    
+
                     print(
                         f"[MAZ][DEBUG] page={page} id={board_id} "
                         f"gameStartAt='{game_start_at}' gameStartAtText='{game_start_at_text}'"
                     )
 
-                    # 1차: gameStartAt 에서 날짜 파싱
+                    # 1) gameStartAt에서 날짜 파싱
                     item_date = _parse_game_start_date(game_start_at)
-                    
-                    # 2차: 아이템 전체 문자열에서 target_date 와 같은 날짜를 찾기
+
+                    # 2) 실패하면 item 전체에서 날짜 탐색(연도 보정)
                     if not item_date:
-                        item_date = detect_game_date_from_item(item, target_date)
-                    
+                        item_date = detect_game_date_from_item(item, target_year=target_date.year)
+
                     print(f"[MAZ][DEBUG_DATE] page={page} id={board_id} item_date={item_date}")
-                    
-                    # 날짜를 못 뽑았거나, target_date(오늘/내일)와 다르면 스킵
-                    if not item_date or item_date != target_date:
+
+                    if not item_date:
                         continue
 
-                    # ⚾ 야구: 주간 카드(월~일)라서 '같은 주'만 허용
+                    # ✅ 날짜 필터 (핵심)
                     if sport_label == "야구":
+                        # 야구는 주간카드(월요일 기준)인 경우가 있어서 "같은 주"만 허용
                         delta_days = (target_date - item_date).days
-                        # item_date 가 target_date 이후(미래)이거나, 7일 이상 차이나면 다른 주 카드 → 스킵
                         if delta_days < 0 or delta_days >= 7:
                             continue
                     else:
-                        # ⚽ 축구 / J리그 등: '내일 날짜'와 정확히 같은 경기만 사용
+                        # 축구/농구/배구는 정확히 target_date만
                         if item_date != target_date:
                             continue
-
-                    # “같은 주” 안에 있는 카드만 통과시키기
-                    #   - item_date: maz 카드 기준 날짜 (보통 월요일)
-                    #   - target_date: 우리가 원하는 경기 날짜
-                    delta_days = (target_date - item_date).days
-
-                    # item_date 가 target_date 이후이거나 (미래)
-                    # 7일 이상 차이나면 다른 주 카드이므로 스킵
-                    if delta_days < 0 or delta_days >= 7:
-                        continue
 
                     league = item.get("leagueName") or league_default
                     home = item.get("homeTeamName") or ""
                     away = item.get("awayTeamName") or ""
 
-                    # 2) 상세 페이지 JSON 호출 → content(HTML) 추출
+                    # 상세 JSON
                     detail_url = MAZ_DETAIL_API_TEMPLATE.format(board_id=board_id)
                     try:
                         r2 = await client.get(detail_url, timeout=10.0)
@@ -2255,7 +2520,6 @@ async def crawl_maz_analysis_common(
                         print(f"[MAZ][DETAIL] id={board_id} content 없음")
                         continue
 
-                    # HTML → 텍스트
                     soup = BeautifulSoup(content_html, "html.parser")
                     try:
                         for bad in soup.select("script, style, .ad, .banner"):
@@ -2265,12 +2529,11 @@ async def crawl_maz_analysis_common(
 
                     full_text = soup.get_text("\n", strip=True)
                     full_text = clean_maz_text(full_text)
-
                     if not full_text:
                         print(f"[MAZ][DETAIL] id={board_id} 본문 텍스트 없음")
                         continue
 
-                    # 3) OpenAI로 제목/본문 요약 생성
+                    # 텔레그램용 요약
                     new_title, new_body = summarize_analysis_with_gemini(
                         full_text,
                         league=league,
@@ -2279,19 +2542,19 @@ async def crawl_maz_analysis_common(
                         max_chars=900,
                     )
 
-                    # ✅ 시트 sport 컬럼: 세부 카테고리 분리
-                    row_sport = sport_label  # 기본값
+                    # sport 세부분류
+                    row_sport = sport_label
 
                     if sport_label == "축구":
-                        if "K리그" in league:
+                        if "K리그" in (league or ""):
                             row_sport = "K리그"
-                        elif "J리그" in league:
+                        elif "J리그" in (league or ""):
                             row_sport = "J리그"
                         else:
                             row_sport = "해외축구"
 
                     elif sport_label == "야구":
-                        upper_league = league.upper()
+                        upper_league = (league or "").upper()
                         if "KBO" in upper_league:
                             row_sport = "KBO"
                         elif "NPB" in upper_league:
@@ -2302,40 +2565,68 @@ async def crawl_maz_analysis_common(
                             row_sport = "해외야구"
 
                     elif sport_label in ("농구", "농구/배구"):
-                        # NBA / KBL / WKBL / V리그 / 배구 등으로 자동 분류
-                        row_sport = classify_basketball_volleyball_sport(league or "")                    
+                        # 네가 이미 만든 분류 함수 사용
+                        row_sport = classify_basketball_volleyball_sport(league or "")
 
-                    rows_to_append.append([
-                        row_sport,   # sport 열
-                        row_id,      # id 열 → maz 게시글 기준 고유 id
-                        new_title,
-                        new_body,
-                    ])
+                    rows_to_append.append([row_sport, row_id, new_title, new_body])
+                    existing_ids.add(row_id)
+
+                    # ✅ site_export 저장용(옵션) - 네가 관련 함수/재작성 로직을 붙였을 때만 활성화
+                    if export_site:
+                        try:
+                            # rewrite_for_site_openai가 없으면 그냥 스킵
+                            site_title, site_body = rewrite_for_site_openai(
+                                full_text,
+                                league=league,
+                                home_team=home,
+                                away_team=away,
+                                max_chars=4500,
+                            )
+                            created_at = get_kst_now().strftime("%Y-%m-%d %H:%M:%S")
+
+                            site_rows_to_append.append([
+                                day_str,        # day
+                                row_sport,      # sport
+                                row_id,         # src_id
+                                site_title,     # title
+                                site_body,      # body
+                                created_at,     # creatadAt(오타 헤더지만 값은 저장됨)
+                            ])
+                            existing_site.add(row_id)
+                        except Exception as e:
+                            print(f"[SITE_EXPORT] 생성 실패 id={row_id}: {e}")
 
     except Exception as e:
         await update.message.reply_text(f"요청 오류가 발생했습니다: {e}")
         return
 
-    # 해당 날짜 경기 없을 때
     if not rows_to_append:
         await update.message.reply_text(
             f"mazgtv {sport_label} 분석에서 {target_ymd} 경기 분석글을 찾지 못했습니다."
         )
         return
 
-    # 4) 시트에 저장
+    # ✅ today/tomorrow 시트 저장
     ok = append_analysis_rows(day_key, rows_to_append)
     if not ok:
         await update.message.reply_text("구글시트에 분석 데이터를 저장하지 못했습니다.")
         return
 
+    # ✅ site_export 시트 저장(옵션)
+    if export_site and site_rows_to_append:
+        try:
+            append_site_export_rows(site_rows_to_append)
+        except Exception as e:
+            print(f"[SITE_EXPORT] 시트 저장 실패: {e}")
+
     reload_analysis_from_sheet()
 
     await update.message.reply_text(
         f"mazgtv {sport_label} 분석에서 {target_ymd} 경기 분석 {len(rows_to_append)}건을 "
-        f"'{day_key}' 시트에 저장했습니다.\n"
-        "텔레그램에서 경기 분석픽 메뉴를 열어 확인해보세요."
+        f"'{day_key}' 시트에 저장했습니다."
+        + (f"\nsite_export에도 {len(site_rows_to_append)}건 저장했습니다." if export_site else "")
     )
+
 
 # ───────────────── 종목별 (Daum 뉴스) 크롤링 명령어 ─────────────────
 
@@ -2585,35 +2876,36 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 async def crawlmazsoccer_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # 1) 해외축구 탭
+    # 1) 해외축구
     await crawl_maz_analysis_common(
         update,
         context,
         base_url="https://mazgtv1.com/analyze/overseas",
-        sport_label="축구",          # 안에서 '해외축구/K리그/J리그'로 다시 분류됨
+        sport_label="축구",
         league_default="해외축구",
         day_key="tomorrow",
         max_pages=5,
         board_type=2,
-        category=1,                  # 해외축구
+        category=1,
+        export_site=True,   # ✅ 추가
     )
 
-    # 2) K리그 / J리그 탭
+    # 2) K리그/J리그(asia)
     await crawl_maz_analysis_common(
         update,
         context,
         base_url="https://mazgtv1.com/analyze/asia",
-        sport_label="축구",          # 여기도 그대로 "축구" 사용
+        sport_label="축구",
         league_default="K리그/J리그",
         day_key="tomorrow",
         max_pages=5,
         board_type=2,
-        category=2,                  # ⭐ DevTools에서 본 K리그/J리그 category 값
+        category=2,
+        export_site=True,   # ✅ 추가
     )
 
-    await update.message.reply_text(
-        "⚽ 해외축구 + K리그/J리그 내일 경기 분석 크롤링을 모두 실행했습니다."
-    )
+    await update.message.reply_text("⚽ 텔레그램용 + 사이트용(내일) 분석 크롤링을 모두 저장했습니다.")
+
 
 # 야구(MLB · KBO · NPB) 분석 (내일 경기 → tomorrow 시트)
 async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2871,6 +3163,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
