@@ -1784,15 +1784,18 @@ def rewrite_for_site_openai(
     if not full_text_clean:
         return ("[분석글 없음]", "")
 
+    # 너무 길면 잘라서 토큰 폭주 방지
     if len(full_text_clean) > 9000:
         full_text_clean = full_text_clean[:9000]
 
+    # 제목 기본값
     _league = (league or "").strip() or "경기"
     if home_team and away_team:
         base_title = f"[{_league}] {home_team} vs {away_team} 스포츠분석"
     else:
         base_title = f"[{_league}] 스포츠분석"
 
+    # OpenAI 키 없으면 최소 폴백(=원문 기반 요약)만 반환
     if not client_oa:
         body_fb = simple_summarize(full_text_clean, max_chars=max_chars)
         return (base_title, body_fb)
@@ -1867,8 +1870,10 @@ def rewrite_for_site_openai(
         if not body:
             raise ValueError("empty response from OpenAI (site)")
 
+        # 혹시 모델이 제목을 섞어 출력하면 제거
         body = re.sub(r"^제목\s*[:：].*\n+", "", body).strip()
 
+        # 너무 길면 자르기
         if len(body) > max_chars:
             body = body[:max_chars].rstrip()
 
@@ -1879,7 +1884,7 @@ def rewrite_for_site_openai(
         body_fb = simple_summarize(full_text_clean, max_chars=max_chars)
         return (base_title, body_fb)
 
-# ───────────────── 뉴스용 Gemini 요약 함수 ─────────────────
+
 
 def summarize_with_gemini(full_text: str, orig_title: str = "", max_chars: int = 400) -> tuple[str, str]:
     """
@@ -2410,6 +2415,10 @@ async def crawl_maz_analysis_common(
     # ✅ 중복 방지: 이미 today/tomorrow 시트에 있는 src_id 모으기
     existing_ids = get_existing_analysis_ids(day_key)
 
+    # ✅ site_export 시트 중복 방지용
+    existing_site_src_ids = get_existing_site_src_ids() if export_site else set()
+    site_rows_to_append: list[list[str]] = []
+
     try:
         async with httpx.AsyncClient(
             headers={"User-Agent": "Mozilla/5.0"},
@@ -2481,7 +2490,7 @@ async def crawl_maz_analysis_common(
 
                     # 2) 실패하면 item 전체에서 날짜 패턴 탐색 (연도 보정용)
                     if not item_date:
-                        item_date = detect_game_date_from_item(item, target_year=target_date.year)
+                        item_date = detect_game_date_from_item(item, target_date)
 
                     print(f"[MAZ][DEBUG_DATE] page={page} id={board_id} item_date={item_date}")
 
@@ -2566,6 +2575,31 @@ async def crawl_maz_analysis_common(
 
                     rows_to_append.append([row_sport, row_id, new_title, new_body])
 
+                    # ✅ 사이트 업로드용(site_export)도 같이 저장
+                    if export_site:
+                        if row_id in existing_site_src_ids:
+                            print(f"[SITE_EXPORT][SKIP_DUP] already exists: {row_id}")
+                        else:
+                            try:
+                                site_title, site_body = rewrite_for_site_openai(
+                                    full_text,
+                                    league=league,
+                                    home_team=home,
+                                    away_team=away,
+                                )
+                            except Exception as e:
+                                print(f"[SITE_EXPORT][ERR] id={board_id}: {e}")
+                            else:
+                                site_rows_to_append.append([
+                                    day_key,
+                                    row_sport,
+                                    row_id,
+                                    site_title,
+                                    site_body,
+                                    get_kst_now().strftime("%Y-%m-%d %H:%M:%S"),
+                                ])
+                                existing_site_src_ids.add(row_id)
+
     except Exception as e:
         # ✅ 여기 except는 try와 같은 들여쓰기 레벨이어야 함
         await update.message.reply_text(f"요청 오류가 발생했습니다: {e}")
@@ -2582,11 +2616,22 @@ async def crawl_maz_analysis_common(
         await update.message.reply_text("구글시트에 분석 데이터를 저장하지 못했습니다.")
         return
 
+    # ✅ site_export 시트 저장
+    if export_site and site_rows_to_append:
+        ok2 = append_site_export_rows(site_rows_to_append)
+        if not ok2:
+            await update.message.reply_text("site_export 시트 저장 중 오류가 발생했습니다.")
+            return
+
     reload_analysis_from_sheet()
+
+    extra = ""
+    if export_site:
+        extra = f"\\nsite_export 시트에도 {len(site_rows_to_append)}건을 저장했습니다."
 
     await update.message.reply_text(
         f"mazgtv {sport_label} 분석에서 {target_ymd} 경기 분석 {len(rows_to_append)}건을 "
-        f"'{day_key}' 시트에 저장했습니다.\n"
+        f"'{day_key}' 시트에 저장했습니다." + extra + "\\n"
         "텔레그램에서 경기 분석픽 메뉴를 열어 확인해보세요."
     )
 
@@ -3125,7 +3170,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 
