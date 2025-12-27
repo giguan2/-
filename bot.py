@@ -527,41 +527,33 @@ def get_site_export_ws():
         return None
 
 
-def get_existing_site_src_ids(day_value: str | None = None) -> set[str]:
+def get_existing_site_src_ids(day_str: str | None = None) -> set[str]:
     """
-    site_export 탭에서 이미 저장된 src_id 목록을 읽어 중복 저장 방지.
-    day_value를 주면 해당 day만 필터링해서 읽는다.
+    site_export 시트의 src_id(=maz_xxx) 목록을 읽어서 반환.
+    day_str가 주어지면 해당 day만 필터링.
     """
-    ws = get_site_export_ws()
-    if not ws:
-        return set()
-
     try:
+        ws = open_sheet("site_export")  # 너 프로젝트에서 시트 여는 함수명에 맞춰
         values = ws.get_all_values()
         if not values or len(values) < 2:
             return set()
 
         header = values[0]
-        idx_day = header.index("day") if "day" in header else 0
-        idx_src = header.index("src_id") if "src_id" in header else 2
+        day_idx = header.index("day")
+        src_idx = header.index("src_id")
 
         out = set()
-        for r in values[1:]:
-            if len(r) <= idx_src:
+        for row in values[1:]:
+            if len(row) <= src_idx:
                 continue
-            rid = (r[idx_src] or "").strip()
-            if not rid:
+            if day_str and (len(row) <= day_idx or row[day_idx] != day_str):
                 continue
-            if day_value:
-                dv = (r[idx_day] or "").strip() if len(r) > idx_day else ""
-                if dv != day_value:
-                    continue
-            out.add(rid)
-
+            src = row[src_idx].strip()
+            if src:
+                out.add(src)
         return out
-
     except Exception as e:
-        print(f"[GSHEET][SITE_EXPORT] existing src_id 로드 실패: {e}")
+        print(f"[SITE_EXPORT] get_existing_site_src_ids error: {e}")
         return set()
 
 
@@ -2416,7 +2408,7 @@ async def crawl_maz_analysis_common(
     existing_ids = get_existing_analysis_ids(day_key)
 
     # ✅ site_export 시트 중복 방지용
-    existing_site_src_ids = get_existing_site_src_ids() if export_site else set()
+    existing_site_src_ids = get_existing_site_src_ids(target_ymd) if export_site else set()
     site_rows_to_append: list[list[str]] = []
 
     try:
