@@ -2354,34 +2354,21 @@ async def crawl_maz_analysis_common(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     *,
-    base_url: str,               # 인터페이스 유지용(실제로 API만 사용)
-    sport_label: str,            # "축구", "야구", "농구", "농구/배구" 등
-    league_default: str,         # 기본 리그명
-    day_key: str = "tomorrow",   # "today" or "tomorrow"
+    base_url: str,
+    sport_label: str,
+    league_default: str,
+    day_key: str = "tomorrow",
     max_pages: int = 5,
     board_type: int = 2,
     category: int = 1,
-    target_ymd: str | None = None,   # 강제 날짜(YYYY-MM-DD)
-    export_site: bool = False,       # ✅ site_export 저장 여부
+    target_ymd: str | None = None,
+    export_site: bool = False,
 ):
-    """
-    mazgtv 분석 공통 크롤러(JSON API).
-
-    - 리스트: /api/board/list
-    - 상세:   /api/board/{id}  → content(html)
-    - 날짜 필터:
-        * 축구/농구/배구: item_date == target_date
-        * 야구: 주간카드(월~일) 허용 → 0 <= (target_date - item_date).days < 7
-    - 중복 방지:
-        * today/tomorrow 시트: row_id(maz_{board_id})가 있으면 스킵
-        * export_site=True 시: site_export에도 같은 src_id 있으면 스킵(함수들 존재할 때만)
-    """
-
     if not is_admin(update):
         await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
         return
 
-    # ✅ 날짜 기준 설정
+    # ✅ 날짜 기준 설정 (today/tomorrow)
     if target_ymd is None:
         base_date = get_kst_now().date()
         if day_key == "tomorrow":
@@ -2391,24 +2378,13 @@ async def crawl_maz_analysis_common(
     target_date = datetime.strptime(target_ymd, "%Y-%m-%d").date()
 
     await update.message.reply_text(
-        f"mazgtv {sport_label} 분석에서 {target_ymd} 경기 분석글을 가져옵니다. 잠시만 기다려 주세요..."
+        f"mazgtv {sport_label} 분석 페이지에서 {target_ymd} 경기 분석글을 가져옵니다. 잠시만 기다려 주세요..."
     )
 
-    # ✅ today/tomorrow 시트 중복 방지
-    existing_ids = get_existing_analysis_ids(day_key)
-
-    # ✅ site_export 중복 방지(옵션)
-    day_str = "today" if day_key == "today" else "tomorrow"
-    existing_site = set()
-    site_rows_to_append: list[list[str]] = []
-    if export_site:
-        # 네가 이전에 추가할 함수들이 있을 때만 동작
-        try:
-            existing_site = get_existing_site_src_ids(day_str)
-        except Exception:
-            existing_site = set()
-
     rows_to_append: list[list[str]] = []
+
+    # ✅ 중복 방지: 이미 today/tomorrow 시트에 있는 src_id 모으기
+    existing_ids = get_existing_analysis_ids(day_key)
 
     try:
         async with httpx.AsyncClient(
@@ -2445,7 +2421,7 @@ async def crawl_maz_analysis_common(
                     items = data
 
                 if not isinstance(items, list) or not items:
-                    print(f"[MAZ][LIST] page={page} 항목 없음 → 종료")
+                    print(f"[MAZ][LIST] page={page} 항목 없음 → 반복 종료")
                     break
 
                 for item in items:
@@ -2458,30 +2434,28 @@ async def crawl_maz_analysis_common(
 
                     row_id = f"maz_{board_id}"
 
-                    # ✅ today/tomorrow 시트 중복이면 스킵
+                    # ✅ 중복 스킵
                     if row_id in existing_ids:
                         print(f"[MAZ][SKIP_DUP] already exists in sheet: {row_id}")
                         continue
 
-                    # ✅ site_export 중복이면 스킵(옵션)
-                    if export_site and row_id in existing_site:
-                        print(f"[MAZ][SKIP_DUP_SITE] already exists in site_export: {row_id}")
-                        continue
-
-                    # 날짜 후보
-                    game_start_at = (item.get("gameStartAt") or item.get("game_start_at") or "")
+                    game_start_at = (
+                        item.get("gameStartAt")
+                        or item.get("game_start_at")
+                        or ""
+                    )
                     game_start_at = str(game_start_at).strip()
-                    game_start_at_text = str(item.get("gameStartAtText") or "").strip()
 
+                    game_start_at_text = str(item.get("gameStartAtText") or "").strip()
                     print(
                         f"[MAZ][DEBUG] page={page} id={board_id} "
                         f"gameStartAt='{game_start_at}' gameStartAtText='{game_start_at_text}'"
                     )
 
-                    # 1) gameStartAt에서 날짜 파싱
+                    # 1) gameStartAt로 날짜 파싱
                     item_date = _parse_game_start_date(game_start_at)
 
-                    # 2) 실패하면 item 전체에서 날짜 탐색(연도 보정)
+                    # 2) 실패하면 item 전체에서 날짜 패턴 탐색 (연도 보정용)
                     if not item_date:
                         item_date = detect_game_date_from_item(item, target_year=target_date.year)
 
@@ -2490,14 +2464,15 @@ async def crawl_maz_analysis_common(
                     if not item_date:
                         continue
 
-                    # ✅ 날짜 필터 (핵심)
+                    # ✅ 날짜 필터링
+                    # - 축구/농구/배구: target_date와 정확히 일치만
+                    # - 야구: (혹시 주간 카드로 들어오는 경우) 일치가 아니면 같은 주(0~6일)까지 허용
                     if sport_label == "야구":
-                        # 야구는 주간카드(월요일 기준)인 경우가 있어서 "같은 주"만 허용
-                        delta_days = (target_date - item_date).days
-                        if delta_days < 0 or delta_days >= 7:
-                            continue
+                        if item_date != target_date:
+                            delta_days = (target_date - item_date).days
+                            if delta_days < 0 or delta_days >= 7:
+                                continue
                     else:
-                        # 축구/농구/배구는 정확히 target_date만
                         if item_date != target_date:
                             continue
 
@@ -2505,7 +2480,6 @@ async def crawl_maz_analysis_common(
                     home = item.get("homeTeamName") or ""
                     away = item.get("awayTeamName") or ""
 
-                    # 상세 JSON
                     detail_url = MAZ_DETAIL_API_TEMPLATE.format(board_id=board_id)
                     try:
                         r2 = await client.get(detail_url, timeout=10.0)
@@ -2533,7 +2507,6 @@ async def crawl_maz_analysis_common(
                         print(f"[MAZ][DETAIL] id={board_id} 본문 텍스트 없음")
                         continue
 
-                    # 텔레그램용 요약
                     new_title, new_body = summarize_analysis_with_gemini(
                         full_text,
                         league=league,
@@ -2542,13 +2515,13 @@ async def crawl_maz_analysis_common(
                         max_chars=900,
                     )
 
-                    # sport 세부분류
+                    # ✅ sport 세부 분류
                     row_sport = sport_label
 
                     if sport_label == "축구":
-                        if "K리그" in (league or ""):
+                        if "K리그" in league:
                             row_sport = "K리그"
-                        elif "J리그" in (league or ""):
+                        elif "J리그" in league:
                             row_sport = "J리그"
                         else:
                             row_sport = "해외축구"
@@ -2565,38 +2538,12 @@ async def crawl_maz_analysis_common(
                             row_sport = "해외야구"
 
                     elif sport_label in ("농구", "농구/배구"):
-                        # 네가 이미 만든 분류 함수 사용
                         row_sport = classify_basketball_volleyball_sport(league or "")
 
                     rows_to_append.append([row_sport, row_id, new_title, new_body])
-                    existing_ids.add(row_id)
-
-                    # ✅ site_export 저장용(옵션) - 네가 관련 함수/재작성 로직을 붙였을 때만 활성화
-                    if export_site:
-                        try:
-                            # rewrite_for_site_openai가 없으면 그냥 스킵
-                            site_title, site_body = rewrite_for_site_openai(
-                                full_text,
-                                league=league,
-                                home_team=home,
-                                away_team=away,
-                                max_chars=4500,
-                            )
-                            created_at = get_kst_now().strftime("%Y-%m-%d %H:%M:%S")
-
-                            site_rows_to_append.append([
-                                day_str,        # day
-                                row_sport,      # sport
-                                row_id,         # src_id
-                                site_title,     # title
-                                site_body,      # body
-                                created_at,     # creatadAt(오타 헤더지만 값은 저장됨)
-                            ])
-                            existing_site.add(row_id)
-                        except Exception as e:
-                            print(f"[SITE_EXPORT] 생성 실패 id={row_id}: {e}")
 
     except Exception as e:
+        # ✅ 여기 except는 try와 같은 들여쓰기 레벨이어야 함
         await update.message.reply_text(f"요청 오류가 발생했습니다: {e}")
         return
 
@@ -2606,27 +2553,18 @@ async def crawl_maz_analysis_common(
         )
         return
 
-    # ✅ today/tomorrow 시트 저장
     ok = append_analysis_rows(day_key, rows_to_append)
     if not ok:
         await update.message.reply_text("구글시트에 분석 데이터를 저장하지 못했습니다.")
         return
 
-    # ✅ site_export 시트 저장(옵션)
-    if export_site and site_rows_to_append:
-        try:
-            append_site_export_rows(site_rows_to_append)
-        except Exception as e:
-            print(f"[SITE_EXPORT] 시트 저장 실패: {e}")
-
     reload_analysis_from_sheet()
 
     await update.message.reply_text(
         f"mazgtv {sport_label} 분석에서 {target_ymd} 경기 분석 {len(rows_to_append)}건을 "
-        f"'{day_key}' 시트에 저장했습니다."
-        + (f"\nsite_export에도 {len(site_rows_to_append)}건 저장했습니다." if export_site else "")
+        f"'{day_key}' 시트에 저장했습니다.\n"
+        "텔레그램에서 경기 분석픽 메뉴를 열어 확인해보세요."
     )
-
 
 # ───────────────── 종목별 (Daum 뉴스) 크롤링 명령어 ─────────────────
 
@@ -3163,6 +3101,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
