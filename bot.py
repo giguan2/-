@@ -2889,6 +2889,7 @@ async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAUL
         max_pages=5,
         board_type=2,
         category=3,
+        export_site=True,
     )
 
     # KBO + NPB
@@ -2902,6 +2903,7 @@ async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAUL
         max_pages=5,
         board_type=2,
         category=4,
+        export_site=True,
     )
 
     await update.message.reply_text(
@@ -2929,6 +2931,7 @@ async def bvcrawl_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         board_type=2,                # ⚠️ 실제 boardType 값으로 수정 필요
         category=5,                  # ⚠️ 실제 category 값으로 수정 필요
         # target_ymd=None → 자동으로 '내일' 날짜 사용
+        export_site=True,
     )
 
     # 2) 국내 농구 + 배구 (KBL / WKBL / V리그 등)
@@ -2942,6 +2945,7 @@ async def bvcrawl_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         max_pages=5,
         board_type=2,                # ⚠️ 실제 boardType 값으로 수정 필요
         category=7,                  # ⚠️ 실제 category 값으로 수정 필요
+        export_site=True,
     )
 
     await update.message.reply_text(
@@ -3002,6 +3006,7 @@ async def crawlmazbaseball_today(update: Update, context: ContextTypes.DEFAULT_T
         max_pages=5,
         board_type=2,               # 기존 /crawlmazbaseball_tomorrow 와 동일
         category=3,                 # MLB 쪽 category 값 (지금 쓰는 값 그대로)
+        export_site=True,
     )
 
     # 2) KBO + NPB
@@ -3015,6 +3020,7 @@ async def crawlmazbaseball_today(update: Update, context: ContextTypes.DEFAULT_T
         max_pages=5,
         board_type=2,               # 동일 boardType
         category=4,                 # KBO/NPB 쪽 category 값 (지금 쓰는 값 그대로)
+        export_site=True,
     )
 
     await update.message.reply_text(
@@ -3042,6 +3048,7 @@ async def bvcrawl_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
         max_pages=5,
         board_type=2,                # 👉 tomorrow와 동일 값 유지
         category=5,
+        export_site=True,
     )
 
     # 2) 국내 농구 + 배구 (KBL / WKBL / V리그 등)
@@ -3055,6 +3062,7 @@ async def bvcrawl_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
         max_pages=5,
         board_type=2,                # 👉 tomorrow와 동일 값 유지
         category=7,
+        export_site=True,
     )
 
     await update.message.reply_text(
