@@ -1767,93 +1767,117 @@ def summarize_analysis_with_gemini(
 def rewrite_for_site_openai(
     full_text: str,
     *,
-    league: str,
-    home_team: str,
-    away_team: str,
-    max_chars: int = 4500,
+    league: str = "",
+    home_team: str = "",
+    away_team: str = "",
+    max_chars: int = 3500,
 ) -> tuple[str, str]:
     """
-    사이트 게시용: 원문(full_text) 기반 서술형 재작성.
-    - 허구/추측 금지
-    - 원문과 어긋나는 정보 추가 금지
-    - '스포츠분석', '고트티비' 키워드 자연스럽게 1~2회 삽입
+    사이트 게시용: '원문 기반 재작성' 전용.
+    - 원문을 그대로 복붙하지 않고, 구조화된 서술형(팀 분석/경기 흐름/핵심 포인트/최종 픽)으로 재작성
+    - 원문에 있는 정보/방향성에서 크게 벗어나지 않도록 제한
+    - '스포츠분석', '고트티비' 키워드를 자연스럽게 1~2회 포함
     """
-    text = (full_text or "").strip()
-    if not text or len(text) < 200:
-        raise ValueError("원문이 너무 짧음(사이트용 생성 스킵)")
-
     client_oa = get_openai_client()
+
+    full_text_clean = clean_maz_text(full_text or "").strip()
+    if not full_text_clean:
+        return ("[분석글 없음]", "")
+
+    if len(full_text_clean) > 9000:
+        full_text_clean = full_text_clean[:9000]
+
+    _league = (league or "").strip() or "경기"
+    if home_team and away_team:
+        base_title = f"[{_league}] {home_team} vs {away_team} 스포츠분석"
+    else:
+        base_title = f"[{_league}] 스포츠분석"
+
     if not client_oa:
-        raise ValueError("OPENAI_API_KEY 없음(사이트용 생성 스킵)")
-
-    base_title = f"[{league}] {home_team} vs {away_team} 경기 분석".strip()
-
-    # 너무 길면 컷
-    if len(text) > 9000:
-        text = text[:9000]
+        body_fb = simple_summarize(full_text_clean, max_chars=max_chars)
+        return (base_title, body_fb)
 
     prompt = f"""
-다음은 스포츠 경기 분석 원문이다.
-원문을 기반으로만 한국어로 자연스럽게 재작성하라.
-절대로 원문에 없는 내용을 추가/추측/단정하지 마라.
+아래는 스포츠 경기 분석 원문이다.
+원문 내용을 바탕으로 **사이트 게시용 서술형 분석글**로 재작성하라.
 
-요구사항:
-- 제목 1개 + 본문(서술형)만 작성
-- 본문은 6~14문단 내에서 자연스럽게 구성(줄바꿈 유지)
-- 팀 전력/핵심 포인트/경기 흐름 전망 중심으로 정리
-- '스포츠분석' 키워드를 본문에 1~2회 자연스럽게 포함
-- '고트티비' 키워드를 본문에 1회 자연스럽게 포함
-- 베팅 픽/배당/확률/승부 단정은 쓰지 말고, 가능성/흐름 중심으로만
-- 원문 문장을 그대로 복사하지 말 것(재작성)
+필수 요구사항:
+- 원문 문장을 그대로 복사하지 말고, 반드시 재작성
+- 원문 내용과 어긋나는 '사실'을 만들지 말 것 (선수/전술/부상/기록 등 임의 생성 금지)
+- 문장 흐름은 자연스럽게, 단락을 명확히 분리
+- 아래 섹션 구성은 유지하되, 원문에 없는 섹션 정보는 과장하지 말 것
+- '스포츠분석' 과 '고트티비' 키워드를 본문에 **각 1~2회** 자연스럽게 포함 (과도한 반복 금지)
+- 결과는 **오직 본문만** 출력 (추가 안내/주석 금지)
 
-출력 형식(반드시):
-제목: ...
-본문:
-... (여기부터 본문)
+출력 구조(섹션 제목은 그대로 사용):
+[팀1 분석]
+(3~6문장)
 
-리그: {league}
-홈팀: {home_team}
-원정팀: {away_team}
+───────────────
+
+[팀2 분석]
+(3~6문장)
+
+───────────────
+
+[경기 흐름 전망]
+(4~8문장)
+
+───────────────
+
+[핵심 포인트 요약]
+- 항목 1
+- 항목 2
+- 항목 3
+
+───────────────
+
+[최종 픽]
+- 승패: (원문에 방향성이 있으면 그 방향 유지, 없으면 '보류')
+- 핸디: (원문에 방향성이 있으면 그 방향 유지, 없으면 '보류')
+- 언오버: (원문에 방향성이 있으면 그 방향 유지, 없으면 '보류')
+
+경기 정보:
+- 리그: {_league}
+- 팀1: {home_team or "팀1"}
+- 팀2: {away_team or "팀2"}
 
 ===== 원문 =====
-{text}
+{full_text_clean}
 """.strip()
 
-    resp = client_oa.chat.completions.create(
-        model=os.getenv("OPENAI_MODEL_SITE", "gpt-4.1-mini"),
-        messages=[
-            {"role": "system", "content": "너는 스포츠 경기 분석 원문을 기반으로 재작성하는 한국어 에디터다. 허구를 절대 추가하지 않는다."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.35,
-        max_completion_tokens=1200,
-    )
+    try:
+        resp = client_oa.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL_SITE", os.getenv("OPENAI_MODEL_ANALYSIS", "gpt-4.1-mini")),
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "너는 스포츠 분석 글을 사이트 게시용으로 재작성하는 한국어 लेखक이다. "
+                        "원문 사실에서 벗어나지 않고, 문장을 간결하고 직설적으로 쓴다."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.4,
+            max_completion_tokens=1200,
+        )
 
-    out = (resp.choices[0].message.content or "").strip()
-    if not out:
-        raise ValueError("site rewrite empty")
+        body = (resp.choices[0].message.content or "").strip()
+        if not body:
+            raise ValueError("empty response from OpenAI (site)")
 
-    # 파싱
-    title = base_title
-    body = out
+        body = re.sub(r"^제목\s*[:：].*\n+", "", body).strip()
 
-    m1 = re.search(r"제목\s*[:：]\s*(.+)", out)
-    m2 = re.search(r"본문\s*[:：]\s*(.+)", out, flags=re.S)
-    if m1:
-        title = m1.group(1).strip()
-    if m2:
-        body = m2.group(1).strip()
+        if len(body) > max_chars:
+            body = body[:max_chars].rstrip()
 
-    # 길이 제한
-    if len(body) > max_chars:
-        body = body[:max_chars].rstrip()
-
-    return title, body
+        return (base_title, body)
 
     except Exception as e:
-        print(f"[OPENAI][SITE] 실패 → simple_summarize 폴백: {e}")
-        body = simple_summarize(text, max_chars=min(max_chars, 1200))
-        return (base_title, body)
+        print(f"[OPENAI][SITE] 재작성 실패 → simple_summarize 폴백: {e}")
+        body_fb = simple_summarize(full_text_clean, max_chars=max_chars)
+        return (base_title, body_fb)
 
 # ───────────────── 뉴스용 Gemini 요약 함수 ─────────────────
 
@@ -3101,6 +3125,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
