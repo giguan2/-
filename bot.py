@@ -496,43 +496,183 @@ def _get_ws_by_name(sh, name: str):
     except Exception:
         return None
 
-async def crawlmazsoccer_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def get_site_export_ws():
     """
-    mazgtv 해외축구 + K리그/J리그 분석 중
-    '오늘 날짜' 경기를 크롤링해서 today 시트에 저장.
+    site_export 탭 워크시트 반환.
+    없으면 생성 시도(권한/환경에 따라 실패 가능).
     """
+    client_gs = get_gs_client()
+    spreadsheet_id = os.getenv("SPREADSHEET_ID")
+    if not (client_gs and spreadsheet_id):
+        return None
 
-    # 1) 해외축구 탭
-    await crawl_maz_analysis_common(
-        update,
-        context,
-        base_url="https://mazgtv1.com/analyze/overseas",
-        sport_label="축구",          # 안에서 '해외축구/K리그/J리그'로 다시 분류됨
-        league_default="해외축구",
-        day_key="today",            # ✅ today
-        max_pages=5,
-        board_type=2,
-        category=1,                 # 해외축구
-        export_site=True,   # ✅ export_today 저장
-    )
+    sheet_name = os.getenv("SHEET_SITE_EXPORT_NAME", "site_export")
 
-    # 2) K리그 / J리그 탭
-    await crawl_maz_analysis_common(
-        update,
-        context,
-        base_url="https://mazgtv1.com/analyze/asia",
-        sport_label="축구",
-        league_default="K리그/J리그",
-        day_key="today",            # ✅ today
-        max_pages=5,
-        board_type=2,
-        category=2,                 # K리그/J리그
-        export_site=True,   # ✅ export_today 저장
-    )
+    try:
+        sh = client_gs.open_by_key(spreadsheet_id)
+        ws = _get_ws_by_name(sh, sheet_name)
+        if ws:
+            return ws
 
-    await update.message.reply_text(
-        "⚽ 해외축구 + K리그/J리그 오늘 경기 분석 크롤링을 모두 실행했습니다."
-    )
+        # 없으면 생성 시도
+        ws = sh.add_worksheet(title=sheet_name, rows=2000, cols=10)
+        # 헤더 세팅
+        ws.update("A1", [SITE_EXPORT_HEADER])
+        return ws
+
+    except Exception as e:
+        print(f"[GSHEET][SITE_EXPORT] 워크시트 준비 실패: {e}")
+        return None
+
+
+# ───────────────── site_export 저장 ─────────────────
+
+SITE_EXPORT_SHEET_NAME = os.getenv("SHEET_SITE_EXPORT_NAME", "site_export")
+SITE_EXPORT_HEADER = ["day", "sport", "src_id", "title", "body", "createdAt"]
+# export 탭 분리: export_today / export_tomorrow
+EXPORT_TODAY_SHEET_NAME = os.getenv("SHEET_EXPORT_TODAY_NAME", "export_today")
+EXPORT_TOMORROW_SHEET_NAME = os.getenv("SHEET_EXPORT_TOMORROW_NAME", "export_tomorrow")
+
+EXPORT_HEADER = SITE_EXPORT_HEADER  # 동일 헤더 사용
+  # createdAt(과거 creatadAt 오타 시트도 호환)
+
+def _ensure_header(ws, header: list[str]) -> None:
+    """시트가 비어있거나 헤더가 없으면 헤더를 1행에 깔아준다."""
+    try:
+        values = ws.get_all_values()
+        if not values:
+            ws.update("A1", [header])
+            return
+        first = values[0]
+        if [c.strip() for c in first] != header:
+            # 헤더가 다르면 강제로 교체하진 않고, 없는 경우만 깔기
+            # (원하면 여기서 강제 교체로 바꿀 수 있음)
+            pass
+    except Exception as e:
+        print(f"[GSHEET][SITE_EXPORT] 헤더 확인 실패: {e}")
+
+def append_site_export_rows(rows: list[list[str]]) -> bool:
+    """
+    site_export 탭에 rows를 append.
+    rows: [ [day, sport, src_id, title, body, createdAt], ... ]
+    """
+    client_gs = get_gs_client()
+    spreadsheet_id = os.getenv("SPREADSHEET_ID")
+    if not (client_gs and spreadsheet_id):
+        print("[GSHEET][SITE_EXPORT] 설정 없음 → 저장 불가")
+        return False
+
+    try:
+        sh = client_gs.open_by_key(spreadsheet_id)
+        ws = sh.worksheet(SITE_EXPORT_SHEET_NAME)
+        _ensure_header(ws, SITE_EXPORT_HEADER)
+    except Exception as e:
+        print(f"[GSHEET][SITE_EXPORT] 시트 '{SITE_EXPORT_SHEET_NAME}' 열기 실패: {e}")
+        return False
+
+    try:
+        ws.append_rows(rows, value_input_option="RAW")
+        print(f"[GSHEET][SITE_EXPORT] {SITE_EXPORT_SHEET_NAME} 에 {len(rows)}건 추가")
+        return True
+    except Exception as e:
+        print(f"[GSHEET][SITE_EXPORT] append_rows 오류: {e}")
+        return False
+
+
+def get_export_ws(sheet_name: str):
+    """export_today / export_tomorrow 워크시트 반환(없으면 생성 + 헤더 세팅)."""
+    client_gs = get_gs_client()
+    spreadsheet_id = os.getenv("SPREADSHEET_ID")
+    if not (client_gs and spreadsheet_id):
+        return None
+
+    try:
+        sh = client_gs.open_by_key(spreadsheet_id)
+        ws = _get_ws_by_name(sh, sheet_name)
+        if not ws:
+            ws = sh.add_worksheet(title=sheet_name, rows=2000, cols=10)
+        _ensure_header(ws, EXPORT_HEADER)
+        return ws
+    except Exception as e:
+        print(f"[GSHEET][EXPORT] 워크시트 준비 실패({sheet_name}): {e}")
+        return None
+
+
+def get_existing_export_src_ids(sheet_name: str) -> set[str]:
+    """지정 export 시트에서 src_id 목록을 읽어 중복 저장 방지용 set으로 반환."""
+    ws = get_export_ws(sheet_name)
+    if not ws:
+        return set()
+
+    try:
+        values = ws.get_all_values()
+        if not values:
+            return set()
+        header = [c.strip() for c in values[0]]
+        if "src_id" not in header:
+            return set()
+        idx = header.index("src_id")
+        out = set()
+        for row in values[1:]:
+            if len(row) > idx:
+                v = (row[idx] or "").strip()
+                if v:
+                    out.add(v)
+        return out
+    except Exception as e:
+        print(f"[GSHEET][EXPORT] 기존 src_id 로딩 실패({sheet_name}): {e}")
+        return set()
+
+
+def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
+    """지정 export 시트에 rows를 append."""
+    if not rows:
+        return True
+
+    ws = get_export_ws(sheet_name)
+    if not ws:
+        return False
+
+    try:
+        ws.append_rows(rows, value_input_option="RAW")
+        return True
+    except Exception as e:
+        print(f"[GSHEET][EXPORT] append 실패({sheet_name}): {e}")
+        return False
+
+
+
+
+def get_existing_site_src_ids(day_str: str) -> set[str]:
+    """site_export 탭에서 day가 같은 행들의 src_id를 set으로 가져와 중복 저장 방지."""
+    client_gs = get_gs_client()
+    spreadsheet_id = os.getenv("SPREADSHEET_ID")
+    if not (client_gs and spreadsheet_id):
+        return set()
+
+    try:
+        sh = client_gs.open_by_key(spreadsheet_id)
+        ws = sh.worksheet(SITE_EXPORT_SHEET_NAME)
+        values = ws.get_all_values()
+        if not values or len(values) < 2:
+            return set()
+
+        header = values[0]
+        idx_day = header.index("day") if "day" in header else 0
+        idx_src = header.index("src_id") if "src_id" in header else 2
+
+        out = set()
+        for r in values[1:]:
+            if len(r) <= max(idx_day, idx_src):
+                continue
+            if (r[idx_day] or "").strip() == day_str:
+                sid = (r[idx_src] or "").strip()
+                if sid:
+                    out.add(sid)
+        return out
+    except Exception as e:
+        print(f"[GSHEET][SITE_EXPORT] 기존 src_id 로딩 실패: {e}")
+        return set()
 
 def get_existing_analysis_ids(day_key: str) -> set[str]:
     """
@@ -2312,7 +2452,7 @@ async def crawl_maz_analysis_common(
 
     # ✅ site_export 시트 중복 방지용
     export_sheet_name = EXPORT_TODAY_SHEET_NAME if day_key == "today" else EXPORT_TOMORROW_SHEET_NAME
-    existing_site_src_ids = get_existing_export_src_ids(export_sheet_name) if export_site else set()
+    existing_export_src_ids = get_existing_export_src_ids(export_sheet_name) if export_site else set()
     site_rows_to_append: list[list[str]] = []
 
     try:
@@ -2363,15 +2503,15 @@ async def crawl_maz_analysis_common(
 
                     row_id = f"maz_{board_id}"
 
-                    # ✅ 중복 스킵
-                    skip_sheet_dup = row_id in existing_ids
-                    need_export = export_site and (row_id not in existing_site_src_ids)
-                    # ✅ today/tomorrow 시트에는 이미 있는데 export에 없으면, export만 백필(backfill) 진행
-                    if skip_sheet_dup and not need_export:
-                        print(f"[MAZ][SKIP_DUP] already exists in sheet: {row_id}")
+                    # ✅ 중복 처리
+                    needs_analysis = row_id not in existing_ids
+                    needs_export = bool(export_site) and (row_id not in existing_export_src_ids)
+                    if (not needs_analysis) and (not needs_export):
+                        print(f"[MAZ][SKIP_DUP] already exists (analysis+export): {row_id}")
                         continue
-                    if skip_sheet_dup and need_export:
-                        print(f"[MAZ][BACKFILL_EXPORT] sheet has row but export missing: {row_id}")
+                    if (not needs_analysis) and needs_export:
+                        print(f"[MAZ][BACKFILL] analysis exists but export missing: {row_id}")
+
                     game_start_at = (
                         item.get("gameStartAt")
                         or item.get("game_start_at")
@@ -2440,7 +2580,7 @@ async def crawl_maz_analysis_common(
                         print(f"[MAZ][DETAIL] id={board_id} 본문 텍스트 없음")
                         continue
 
-                    if not skip_sheet_dup:
+                    if needs_analysis:
                         new_title, new_body = summarize_analysis_with_gemini(
                             full_text,
                             league=league,
@@ -2448,6 +2588,8 @@ async def crawl_maz_analysis_common(
                             away_team=away,
                             max_chars=900,
                         )
+                    else:
+                        new_title, new_body = "", ""
 
                     # ✅ sport 세부 분류
                     row_sport = sport_label
@@ -2474,14 +2616,13 @@ async def crawl_maz_analysis_common(
                     elif sport_label in ("농구", "농구/배구"):
                         row_sport = classify_basketball_volleyball_sport(league or "")
 
-                    if not skip_sheet_dup:
+                    if needs_analysis:
                         rows_to_append.append([row_sport, row_id, new_title, new_body])
 
                     # ✅ 사이트 업로드용(site_export)도 같이 저장
-                    if export_site:
-                        if row_id in existing_site_src_ids:
-                            print(f"[SITE_EXPORT][SKIP_DUP] already exists: {row_id}")
-                        else:
+                    if export_site and needs_export:
+                        # export 시트에만 백필/저장
+                        
                             try:
                                 site_title, site_body = rewrite_for_site_openai(
                                     full_text,
@@ -2493,47 +2634,52 @@ async def crawl_maz_analysis_common(
                                 print(f"[SITE_EXPORT][ERR] id={board_id}: {e}")
                             else:
                                 site_rows_to_append.append([
-                                    target_ymd,
+                                    day_key,
                                     row_sport,
                                     row_id,
                                     site_title,
                                     site_body,
                                     get_kst_now().strftime("%Y-%m-%d %H:%M:%S"),
                                 ])
-                                existing_site_src_ids.add(row_id)
+                                existing_export_src_ids.add(row_id)
 
     except Exception as e:
         # ✅ 여기 except는 try와 같은 들여쓰기 레벨이어야 함
         await update.message.reply_text(f"요청 오류가 발생했습니다: {e}")
         return
 
-    if not rows_to_append:
+    if (not rows_to_append) and (not site_rows_to_append):
         await update.message.reply_text(
             f"mazgtv {sport_label} 분석에서 {target_ymd} 경기 분석글을 찾지 못했습니다."
         )
         return
 
-    ok = append_analysis_rows(day_key, rows_to_append)
-    if not ok:
-        await update.message.reply_text("구글시트에 분석 데이터를 저장하지 못했습니다.")
-        return
+    if rows_to_append:
+        ok = append_analysis_rows(day_key, rows_to_append)
+        if not ok:
+            await update.message.reply_text("구글시트에 분석 데이터를 저장하지 못했습니다.")
+            return
+    else:
+        ok = True
 
     # ✅ site_export 시트 저장
     if export_site and site_rows_to_append:
-        ok2 = append_export_rows(site_rows_to_append, export_sheet_name)
+        ok2 = append_export_rows(export_sheet_name, site_rows_to_append)
         if not ok2:
-            await update.message.reply_text(f"{export_sheet_name} 시트 저장 중 오류가 발생했습니다.")
+            await update.message.reply_text("site_export 시트 저장 중 오류가 발생했습니다.")
             return
 
     reload_analysis_from_sheet()
 
     extra = ""
     if export_site:
-        extra = f"\\nsite_export 시트에도 {len(site_rows_to_append)}건을 저장했습니다."
+        extra = f"\\nexport 시트에도 {len(site_rows_to_append)}건을 저장했습니다."
 
+    saved_analysis_cnt = len(rows_to_append)
+    saved_export_cnt = len(site_rows_to_append) if export_site else 0
     await update.message.reply_text(
-        f"mazgtv {sport_label} 분석에서 {target_ymd} 경기 분석 {len(rows_to_append)}건을 "
-        f"'{day_key}' 시트에 저장했습니다." + extra + "\\n"
+        f"mazgtv {sport_label} 분석에서 {target_ymd} 저장 완료: "
+        f"분석시트 {saved_analysis_cnt}건, export {saved_export_cnt}건." + extra + "\n"
         "텔레그램에서 경기 분석픽 메뉴를 열어 확인해보세요."
     )
 
@@ -3016,6 +3162,61 @@ async def bvcrawl_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ───────────────── 실행부 ─────────────────
+
+async def export_rollover(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """export_tomorrow → export_today 롤오버. 중복(src_id) 제외. 이후 export_tomorrow는 헤더만 남김."""
+    if not is_admin(update):
+        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+
+    today_ws = get_export_ws(EXPORT_TODAY_SHEET_NAME)
+    tomo_ws = get_export_ws(EXPORT_TOMORROW_SHEET_NAME)
+    if not today_ws or not tomo_ws:
+        await update.message.reply_text("export 시트 준비에 실패했습니다. 구글시트 설정을 확인하세요.")
+        return
+
+    try:
+        today_vals = today_ws.get_all_values()
+        tomo_vals = tomo_ws.get_all_values()
+        if not tomo_vals or len(tomo_vals) <= 1:
+            await update.message.reply_text("export_tomorrow에 옮길 데이터가 없습니다.")
+            return
+
+        header = [c.strip() for c in (today_vals[0] if today_vals else EXPORT_HEADER)]
+        src_idx = header.index("src_id") if "src_id" in header else 2
+
+        today_ids = set()
+        for r in today_vals[1:]:
+            if len(r) > src_idx and r[src_idx].strip():
+                today_ids.add(r[src_idx].strip())
+
+        to_move = []
+        skipped = 0
+        for r in tomo_vals[1:]:
+            sid = r[src_idx].strip() if len(r) > src_idx else ""
+            if not sid:
+                continue
+            if sid in today_ids:
+                skipped += 1
+                continue
+            to_move.append(r)
+            today_ids.add(sid)
+
+        if to_move:
+            today_ws.append_rows(to_move, value_input_option="RAW")
+
+        # export_tomorrow 초기화(헤더만)
+        tomo_ws.clear()
+        tomo_ws.update("A1", [EXPORT_HEADER])
+
+        await update.message.reply_text(
+            f"롤오버 완료: export_today로 {len(to_move)}건 이동, 중복 {skipped}건 스킵. export_tomorrow 초기화 완료."
+        )
+
+    except Exception as e:
+        await update.message.reply_text(f"롤오버 중 오류: {e}")
+        return
+
 
 def main():
     reload_analysis_from_sheet()
