@@ -496,112 +496,43 @@ def _get_ws_by_name(sh, name: str):
     except Exception:
         return None
 
-def get_site_export_ws():
+async def crawlmazsoccer_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    site_export 탭 워크시트 반환.
-    없으면 생성 시도(권한/환경에 따라 실패 가능).
+    mazgtv 해외축구 + K리그/J리그 분석 중
+    '오늘 날짜' 경기를 크롤링해서 today 시트에 저장.
     """
-    client_gs = get_gs_client()
-    spreadsheet_id = os.getenv("SPREADSHEET_ID")
-    if not (client_gs and spreadsheet_id):
-        return None
 
-    sheet_name = os.getenv("SHEET_SITE_EXPORT_NAME", "site_export")
+    # 1) 해외축구 탭
+    await crawl_maz_analysis_common(
+        update,
+        context,
+        base_url="https://mazgtv1.com/analyze/overseas",
+        sport_label="축구",          # 안에서 '해외축구/K리그/J리그'로 다시 분류됨
+        league_default="해외축구",
+        day_key="today",            # ✅ today
+        max_pages=5,
+        board_type=2,
+        category=1,                 # 해외축구
+        export_site=True,   # ✅ export_today 저장
+    )
 
-    try:
-        sh = client_gs.open_by_key(spreadsheet_id)
-        ws = _get_ws_by_name(sh, sheet_name)
-        if ws:
-            return ws
+    # 2) K리그 / J리그 탭
+    await crawl_maz_analysis_common(
+        update,
+        context,
+        base_url="https://mazgtv1.com/analyze/asia",
+        sport_label="축구",
+        league_default="K리그/J리그",
+        day_key="today",            # ✅ today
+        max_pages=5,
+        board_type=2,
+        category=2,                 # K리그/J리그
+        export_site=True,   # ✅ export_today 저장
+    )
 
-        # 없으면 생성 시도
-        ws = sh.add_worksheet(title=sheet_name, rows=2000, cols=10)
-        # 헤더 세팅
-        ws.update("A1", [SITE_EXPORT_HEADER])
-        return ws
-
-    except Exception as e:
-        print(f"[GSHEET][SITE_EXPORT] 워크시트 준비 실패: {e}")
-        return None
-
-
-# ───────────────── site_export 저장 ─────────────────
-
-SITE_EXPORT_SHEET_NAME = os.getenv("SHEET_SITE_EXPORT_NAME", "site_export")
-SITE_EXPORT_HEADER = ["day", "sport", "src_id", "title", "body", "createdAt"]  # createdAt(과거 creatadAt 오타 시트도 호환)
-
-def _ensure_header(ws, header: list[str]) -> None:
-    """시트가 비어있거나 헤더가 없으면 헤더를 1행에 깔아준다."""
-    try:
-        values = ws.get_all_values()
-        if not values:
-            ws.update("A1", [header])
-            return
-        first = values[0]
-        if [c.strip() for c in first] != header:
-            # 헤더가 다르면 강제로 교체하진 않고, 없는 경우만 깔기
-            # (원하면 여기서 강제 교체로 바꿀 수 있음)
-            pass
-    except Exception as e:
-        print(f"[GSHEET][SITE_EXPORT] 헤더 확인 실패: {e}")
-
-def append_site_export_rows(rows: list[list[str]]) -> bool:
-    """
-    site_export 탭에 rows를 append.
-    rows: [ [day, sport, src_id, title, body, createdAt], ... ]
-    """
-    client_gs = get_gs_client()
-    spreadsheet_id = os.getenv("SPREADSHEET_ID")
-    if not (client_gs and spreadsheet_id):
-        print("[GSHEET][SITE_EXPORT] 설정 없음 → 저장 불가")
-        return False
-
-    try:
-        sh = client_gs.open_by_key(spreadsheet_id)
-        ws = sh.worksheet(SITE_EXPORT_SHEET_NAME)
-        _ensure_header(ws, SITE_EXPORT_HEADER)
-    except Exception as e:
-        print(f"[GSHEET][SITE_EXPORT] 시트 '{SITE_EXPORT_SHEET_NAME}' 열기 실패: {e}")
-        return False
-
-    try:
-        ws.append_rows(rows, value_input_option="RAW")
-        print(f"[GSHEET][SITE_EXPORT] {SITE_EXPORT_SHEET_NAME} 에 {len(rows)}건 추가")
-        return True
-    except Exception as e:
-        print(f"[GSHEET][SITE_EXPORT] append_rows 오류: {e}")
-        return False
-
-def get_existing_site_src_ids(day_str: str) -> set[str]:
-    """site_export 탭에서 day가 같은 행들의 src_id를 set으로 가져와 중복 저장 방지."""
-    client_gs = get_gs_client()
-    spreadsheet_id = os.getenv("SPREADSHEET_ID")
-    if not (client_gs and spreadsheet_id):
-        return set()
-
-    try:
-        sh = client_gs.open_by_key(spreadsheet_id)
-        ws = sh.worksheet(SITE_EXPORT_SHEET_NAME)
-        values = ws.get_all_values()
-        if not values or len(values) < 2:
-            return set()
-
-        header = values[0]
-        idx_day = header.index("day") if "day" in header else 0
-        idx_src = header.index("src_id") if "src_id" in header else 2
-
-        out = set()
-        for r in values[1:]:
-            if len(r) <= max(idx_day, idx_src):
-                continue
-            if (r[idx_day] or "").strip() == day_str:
-                sid = (r[idx_src] or "").strip()
-                if sid:
-                    out.add(sid)
-        return out
-    except Exception as e:
-        print(f"[GSHEET][SITE_EXPORT] 기존 src_id 로딩 실패: {e}")
-        return set()
+    await update.message.reply_text(
+        "⚽ 해외축구 + K리그/J리그 오늘 경기 분석 크롤링을 모두 실행했습니다."
+    )
 
 def get_existing_analysis_ids(day_key: str) -> set[str]:
     """
@@ -1758,8 +1689,10 @@ def rewrite_for_site_openai(
         body_fb = simple_summarize(full_text_clean, max_chars=max_chars)
         return (base_title, body_fb)
 
-    prompt = f"""
-아래는 스포츠 경기 분석 원문이다.
+    
+    home_label = (home_team or '').strip() or '홈팀'
+    away_label = (away_team or '').strip() or '원정팀'
+    prompt = f"""아래는 스포츠 경기 분석 원문이다.
 원문 내용을 바탕으로 **사이트 게시용 서술형 분석글**로 재작성하라.
 
 필수 요구사항:
@@ -1768,15 +1701,16 @@ def rewrite_for_site_openai(
 - 문장 흐름은 자연스럽게, 단락을 명확히 분리
 - 아래 섹션 구성은 유지하되, 원문에 없는 섹션 정보는 과장하지 말 것
 - '스포츠분석' 과 '고트티비' 키워드를 본문에 **각 1~2회** 자연스럽게 포함 (과도한 반복 금지)
+- 섹션 제목에 '팀1/팀2'라는 표현을 절대 쓰지 말고, **반드시 팀명**을 넣어라
 - 결과는 **오직 본문만** 출력 (추가 안내/주석 금지)
 
 출력 구조(섹션 제목은 그대로 사용):
-[팀1 분석]
+[{home_label} 분석]
 (3~6문장)
 
 ───────────────
 
-[팀2 분석]
+[{away_label} 분석]
 (3~6문장)
 
 ───────────────
@@ -1800,12 +1734,11 @@ def rewrite_for_site_openai(
 
 경기 정보:
 - 리그: {_league}
-- 팀1: {home_team or "팀1"}
-- 팀2: {away_team or "팀2"}
+- 홈팀: {home_label}
+- 원정팀: {away_label}
 
 ===== 원문 =====
-{full_text_clean}
-""".strip()
+{full_text_clean}""".strip()
 
     try:
         resp = client_oa.chat.completions.create(
@@ -1828,6 +1761,10 @@ def rewrite_for_site_openai(
         if not body:
             raise ValueError("empty response from OpenAI (site)")
 
+
+        # 팀명 헤더 강제 치환(모델이 [팀1 분석]/[팀2 분석]로 출력하는 경우 대비)
+        body = re.sub(r"\[\s*팀1\s*분석\s*\]", f"[{home_label} 분석]", body)
+        body = re.sub(r"\[\s*팀2\s*분석\s*\]", f"[{away_label} 분석]", body)
         # 혹시 모델이 제목을 섞어 출력하면 제거
         body = re.sub(r"^제목\s*[:：].*\n+", "", body).strip()
 
@@ -2374,7 +2311,8 @@ async def crawl_maz_analysis_common(
     existing_ids = get_existing_analysis_ids(day_key)
 
     # ✅ site_export 시트 중복 방지용
-    existing_site_src_ids = get_existing_site_src_ids(target_ymd) if export_site else set()
+    export_sheet_name = EXPORT_TODAY_SHEET_NAME if day_key == "today" else EXPORT_TOMORROW_SHEET_NAME
+    existing_site_src_ids = get_existing_export_src_ids(export_sheet_name) if export_site else set()
     site_rows_to_append: list[list[str]] = []
 
     try:
@@ -2426,10 +2364,14 @@ async def crawl_maz_analysis_common(
                     row_id = f"maz_{board_id}"
 
                     # ✅ 중복 스킵
-                    if row_id in existing_ids:
+                    skip_sheet_dup = row_id in existing_ids
+                    need_export = export_site and (row_id not in existing_site_src_ids)
+                    # ✅ today/tomorrow 시트에는 이미 있는데 export에 없으면, export만 백필(backfill) 진행
+                    if skip_sheet_dup and not need_export:
                         print(f"[MAZ][SKIP_DUP] already exists in sheet: {row_id}")
                         continue
-
+                    if skip_sheet_dup and need_export:
+                        print(f"[MAZ][BACKFILL_EXPORT] sheet has row but export missing: {row_id}")
                     game_start_at = (
                         item.get("gameStartAt")
                         or item.get("game_start_at")
@@ -2498,13 +2440,14 @@ async def crawl_maz_analysis_common(
                         print(f"[MAZ][DETAIL] id={board_id} 본문 텍스트 없음")
                         continue
 
-                    new_title, new_body = summarize_analysis_with_gemini(
-                        full_text,
-                        league=league,
-                        home_team=home,
-                        away_team=away,
-                        max_chars=900,
-                    )
+                    if not skip_sheet_dup:
+                        new_title, new_body = summarize_analysis_with_gemini(
+                            full_text,
+                            league=league,
+                            home_team=home,
+                            away_team=away,
+                            max_chars=900,
+                        )
 
                     # ✅ sport 세부 분류
                     row_sport = sport_label
@@ -2531,7 +2474,8 @@ async def crawl_maz_analysis_common(
                     elif sport_label in ("농구", "농구/배구"):
                         row_sport = classify_basketball_volleyball_sport(league or "")
 
-                    rows_to_append.append([row_sport, row_id, new_title, new_body])
+                    if not skip_sheet_dup:
+                        rows_to_append.append([row_sport, row_id, new_title, new_body])
 
                     # ✅ 사이트 업로드용(site_export)도 같이 저장
                     if export_site:
@@ -2549,7 +2493,7 @@ async def crawl_maz_analysis_common(
                                 print(f"[SITE_EXPORT][ERR] id={board_id}: {e}")
                             else:
                                 site_rows_to_append.append([
-                                    day_key,
+                                    target_ymd,
                                     row_sport,
                                     row_id,
                                     site_title,
@@ -2576,9 +2520,9 @@ async def crawl_maz_analysis_common(
 
     # ✅ site_export 시트 저장
     if export_site and site_rows_to_append:
-        ok2 = append_site_export_rows(site_rows_to_append)
+        ok2 = append_export_rows(site_rows_to_append, export_sheet_name)
         if not ok2:
-            await update.message.reply_text("site_export 시트 저장 중 오류가 발생했습니다.")
+            await update.message.reply_text(f"{export_sheet_name} 시트 저장 중 오류가 발생했습니다.")
             return
 
     reload_analysis_from_sheet()
@@ -3088,7 +3032,10 @@ def main():
     # 뉴스 시트 전체 초기화
     app.add_handler(CommandHandler("newsclean", newsclean))
     # today / tomorrow / news 전체 초기화
-    app.add_handler(CommandHandler("allclean", allclean))    
+    app.add_handler(CommandHandler("allclean", allclean))
+
+    # export_tomorrow → export_today 롤오버
+    app.add_handler(CommandHandler("export_rollover", export_rollover))    
 
     # 분석 시트 부분 초기화 명령어들 (모두 tomorrow 시트 기준)
     app.add_handler(CommandHandler("soccerclean", soccerclean))
