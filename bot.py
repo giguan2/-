@@ -3066,6 +3066,7 @@ async def crawlmazsoccer_today(update: Update, context: ContextTypes.DEFAULT_TYP
         max_pages=5,
         board_type=2,
         category=1,                 # 해외축구
+        export_site=True,
     )
 
     # 2) K리그 / J리그 탭
@@ -3079,6 +3080,7 @@ async def crawlmazsoccer_today(update: Update, context: ContextTypes.DEFAULT_TYP
         max_pages=5,
         board_type=2,
         category=2,                 # K리그/J리그
+        export_site=True,
     )
 
     await update.message.reply_text(
