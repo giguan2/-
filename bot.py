@@ -1170,6 +1170,7 @@ async def newsclean(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # 🔹 /allclean – today / tomorrow / news 시트 전체 초기화
 async def allclean(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """today/tomorrow/news + export_today/export_tomorrow 시트를 모두 초기화(헤더만 유지)."""
     if not is_admin(update):
         await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
         return
@@ -1193,45 +1194,50 @@ async def allclean(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sheet_tomorrow_name = os.getenv("SHEET_TOMORROW_NAME", "tomorrow")
     sheet_news_name = os.getenv("SHEET_NEWS_NAME", "news")
 
+    # 분석/뉴스 헤더(로드 함수 기준)
+    analysis_header = ["sport", "id", "title", "summary"]
+    export_header = EXPORT_HEADER  # ["day","sport","src_id","title","body","createdAt"]
+
     sheet_configs = [
-        (sheet_today_name, "today 분석"),
-        (sheet_tomorrow_name, "tomorrow 분석"),
-        (sheet_news_name, "news 뉴스"),
+        (sheet_today_name, "today 분석", analysis_header),
+        (sheet_tomorrow_name, "tomorrow 분석", analysis_header),
+        (sheet_news_name, "news 뉴스", analysis_header),
+        (EXPORT_TODAY_SHEET_NAME, "export_today", export_header),
+        (EXPORT_TOMORROW_SHEET_NAME, "export_tomorrow", export_header),
     ]
 
     errors: list[str] = []
 
-    for sheet_name, desc in sheet_configs:
+    for sheet_name, desc, header in sheet_configs:
         try:
-            ws = sh.worksheet(sheet_name)
+            ws = _get_ws_by_name(sh, sheet_name)
+            if not ws:
+                ws = sh.add_worksheet(title=sheet_name, rows=2000, cols=max(10, len(header)))
         except Exception as e:
             errors.append(f"{desc} 시트를 열지 못했습니다: {e}")
             continue
 
         try:
-            rows = ws.get_all_values()
-            if rows:
-                header = rows[0]
-            else:
-                # today / tomorrow / news 모두 같은 형식 사용
-                header = ["sport", "id", "title", "summary"]
-
             ws.clear()
             ws.update("A1", [header])
         except Exception as e:
-            errors.append(f"{desc} 시트 초기화 중 오류: {e}")
+            errors.append(f"{desc} 초기화 실패: {e}")
 
-    # 메모리 데이터도 함께 리셋
-    reload_analysis_from_sheet()
-    reload_news_from_sheet()
+    # 메모리 데이터도 함께 리셋(분석/뉴스)
+    try:
+        reload_analysis_from_sheet()
+    except Exception as e:
+        errors.append(f"메모리(analysis) 리셋 실패: {e}")
+
+    try:
+        reload_news_from_sheet()
+    except Exception as e:
+        errors.append(f"메모리(news) 리셋 실패: {e}")
 
     if errors:
-        msg = (
-            "일부 시트를 초기화하지 못했습니다.\n\n"
-            + "\n".join(errors)
-        )
+        msg = "일부 시트를 초기화하지 못했습니다.\n\n" + "\n".join(errors)
     else:
-        msg = "today / tomorrow / news 시트를 모두 초기화했습니다. (헤더만 남겨둠) ✅"
+        msg = "today / tomorrow / news / export_today / export_tomorrow 시트를 모두 초기화했습니다. (헤더만 남겨둠) ✅"
 
     await update.message.reply_text(msg)
 
