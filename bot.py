@@ -4,6 +4,34 @@ import time
 import re
 import requests
 import httpx
+
+# ----------------------------
+# HTTP helpers (Mazgtv anti-bot 대응: 브라우저 헤더 + 쿠키 워밍업)
+# ----------------------------
+MAZ_BASE_URL = os.getenv("MAZ_BASE_URL", "https://mazgtv1.com").rstrip("/")
+MAZ_LIST_API = os.getenv("MAZ_LIST_API", f"{MAZ_BASE_URL}/api/board/list")
+
+BROWSER_HEADERS = {
+    "User-Agent": os.getenv(
+        "MAZ_USER_AGENT",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": f"{MAZ_BASE_URL}/",
+    "Origin": MAZ_BASE_URL,
+    "Connection": "keep-alive",
+}
+
+async def _maz_warmup(client: httpx.AsyncClient) -> None:
+    \"\"\"API 호출 전 1회 워밍업으로 쿠키/세션 세팅을 유도한다.
+    403이 계속이면 사이트 측(WAF/차단)에서 서버 IP를 막았을 가능성이 큼.
+    \"\"\"
+    try:
+        await client.get(f"{MAZ_BASE_URL}/", headers=BROWSER_HEADERS, timeout=15.0)
+    except Exception:
+        return
+
 import math
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
@@ -2159,6 +2187,7 @@ async def crawl_daum_news_common(
             headers={"User-Agent": "Mozilla/5.0"},
             follow_redirects=True,
         ) as client:
+            await _maz_warmup(client)
             contents = await fetch_daum_news_json(client, category_id, size=max_articles)
 
             if not contents:
@@ -2302,7 +2331,6 @@ async def crawl_daum_news_common(
 
 # ───────────────── mazgtv 분석 공통 (내일 경기 → today/tomorrow 시트, JSON/API 버전) ─────────────────
 
-MAZ_LIST_API = "https://mazgtv1.com/api/board/list"
 # 상세 API 실제 경로에 맞게 여기만 수정하면 됨
 MAZ_DETAIL_API_TEMPLATE = "https://mazgtv1.com/api/board/{board_id}"
 
@@ -2466,6 +2494,7 @@ async def crawl_maz_analysis_common(
             headers={"User-Agent": "Mozilla/5.0"},
             follow_redirects=True,
         ) as client:
+            await _maz_warmup(client)
 
             for page in range(1, max_pages + 1):
                 list_url = (
