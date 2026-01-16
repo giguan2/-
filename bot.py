@@ -24,9 +24,9 @@ BROWSER_HEADERS = {
 }
 
 async def _maz_warmup(client: httpx.AsyncClient) -> None:
-    \"\"\"API 호출 전 1회 워밍업으로 쿠키/세션 세팅을 유도한다.
+    """API 호출 전 1회 워밍업으로 쿠키/세션 세팅을 유도한다.
     403이 계속이면 사이트 측(WAF/차단)에서 서버 IP를 막았을 가능성이 큼.
-    \"\"\"
+    """
     try:
         await client.get(f"{MAZ_BASE_URL}/", headers=BROWSER_HEADERS, timeout=15.0)
     except Exception:
@@ -333,7 +333,7 @@ def remove_title_prefix(title: str, body: str) -> str:
     if not title or not body:
         return body
 
-    t = title.strip().strip('\"“”')
+    t = title.strip().strip('"“”')
     b = body.strip()
 
     candidates = [
@@ -344,7 +344,7 @@ def remove_title_prefix(title: str, body: str) -> str:
 
     for cand in candidates:
         if b.startswith(cand):
-            return b[len(cand):].lstrip(" -–:·,\"'")
+            return b[len(cand):].lstrip(" -–:·, \"\'")
 
     return b
 
