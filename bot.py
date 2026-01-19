@@ -1,3 +1,4 @@
+from bs4 import BeautifulSoup
 
 
 def parse_maz_match_cards(soup: BeautifulSoup, target_date: str) -> list[dict]:
