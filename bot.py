@@ -1,3 +1,48 @@
+
+
+def parse_maz_match_cards(soup: BeautifulSoup, target_date: str) -> list[dict]:
+    """카드형 DOM(최근 maz 페이지)용 보조 파서.
+    날짜 div 예: <div class="d-flex justify-center pa-0 mb-3 col">01-20 (화) 05:00</div>
+    반환 dict 키: league, home, away, kickoff, link
+    """
+    results: list[dict] = []
+    for d in soup.select("div.d-flex.justify-center.pa-0.mb-3.col"):
+        kickoff_raw = clean_text(d.get_text(" ", strip=True))
+        if _normalize_match_date(target_date, kickoff_raw) != target_date:
+            continue
+
+        # 링크 찾기(가까운 a 태그)
+        a = d.find_parent("a")
+        link = a.get("href") if a and a.get("href") else ""
+
+        # 팀명 추정: 카드 텍스트에서 VS로 분리
+        card = d
+        for _ in range(6):
+            if card is None:
+                break
+            # 좀 더 큰 컨테이너로 이동
+            if hasattr(card, "parent"):
+                card = card.parent
+            else:
+                break
+
+        card_text = clean_text(card.get_text(" ", strip=True)) if card else ""
+        home = away = ""
+        if "VS" in card_text:
+            parts = [p.strip() for p in card_text.split("VS") if p.strip()]
+            if len(parts) >= 2:
+                home = parts[0].split()[-1]
+                away = parts[1].split()[0]
+
+        results.append({
+            "league": "",
+            "home": home,
+            "away": away,
+            "kickoff": kickoff_raw,
+            "link": link,
+        })
+    return results
+
 import re
 
 def _normalize_match_date(target_ymd: str, kickoff_raw: str) -> str:
@@ -62,8 +107,24 @@ def _log_httpx_exception(prefix: str, e: Exception) -> None:
 # ----------------------------
 # HTTP helpers (Mazgtv anti-bot 대응: 브라우저 헤더 + 쿠키 워밍업)
 # ----------------------------
-MAZ_BASE_URL = os.getenv("MAZ_BASE_URL", "https://mazgtv1.com").rstrip("/")
+MAZ_BASE_URL = os.getenv("MAZ_BASE_URL", "https://mazgtv2.com").rstrip("/")
 MAZ_LIST_API = os.getenv("MAZ_LIST_API", f"{MAZ_BASE_URL}/api/board/list")
+
+
+def build_maz_list_params(*, page: int = 1, perpage: int = 15, type_: str = "event",
+                          boardType: int = 4, category: int = 0,
+                          secretFlag: int = 0, fixFlag: bool = True) -> dict:
+    """mazgtv2 list API 파라미터를 표준화한다."""
+    return {
+        "page": page,
+        "perpage": perpage,
+        "type": type_,
+        "boardType": boardType,
+        "category": category,
+        "secretFlag": secretFlag,
+        "fixFlag": str(fixFlag).lower(),  # maz는 true/false 문자열을 쓰는 경우가 있음
+    }
+
 
 BROWSER_HEADERS = {
     "User-Agent": os.getenv(
@@ -2387,7 +2448,7 @@ async def crawl_daum_news_common(
 # ───────────────── mazgtv 분석 공통 (내일 경기 → today/tomorrow 시트, JSON/API 버전) ─────────────────
 
 # 상세 API 실제 경로에 맞게 여기만 수정하면 됨
-MAZ_DETAIL_API_TEMPLATE = "https://mazgtv1.com/api/board/{board_id}"
+MAZ_DETAIL_API_TEMPLATE = "{MAZ_BASE_URL}/api/board/{board_id}"
 
 
 def _parse_game_start_date(game_start_at: str) -> date | None:
