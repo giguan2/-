@@ -2449,7 +2449,7 @@ async def crawl_daum_news_common(
 # ───────────────── mazgtv 분석 공통 (내일 경기 → today/tomorrow 시트, JSON/API 버전) ─────────────────
 
 # 상세 API 실제 경로에 맞게 여기만 수정하면 됨
-MAZ_DETAIL_API_TEMPLATE = "{MAZ_BASE_URL}/api/board/{board_id}"
+MAZ_DETAIL_API_TEMPLATE = f"{MAZ_BASE_URL}/api/board/{{board_id}}"
 
 
 def _parse_game_start_date(game_start_at: str) -> date | None:
