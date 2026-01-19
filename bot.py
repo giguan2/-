@@ -1,9 +1,63 @@
+import re
+
+def _normalize_match_date(target_ymd: str, kickoff_raw: str) -> str:
+    """kickoff_raw에서 날짜를 뽑아 target_ymd(YYYY-MM-DD)와 비교 가능한 형태로 만든다.
+    지원 예:
+      - '2026-01-19 04:45'
+      - '2026.01.19 04:45'
+      - '01-19(월) 04:45'
+      - '01-19 04:45'
+    """
+    if not kickoff_raw:
+        return ""
+    s = str(kickoff_raw).strip()
+
+    m = re.search(r"(20\d{2})-(\d{2})-(\d{2})", s)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+
+    m = re.search(r"(20\d{2})\.(\d{2})\.(\d{2})", s)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+
+    m = re.search(r"(\d{2})-(\d{2})", s)
+    if m and re.match(r"20\d{2}-\d{2}-\d{2}", target_ymd or ""):
+        year = target_ymd.split("-")[0]
+        return f"{year}-{m.group(1)}-{m.group(2)}"
+
+    return ""
+
+
 import os
 import json
 import time
 import re
 import requests
 import httpx
+
+import traceback
+
+def _log_httpx_exception(prefix: str, e: Exception) -> None:
+    """Render 로그에 httpx 예외(특히 403/URL)를 확실히 남긴다."""
+    try:
+        req = getattr(e, "request", None)
+        resp = getattr(e, "response", None)
+        if req is not None:
+            print(f"{prefix} request_url={getattr(req, 'url', '')}")
+        if resp is not None:
+            try:
+                print(f"{prefix} status_code={resp.status_code} url={resp.url}")
+                txt = (resp.text or "")
+                if txt:
+                    print(f"{prefix} resp_text_head={txt[:300]}")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    print(f"{prefix} exc={repr(e)}")
+    traceback.print_exc()
+
 
 # ----------------------------
 # HTTP helpers (Mazgtv anti-bot 대응: 브라우저 헤더 + 쿠키 워밍업)
@@ -2289,6 +2343,7 @@ async def crawl_daum_news_common(
                     art["summary"] = "(본문 크롤링 실패)"
 
     except Exception as e:
+        _log_httpx_exception("[MAZ][Exception]", e)
         await update.message.reply_text(f"요청 오류가 발생했습니다: {e}")
         return
 
