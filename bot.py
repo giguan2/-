@@ -56,27 +56,58 @@ def extract_simple_from_body(body: str) -> str:
         s = re.sub(r"^[\-\•\*]+\s*", "", s)
         lines.append(s)
 
-    # 여러 불릿을 "한 문장"으로 합치기: 각 라인의 문장부호/종결을 제거 후 콤마로 연결하고 마지막에 "다."를 붙임
+        # 여러 줄 불릿을 "한 문장"으로 재작성 (가능하면 OpenAI 사용)
     cleaned = []
     for s in lines:
         s2 = s.strip()
-        # 마지막 종결/문장부호 제거
-        s2 = re.sub(r"\s*[\.\!\?…]+\s*$", "", s2)
-        s2 = re.sub(r"\s*다\s*$", "", s2)  # 끝의 "다" 제거 (다시 붙일 예정)
-        cleaned.append(s2)
+        # 불필요한 끝 쉼표/공백 정리
+        s2 = re.sub(r"\s*,\s*$", "", s2)
+        s2 = re.sub(r"\s+", " ", s2).strip()
+        if s2:
+            cleaned.append(s2)
 
-    one = ", ".join([c for c in cleaned if c])
+    if not cleaned:
+        return ""
+
+    # OpenAI로 1문장 재작성 (불릿이 2개 이상일 때만)
+    client_oa = get_openai_client()
+    if client_oa and len(cleaned) >= 2:
+        try:
+            bullets_txt = "\n".join([f"- {b}" for b in cleaned[:6]])
+            prompt = f'''아래 "핵심 포인트 요약" 불릿들을 의미를 유지한 채 자연스러운 한국어 1문장으로 재작성해줘.
+
+조건:
+- 반드시 한 문장(줄바꿈 없이)
+- 어색한 쉼표 나열 금지 (필요한 최소만 사용)
+- 관형형(예: "한", "미친", "준")으로 끝나지 않게 종결
+- 220자 이내
+- 출력은 문장만 (따옴표/머리말/불릿 금지)
+
+불릿:
+{bullets_txt}
+'''
+            resp = client_oa.chat.completions.create(
+                model=os.getenv("SIMPLE_REWRITE_MODEL", "gpt-4.1-mini"),
+                messages=[
+                    {"role": "system", "content": "Rewrite Korean sports analysis bullet points into one natural sentence."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+            )
+            one = (resp.choices[0].message.content or "").strip()
+            one = re.sub(r"\s+", " ", one).strip()
+            # 안전장치: 너무 길거나 비어있으면 폴백
+            if (not one) or (len(one) > 240):
+                raise ValueError("simple rewrite empty/too long")
+        except Exception:
+            one = " | ".join(cleaned)
+    else:
+        one = " | ".join(cleaned)
+
     one = re.sub(r"\s+", " ", one).strip()
 
-    if one:
-        # '다'로 끝나면 마침표만, 아니면 '다.'를 붙임
-        if one.endswith("다"):
-            one = one + "."
-        else:
-            one = one + "다."
-
-    if len(one) > 200:
-        one = one[:197] + "..."
+    if len(one) > 220:
+        one = one[:217] + "..."
     return one
 def ensure_export_header(ws) -> None:
     """export 시트 헤더가 7컬럼으로 맞지 않으면 강제로 맞춘다."""
