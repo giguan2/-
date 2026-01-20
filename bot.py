@@ -56,8 +56,24 @@ def extract_simple_from_body(body: str) -> str:
         s = re.sub(r"^[\-\•\*]+\s*", "", s)
         lines.append(s)
 
-    one = " / ".join(lines)
+    # 여러 불릿을 "한 문장"으로 합치기: 각 라인의 문장부호/종결을 제거 후 콤마로 연결하고 마지막에 "다."를 붙임
+    cleaned = []
+    for s in lines:
+        s2 = s.strip()
+        # 마지막 종결/문장부호 제거
+        s2 = re.sub(r"\s*[\.\!\?…]+\s*$", "", s2)
+        s2 = re.sub(r"\s*다\s*$", "", s2)  # 끝의 "다" 제거 (다시 붙일 예정)
+        cleaned.append(s2)
+
+    one = ", ".join([c for c in cleaned if c])
     one = re.sub(r"\s+", " ", one).strip()
+
+    if one:
+        # '다'로 끝나면 마침표만, 아니면 '다.'를 붙임
+        if one.endswith("다"):
+            one = one + "."
+        else:
+            one = one + "다."
 
     if len(one) > 200:
         one = one[:197] + "..."
