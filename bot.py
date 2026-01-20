@@ -1,5 +1,49 @@
 from bs4 import BeautifulSoup
 
+import re as _re_simple
+
+def extract_simple_from_body(body: str) -> str:
+    """서술형 body에서 [핵심 포인트 요약] 섹션을 한 줄로 압축해 반환."""
+    if not body:
+        return ""
+
+    text = str(body)
+
+    m = _re_simple.search(
+        r"\[핵심\s*포인트\s*요약\](.*?)(?:\n\s*────────+|\n\s*\[최종\s*픽\]|\n\s*\[경기|\Z)",
+        text,
+        flags=_re_simple.S,
+    )
+    section = m.group(1).strip() if m else ""
+    if not section:
+        return ""
+
+    lines = []
+    for line in section.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        line = _re_simple.sub(r"^[\-\•\*]+\s*", "", line)
+        lines.append(line)
+
+    one = " / ".join(lines)
+    one = _re_simple.sub(r"\s+", " ", one).strip()
+
+    if len(one) > 160:
+        one = one[:157] + "..."
+    return one
+
+
+def ensure_export_header(ws) -> None:
+    """export 시트 헤더가 7컬럼으로 맞지 않으면 강제로 맞춘다."""
+    try:
+        top = ws.row_values(1)
+    except Exception:
+        top = []
+    if (not top) or top[: len(EXPORT_HEADER)] != EXPORT_HEADER:
+        ws.update("A1", [EXPORT_HEADER])
+
+
 
 def parse_maz_match_cards(soup: BeautifulSoup, target_date: str) -> list[dict]:
     """카드형 DOM(최근 maz 페이지)용 보조 파서.
@@ -656,10 +700,11 @@ def get_site_export_ws():
         sh = client_gs.open_by_key(spreadsheet_id)
         ws = _get_ws_by_name(sh, sheet_name)
         if ws:
+            ensure_export_header(ws)
             return ws
 
         # 없으면 생성 시도
-        ws = sh.add_worksheet(title=sheet_name, rows=2000, cols=10)
+        ws = sh.add_worksheet(title=sheet_name, rows=2000, cols=max(10, len(EXPORT_HEADER)))
         # 헤더 세팅
         ws.update("A1", [SITE_EXPORT_HEADER])
         return ws
@@ -672,7 +717,7 @@ def get_site_export_ws():
 # ───────────────── site_export 저장 ─────────────────
 
 SITE_EXPORT_SHEET_NAME = os.getenv("SHEET_SITE_EXPORT_NAME", "site_export")
-SITE_EXPORT_HEADER = ["day", "sport", "src_id", "title", "body", "createdAt"]
+SITE_EXPORT_HEADER = ["day", "sport", "src_id", "title", "body", "createdAt", "simple"]
 # export 탭 분리: export_today / export_tomorrow
 EXPORT_TODAY_SHEET_NAME = os.getenv("SHEET_EXPORT_TODAY_NAME", "export_today")
 EXPORT_TOMORROW_SHEET_NAME = os.getenv("SHEET_EXPORT_TOMORROW_NAME", "export_tomorrow")
@@ -715,6 +760,22 @@ def append_site_export_rows(rows: list[list[str]]) -> bool:
         return False
 
     try:
+        # rows는 6컬럼([day,sport,src_id,title,body,createdAt]) 또는 7컬럼일 수 있음. simple 자동 생성.
+        fixed_rows = []
+        for r in rows:
+            if not r:
+                continue
+            rr = list(r)
+            if len(rr) == 6:
+                rr.append(extract_simple_from_body(rr[4] if len(rr) > 4 else ""))
+            elif len(rr) >= 7:
+                rr = rr[:7]
+            else:
+                while len(rr) < 6:
+                    rr.append("")
+                rr.append(extract_simple_from_body(rr[4] if len(rr) > 4 else ""))
+            fixed_rows.append(rr)
+        rows = fixed_rows
         ws.append_rows(rows, value_input_option="RAW")
         print(f"[GSHEET][SITE_EXPORT] {SITE_EXPORT_SHEET_NAME} 에 {len(rows)}건 추가")
         return True
@@ -3438,7 +3499,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 
