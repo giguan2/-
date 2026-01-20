@@ -1,6 +1,7 @@
 from bs4 import BeautifulSoup
 
 import re as _re_simple
+from telegram.error import BadRequest
 
 def extract_simple_from_body(body: str) -> str:
     """서술형 body에서 '핵심 포인트 요약'을 한 줄로 압축해 반환.
@@ -3018,9 +3019,16 @@ async def crawlvolleyball(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # 4) 인라인 버튼 콜백 처리 (분석/뉴스 팝업)
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    if q:
+        # callback query는 생성 후 짧은 시간 내에 answer 해야 오류가 안 난다.
+        try:
+            await q.answer()
+        except BadRequest as e:
+            if "Query is too old" in str(e) or "query id is invalid" in str(e):
+                pass
+            else:
+                raise
     data = q.data or ""
-    await q.answer()
-
     # 아무 동작 안 하는 더미
     if data == "noop":
         return
@@ -3545,7 +3553,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 
