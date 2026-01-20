@@ -108,7 +108,56 @@ def extract_simple_from_body(body: str) -> str:
 
     if len(one) > 220:
         one = one[:217] + "..."
+    # 마지막에 최종 픽을 붙인다(줄바꿈 유지)
+    try:
+        pick_block = extract_final_pick_from_body(body)
+    except Exception:
+        pick_block = ""
+    if pick_block:
+        one2 = (one or "").strip()
+        if one2:
+            return one2 + "\n\n" + pick_block
+        return pick_block
+
     return one
+
+
+def extract_final_pick_from_body(body: str) -> str:
+    """body에서 [최종 픽] 섹션을 줄바꿈 그대로 추출해 반환."""
+    if not body:
+        return ""
+    text = str(body)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    # HTML 줄바꿈도 처리 (simple에 줄바꿈 반영)
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
+    text = re.sub(r"</(p|div|li)>", "\n", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = text.replace("&nbsp;", " ")
+
+    pats = [
+        r"\[\s*최종\s*픽\s*\](.*?)(?:\n\s*[─\-]{5,}|\n\s*\[|\Z)",
+        r"최종\s*픽\s*[:：]?\s*\n(.*?)(?:\n\s*[─\-]{5,}|\n\s*\[|\Z)",
+    ]
+    block = ""
+    for pat in pats:
+        m = re.search(pat, text, flags=re.S)
+        if m:
+            block = (m.group(1) or "").strip()
+            if block:
+                break
+    if not block:
+        return ""
+
+    out_lines = []
+    for line in block.split("\n"):
+        s = line.rstrip()
+        if not s.strip():
+            continue
+        out_lines.append(s.strip())
+    if not out_lines:
+        return ""
+    return "[최종 픽]\n" + "\n".join(out_lines)
+
 def ensure_export_header(ws) -> None:
     """export 시트 헤더가 7컬럼으로 맞지 않으면 강제로 맞춘다."""
     try:
