@@ -3,37 +3,64 @@ from bs4 import BeautifulSoup
 import re as _re_simple
 
 def extract_simple_from_body(body: str) -> str:
-    """서술형 body에서 [핵심 포인트 요약] 섹션을 한 줄로 압축해 반환."""
+    """서술형 body에서 '핵심 포인트 요약'을 한 줄로 압축해 반환.
+    - [핵심 포인트 요약] / 핵심 포인트 요약 / 핵심포인트요약 등 다양한 표기 지원
+    - HTML(<br>, <p>)이 섞여 있어도 처리
+    """
     if not body:
         return ""
 
     text = str(body)
 
-    m = _re_simple.search(
-        r"\[핵심\s*포인트\s*요약\](.*?)(?:\n\s*────────+|\n\s*\[최종\s*픽\]|\n\s*\[경기|\Z)",
-        text,
-        flags=_re_simple.S,
-    )
-    section = m.group(1).strip() if m else ""
+    # normalize newlines / HTML
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
+    text = re.sub(r"</(p|div|li)>", "\n", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = text.replace("&nbsp;", " ")
+
+    patterns = [
+        r"\[\s*핵심\s*포인트\s*요약\s*\](.*?)(?:\n\s*[─\-]{5,}|\n\s*\[\s*최종\s*픽\s*\]|\n\s*\[|\Z)",
+        r"핵심\s*포인트\s*요약\s*[:：]?\s*\n(.*?)(?:\n\s*[─\-]{5,}|\n\s*최종\s*픽\s*[:：]?|\n\s*\[|\Z)",
+        r"핵심\s*포인트\s*[:：]?\s*\n(.*?)(?:\n\s*[─\-]{5,}|\n\s*최종\s*픽\s*[:：]?|\n\s*\[|\Z)",
+        r"핵심포인트\s*요약\s*[:：]?\s*\n(.*?)(?:\n\s*[─\-]{5,}|\n\s*최종\s*픽\s*[:：]?|\n\s*\[|\Z)",
+    ]
+
+    section = ""
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.S)
+        if m:
+            section = (m.group(1) or "").strip()
+            if section:
+                break
+
+    # 섹션이 없으면 불릿 마지막 2~4개로 대체
+    if not section:
+        bullets = []
+        for line in text.split("\n"):
+            s = line.strip()
+            if re.match(r"^[\-\•\*]+\s+", s):
+                bullets.append(re.sub(r"^[\-\•\*]+\s*", "", s))
+        if len(bullets) >= 2:
+            section = "\n".join(bullets[-4:])
+
     if not section:
         return ""
 
     lines = []
-    for line in section.splitlines():
-        line = line.strip()
-        if not line:
+    for line in section.split("\n"):
+        s = line.strip()
+        if not s:
             continue
-        line = _re_simple.sub(r"^[\-\•\*]+\s*", "", line)
-        lines.append(line)
+        s = re.sub(r"^[\-\•\*]+\s*", "", s)
+        lines.append(s)
 
     one = " / ".join(lines)
-    one = _re_simple.sub(r"\s+", " ", one).strip()
+    one = re.sub(r"\s+", " ", one).strip()
 
-    if len(one) > 160:
-        one = one[:157] + "..."
+    if len(one) > 200:
+        one = one[:197] + "..."
     return one
-
-
 def ensure_export_header(ws) -> None:
     """export 시트 헤더가 7컬럼으로 맞지 않으면 강제로 맞춘다."""
     try:
