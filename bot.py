@@ -823,6 +823,7 @@ def get_export_ws(sheet_name: str):
         ws = _get_ws_by_name(sh, sheet_name)
         if not ws:
             ws = sh.add_worksheet(title=sheet_name, rows=2000, cols=10)
+        ws.resize(cols=max(10, len(EXPORT_HEADER)))
         _ensure_header(ws, EXPORT_HEADER)
         return ws
     except Exception as e:
@@ -864,6 +865,24 @@ def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
     ws = get_export_ws(sheet_name)
     if not ws:
         return False
+    # rows는 6컬럼([day,sport,src_id,title,body,createdAt]) 또는 7컬럼일 수 있음. simple 자동 생성.
+    fixed_rows = []
+    for r in rows:
+        if not r:
+            continue
+        rr = list(r)
+        if len(rr) == 6:
+            rr.append(extract_simple_from_body(rr[4] if len(rr) > 4 else ""))
+        elif len(rr) >= 7:
+            rr = rr[:7]
+            if not str(rr[6]).strip():
+                rr[6] = extract_simple_from_body(rr[4] if len(rr) > 4 else "")
+        else:
+            while len(rr) < 6:
+                rr.append("")
+            rr.append(extract_simple_from_body(rr[4] if len(rr) > 4 else ""))
+        fixed_rows.append(rr)
+    rows = fixed_rows
 
     try:
         ws.append_rows(rows, value_input_option="RAW")
