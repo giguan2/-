@@ -123,12 +123,15 @@ def extract_simple_from_body(body: str) -> str:
 
 
 def extract_final_pick_from_body(body: str) -> str:
-    """body에서 [최종 픽] 섹션을 줄바꿈 그대로 추출해 반환."""
+    """body에서 [최종 픽] 섹션 중 '픽 라인'만 줄바꿈 그대로 추출해 반환.
+    - [최종 픽] 이후 불릿(-,•,*) 또는 '승패/핸디/언오버' 라인만 연속으로 가져오고,
+      그 다음 일반 문장(총평 등)이 나오면 거기서 중단한다.
+    """
     if not body:
         return ""
     text = str(body)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    # HTML 줄바꿈도 처리 (simple에 줄바꿈 반영)
+    # HTML 줄바꿈도 처리
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
     text = re.sub(r"</(p|div|li)>", "\n", text, flags=re.I)
     text = re.sub(r"<[^>]+>", "", text)
@@ -148,15 +151,42 @@ def extract_final_pick_from_body(body: str) -> str:
     if not block:
         return ""
 
-    out_lines = []
-    for line in block.split("\n"):
-        s = line.rstrip()
-        if not s.strip():
+    pick_lines = []
+    started = False
+
+    def is_pick_line(s: str) -> bool:
+        s2 = s.strip()
+        if not s2:
+            return False
+        if re.match(r"^[\-\•\*]+\s+", s2):
+            return True
+        if re.match(r"^(승패|핸디|언오버|오버|언더|결과|픽|추천)\s*[:：]", s2):
+            return True
+        return False
+
+    for raw in block.split("\n"):
+        s = raw.strip()
+        if not s:
+            if started:
+                break
             continue
-        out_lines.append(s.strip())
-    if not out_lines:
+
+        if is_pick_line(s):
+            started = True
+            pick_lines.append(s)
+        else:
+            if started:
+                break
+            if re.match(r"^(승패\s*예상|핸디\s*예상|언오버\s*예상)\s*$", s):
+                started = True
+                pick_lines.append(s)
+            else:
+                continue
+
+    if not pick_lines:
         return ""
-    return "[최종 픽]\n" + "\n".join(out_lines)
+
+    return "[최종 픽]\n" + "\n".join(pick_lines)
 
 def ensure_export_header(ws) -> None:
     """export 시트 헤더가 7컬럼으로 맞지 않으면 강제로 맞춘다."""
