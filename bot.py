@@ -3559,7 +3559,10 @@ async def bvcrawl_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ───────────────── 실행부 ─────────────────
 
 async def export_rollover(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """export_tomorrow → export_today 롤오버. 중복(src_id) 제외. 이후 export_tomorrow는 헤더만 남김."""
+    """export_tomorrow → export_today 롤오버 (덮어쓰기).
+    - export_today 기존 데이터는 모두 비우고(헤더 재설정) export_tomorrow 데이터를 그대로 복사
+    - 이후 export_tomorrow는 헤더만 남김
+    """
     if not is_admin(update):
         await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
         return
@@ -3571,31 +3574,35 @@ async def export_rollover(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        today_vals = today_ws.get_all_values()
         tomo_vals = tomo_ws.get_all_values()
         if not tomo_vals or len(tomo_vals) <= 1:
             await update.message.reply_text("export_tomorrow에 옮길 데이터가 없습니다.")
             return
 
-        header = [c.strip() for c in (today_vals[0] if today_vals else EXPORT_HEADER)]
+        # 옮길 데이터(헤더 제외). src_id가 비어있는 행은 제외.
+        header = [c.strip() for c in (tomo_vals[0] if tomo_vals else EXPORT_HEADER)]
         src_idx = header.index("src_id") if "src_id" in header else 2
 
-        today_ids = set()
-        for r in today_vals[1:]:
-            if len(r) > src_idx and r[src_idx].strip():
-                today_ids.add(r[src_idx].strip())
-
         to_move = []
-        skipped = 0
         for r in tomo_vals[1:]:
             sid = r[src_idx].strip() if len(r) > src_idx else ""
             if not sid:
                 continue
-            if sid in today_ids:
-                skipped += 1
-                continue
             to_move.append(r)
-            today_ids.add(sid)
+
+        # export_today는 덮어쓰기: 전체 비우고 헤더 재설정 후, 내일 데이터를 그대로 넣는다.
+        try:
+            today_ws.clear()
+        except Exception:
+            try:
+                today_ws.batch_clear(["A2:Z"])
+            except Exception:
+                pass
+
+        try:
+            today_ws.update("A1", [EXPORT_HEADER])
+        except Exception:
+            today_ws.update(values=[EXPORT_HEADER], range_name="A1")
 
         if to_move:
             today_ws.append_rows(to_move, value_input_option="RAW")
@@ -3605,13 +3612,12 @@ async def export_rollover(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tomo_ws.update("A1", [EXPORT_HEADER])
 
         await update.message.reply_text(
-            f"롤오버 완료: export_today로 {len(to_move)}건 이동, 중복 {skipped}건 스킵. export_tomorrow 초기화 완료."
+            f"롤오버 완료(덮어쓰기): export_today에 {len(to_move)}건 반영, export_tomorrow 초기화 완료."
         )
 
     except Exception as e:
         await update.message.reply_text(f"롤오버 중 오류: {e}")
         return
-
 
 def main():
     reload_analysis_from_sheet()
