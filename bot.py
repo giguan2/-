@@ -4,6 +4,16 @@ from bs4 import BeautifulSoup
 import re as _re_simple
 from telegram.error import BadRequest
 
+# --- Time helpers ---
+from datetime import datetime, timedelta, timezone
+
+KST = timezone(timedelta(hours=9))
+
+def now_kst() -> datetime:
+    """Return timezone-aware KST datetime."""
+    return datetime.now(KST)
+
+
 def extract_simple_from_body(body: str) -> str:
     """서술형 body에서 '핵심 포인트 요약'을 한 줄로 압축해 반환.
     - [핵심 포인트 요약] / 핵심 포인트 요약 / 핵심포인트요약 등 다양한 표기 지원
@@ -4036,7 +4046,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 
