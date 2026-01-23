@@ -461,6 +461,48 @@ def _load_posted_src_ids(ws_log) -> set:
         pass
     return posted
 
+
+def _cafe_sport_match(sport_value: str, sport_filter: str) -> bool:
+    """export 시트의 sport 값이 명령어 sport_filter(축구/야구/농구/배구)와 매칭되는지 판정."""
+    sv = (sport_value or "").strip().lower()
+    sf = (sport_filter or "").strip().lower()
+    if not sf:
+        return True
+    # 같은 값이면 바로 통과
+    if sv == sf:
+        return True
+
+    # 명령어 필터별 허용 sport 값(시트에서 쓰는 리그명까지 포함)
+    aliases = {
+        "soccer": {
+            "soccer", "football",
+            "축구", "해외축구", "국내축구", "해축", "국축", "k리그", "k리그1", "k리그2", "k-league", "kleague", "epl", "ucl", "uefa", "챔피언스리그", "유로파", "컨퍼런스",
+        },
+        "baseball": {
+            "baseball", "야구",
+            "kbo", "mlb", "npb", "프로야구", "해외야구", "국내야구",
+        },
+        "basketball": {
+            "basketball", "농구",
+            "nba", "kbl", "wkbl", "wnba",
+        },
+        "volleyball": {
+            "volleyball", "배구",
+            "v리그", "vleague", "kovo", "프로배구", "남자배구", "여자배구", "vnl", "avc",
+        },
+    }
+    # sport_filter가 한글로 들어오는 경우도 대비
+    sf_norm = {
+        "축구": "soccer",
+        "야구": "baseball",
+        "농구": "basketball",
+        "배구": "volleyball",
+    }.get(sf, sf)
+
+    allowed = aliases.get(sf_norm, {sf_norm})
+    return sv in allowed
+
+
 async def _cafe_parse_which_arg(context: ContextTypes.DEFAULT_TYPE) -> str:
     which = "today"
     args = getattr(context, "args", None) or []
@@ -540,7 +582,7 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
             continue
         dayv = r[i_day].strip() if len(r) > i_day else ""
         sportv = r[i_sport].strip() if len(r) > i_sport else ""
-        if sport_filter and sportv.strip().lower() != sport_filter.strip().lower():
+        if sport_filter and (not _cafe_sport_match(sportv, sport_filter)):
             continue
         titlev = r[i_title].strip() if len(r) > i_title else ""
         bodyv = r[i_body] if len(r) > i_body else ""
