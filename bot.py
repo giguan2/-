@@ -1,3 +1,4 @@
+from __future__ import annotations
 from bs4 import BeautifulSoup
 
 import re as _re_simple
