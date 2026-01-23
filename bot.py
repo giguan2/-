@@ -275,11 +275,313 @@ def _normalize_match_date(target_ymd: str, kickoff_raw: str) -> str:
 import os
 import json
 import time
+import asyncio
 import re
 import requests
 import httpx
 
 import traceback
+# ───────────────── 네이버 카페 자동 글쓰기 (추후: '네이버 카페 자동 글쓰기') ─────────────────
+# 공식 문서:
+# - 네이버 로그인 토큰 발급/갱신: https://nid.naver.com/oauth2.0/token
+# - 카페 글쓰기: https://openapi.naver.com/v1/cafe/{clubid}/menu/{menuid}/articles
+
+NAVER_CLIENT_ID = (os.getenv("NAVER_CLIENT_ID") or "").strip()
+NAVER_CLIENT_SECRET = (os.getenv("NAVER_CLIENT_SECRET") or "").strip()
+NAVER_REFRESH_TOKEN = (os.getenv("NAVER_REFRESH_TOKEN") or "").strip()
+
+# 기본값(전 종목 공통 게시판). 종목별 분리는 NAVER_CAFE_MENU_MAP(JSON)로 설정 가능.
+NAVER_CAFE_CLUBID = (os.getenv("NAVER_CAFE_CLUBID") or "").strip()
+NAVER_CAFE_MENU_ID = (os.getenv("NAVER_CAFE_MENU_ID") or "").strip()
+# 종목별 게시판(menuid). 비어있으면 NAVER_CAFE_MENU_MAP 또는 NAVER_CAFE_MENU_ID로 폴백.
+NAVER_CAFE_MENU_ID_SOCCER = (os.getenv("NAVER_CAFE_MENU_ID_SOCCER") or "").strip()
+NAVER_CAFE_MENU_ID_BASEBALL = (os.getenv("NAVER_CAFE_MENU_ID_BASEBALL") or "").strip()
+NAVER_CAFE_MENU_ID_BASKETBALL = (os.getenv("NAVER_CAFE_MENU_ID_BASKETBALL") or "").strip()
+NAVER_CAFE_MENU_ID_VOLLEYBALL = (os.getenv("NAVER_CAFE_MENU_ID_VOLLEYBALL") or "").strip()
+
+# 예: {"soccer":"10","baseball":"20","basketball":"30","volleyball":"40"}
+NAVER_CAFE_MENU_MAP_RAW = (os.getenv("NAVER_CAFE_MENU_MAP") or "").strip()
+
+CAFE_LOG_SHEET_NAME = (os.getenv("CAFE_LOG_SHEET_NAME") or "cafe_log").strip()
+CAFE_LOG_HEADER = ["src_id", "day", "sport", "clubid", "menuid", "articleId", "postedAt", "status"]
+
+_naver_access_token_cache = {"token": "", "expires_at": 0}
+
+def _naver_menu_id_for_sport(sport: str) -> str:
+    sport_key = (sport or "").strip().lower()
+
+    # 1) 종목별 환경변수 우선
+    if sport_key == "soccer" and NAVER_CAFE_MENU_ID_SOCCER:
+        return NAVER_CAFE_MENU_ID_SOCCER
+    if sport_key == "baseball" and NAVER_CAFE_MENU_ID_BASEBALL:
+        return NAVER_CAFE_MENU_ID_BASEBALL
+    if sport_key == "basketball" and NAVER_CAFE_MENU_ID_BASKETBALL:
+        return NAVER_CAFE_MENU_ID_BASKETBALL
+    if sport_key == "volleyball" and NAVER_CAFE_MENU_ID_VOLLEYBALL:
+        return NAVER_CAFE_MENU_ID_VOLLEYBALL
+
+    # 2) JSON 맵 폴백: {"soccer":"10", ...}
+    if NAVER_CAFE_MENU_MAP_RAW:
+        try:
+            mp = json.loads(NAVER_CAFE_MENU_MAP_RAW)
+            v = mp.get(sport_key, "")
+            if v:
+                return str(v).strip()
+        except Exception:
+            pass
+
+    # 3) 단일 메뉴 폴백
+    return NAVER_CAFE_MENU_ID
+
+def _naver_have_config() -> bool:
+    return bool(NAVER_CLIENT_ID and NAVER_CLIENT_SECRET and NAVER_REFRESH_TOKEN and NAVER_CAFE_CLUBID)
+
+def _naver_refresh_access_token() -> str:
+    """refresh_token으로 access_token 갱신(캐시 사용)."""
+    now_ts = int(time.time())
+    # 60초 여유
+    if _naver_access_token_cache["token"] and _naver_access_token_cache["expires_at"] - 60 > now_ts:
+        return _naver_access_token_cache["token"]
+
+    if not (NAVER_CLIENT_ID and NAVER_CLIENT_SECRET and NAVER_REFRESH_TOKEN):
+        return ""
+
+    url = "https://nid.naver.com/oauth2.0/token"
+    params = {
+        "grant_type": "refresh_token",
+        "client_id": NAVER_CLIENT_ID,
+        "client_secret": NAVER_CLIENT_SECRET,
+        "refresh_token": NAVER_REFRESH_TOKEN,
+    }
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        if r.status_code != 200:
+            print(f"[NAVER] token refresh failed status={r.status_code} body={r.text[:500]}")
+            return ""
+        data = r.json()
+        token = (data.get("access_token") or "").strip()
+        expires_in = int(str(data.get("expires_in") or "3600"))
+        if token:
+            _naver_access_token_cache["token"] = token
+            _naver_access_token_cache["expires_at"] = now_ts + max(60, expires_in)
+        return token
+    except Exception as e:
+        print(f"[NAVER] token refresh exception: {e}")
+        return ""
+
+def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tuple[bool, str]:
+    """네이버 카페에 글쓰기. (success, articleId_or_error)"""
+    token = _naver_refresh_access_token()
+    if not token:
+        return False, "NO_ACCESS_TOKEN"
+
+    if not clubid or not menuid:
+        return False, "NO_CLUBID_OR_MENUID"
+
+    # subject 길이 제한 대비(너무 길면 잘라냄)
+    subject = (subject or "").strip()
+    if not subject:
+        subject = "스포츠 분석"
+    if len(subject) > 80:
+        subject = subject[:80]
+
+    url = f"https://openapi.naver.com/v1/cafe/{clubid}/menu/{menuid}/articles"
+    headers = {"Authorization": f"Bearer {token}"}
+    data = {"subject": subject, "content": content or ""}
+
+    try:
+        resp = requests.post(url, headers=headers, data=data, timeout=30)
+        if resp.status_code != 200:
+            return False, f"HTTP_{resp.status_code}:{resp.text[:300]}"
+
+        # 문서상 응답 포맷이 고정되어 있지 않아 안전하게 파싱
+        article_id = ""
+        try:
+            j = resp.json()
+            # 흔히 result/articleId 또는 message.result.articleId 형태
+            if isinstance(j, dict):
+                for key_path in [
+                    ("result", "articleId"),
+                    ("result", "articleid"),
+                    ("message", "result", "articleId"),
+                    ("message", "result", "articleid"),
+                ]:
+                    cur = j
+                    ok = True
+                    for k in key_path:
+                        if isinstance(cur, dict) and k in cur:
+                            cur = cur[k]
+                        else:
+                            ok = False
+                            break
+                    if ok and cur:
+                        article_id = str(cur)
+                        break
+        except Exception:
+            pass
+
+        return True, (article_id or "OK")
+    except Exception as e:
+        return False, f"EXC:{e}"
+
+def get_cafe_log_ws():
+    """cafe_log 워크시트 반환(없으면 생성 + 헤더 세팅)."""
+    client_gs = get_gs_client()
+    spreadsheet_id = os.getenv("SPREADSHEET_ID")
+    if not (client_gs and spreadsheet_id):
+        return None
+    try:
+        sh = client_gs.open_by_key(spreadsheet_id)
+        ws = _get_ws_by_name(sh, CAFE_LOG_SHEET_NAME)
+        if not ws:
+            ws = sh.add_worksheet(title=CAFE_LOG_SHEET_NAME, rows=2000, cols=12)
+        ws.resize(cols=max(12, len(CAFE_LOG_HEADER)))
+        _ensure_header(ws, CAFE_LOG_HEADER)
+        return ws
+    except Exception as e:
+        print(f"[GSHEET] cafe_log ws error: {e}")
+        return None
+
+def _load_posted_src_ids(ws_log) -> set:
+    posted = set()
+    try:
+        vals = ws_log.get_all_values()
+        if not vals or len(vals) <= 1:
+            return posted
+        header = vals[0]
+        try:
+            idx = header.index("src_id")
+        except ValueError:
+            idx = 0
+        for r in vals[1:]:
+            if len(r) > idx and r[idx].strip():
+                posted.add(r[idx].strip())
+    except Exception:
+        pass
+    return posted
+
+async def _cafe_parse_which_arg(context: ContextTypes.DEFAULT_TYPE) -> str:
+    which = "today"
+    args = getattr(context, "args", None) or []
+    if args:
+        a0 = (args[0] or "").strip().lower()
+        if a0 in ("tomorrow", "tmr", "t", "내일"):
+            which = "tomorrow"
+    return which
+
+async def cafe_soccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    which = await _cafe_parse_which_arg(context)
+    return await cafe_post_from_export(update, context, which, sport_filter="soccer")
+
+async def cafe_baseball(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    which = await _cafe_parse_which_arg(context)
+    return await cafe_post_from_export(update, context, which, sport_filter="baseball")
+
+async def cafe_basketball(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    which = await _cafe_parse_which_arg(context)
+    return await cafe_post_from_export(update, context, which, sport_filter="basketball")
+
+async def cafe_volleyball(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    which = await _cafe_parse_which_arg(context)
+    return await cafe_post_from_export(update, context, which, sport_filter="volleyball")
+
+async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TYPE, which: str, sport_filter: str = ""):
+    """export_today/export_tomorrow 내용을 네이버 카페에 업로드."""
+    if not is_admin(update):
+        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+
+    if not _naver_have_config():
+        await update.message.reply_text(
+            "네이버 카페 자동 글쓰기 설정이 비어있어. 환경변수에 아래를 넣어줘:\n"
+            "NAVER_CLIENT_ID, NAVER_CLIENT_SECRET, NAVER_REFRESH_TOKEN, NAVER_CAFE_CLUBID, NAVER_CAFE_MENU_ID_SOCCER/BASEBALL/BASKETBALL/VOLLEYBALL (또는 NAVER_CAFE_MENU_MAP/NAVER_CAFE_MENU_ID 폴백)"
+        )
+        return
+
+    sheet_name = EXPORT_TODAY_SHEET_NAME if which == "today" else EXPORT_TOMORROW_SHEET_NAME
+    ws = get_export_ws(sheet_name)
+    ws_log = get_cafe_log_ws()
+    if not ws:
+        await update.message.reply_text(f"{sheet_name} 시트를 못 찾았어.")
+        return
+    if not ws_log:
+        await update.message.reply_text("cafe_log 시트를 준비 못 했어(SPREADSHEET_ID 확인).")
+        return
+
+    vals = ws.get_all_values()
+    if not vals or len(vals) <= 1:
+        await update.message.reply_text(f"{sheet_name}에 업로드할 데이터가 없어.")
+        return
+
+    header = vals[0]
+    def col(name, default=-1):
+        try:
+            return header.index(name)
+        except ValueError:
+            return default
+
+    i_day = col("day", 0)
+    i_sport = col("sport", 1)
+    i_src = col("src_id", 2)
+    i_title = col("title", 3)
+    i_body = col("body", 4)
+    i_created = col("createdAt", 5)
+    i_simple = col("simple", 6)
+
+    posted = _load_posted_src_ids(ws_log)
+
+    to_post = []
+    for r in vals[1:]:
+        sid = (r[i_src].strip() if len(r) > i_src else "")
+        if not sid:
+            continue
+        if sid in posted:
+            continue
+        dayv = r[i_day].strip() if len(r) > i_day else ""
+        sportv = r[i_sport].strip() if len(r) > i_sport else ""
+        if sport_filter and sportv.strip().lower() != sport_filter.strip().lower():
+            continue
+        titlev = r[i_title].strip() if len(r) > i_title else ""
+        bodyv = r[i_body] if len(r) > i_body else ""
+        simplev = r[i_simple].strip() if len(r) > i_simple else ""
+        createdv = r[i_created].strip() if len(r) > i_created else ""
+
+        # content 구성: simple 1줄 + 공백 + body
+        content = ""
+        if simplev:
+            content = simplev + "\n\n" + (bodyv or "")
+        else:
+            content = bodyv or ""
+
+        menuid = _naver_menu_id_for_sport(sportv)
+        to_post.append((sid, dayv, sportv, titlev, content, createdv, menuid))
+
+    if not to_post:
+        await update.message.reply_text("업로드할 새 글이 없어(이미 올린 src_id는 제외됨).")
+        return
+
+    ok_cnt, fail_cnt = 0, 0
+    for (sid, dayv, sportv, titlev, content, createdv, menuid) in to_post:
+        # menuid 미설정이면 스킵
+        if not menuid:
+            fail_cnt += 1
+            ws_log.append_row([sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), "NO_MENU_ID"], value_input_option="RAW")
+            continue
+
+        subject = titlev or f"{sportv} 분석"
+        success, info = _naver_cafe_post(subject=subject, content=content, clubid=NAVER_CAFE_CLUBID, menuid=menuid)
+        if success:
+            ok_cnt += 1
+            ws_log.append_row([sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, info, now_kst().isoformat(), "OK"], value_input_option="RAW")
+        else:
+            fail_cnt += 1
+            ws_log.append_row([sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), info], value_input_option="RAW")
+
+        # 너무 빠른 연속 호출 방지
+        await asyncio.sleep(0.3)
+
+    await update.message.reply_text(f"카페 업로드 완료: 성공 {ok_cnt} / 실패 {fail_cnt} (중복 src_id는 제외됨)")
+
 
 def _log_httpx_exception(prefix: str, e: Exception) -> None:
     """Render 로그에 httpx 예외(특히 403/URL)를 확실히 남긴다."""
@@ -3639,7 +3941,13 @@ def main():
     # export_tomorrow → export_today 롤오버
     app.add_handler(CommandHandler("export_rollover", export_rollover))    
 
-    # 분석 시트 부분 초기화 명령어들 (모두 tomorrow 시트 기준)
+    # 네이버 카페 자동 글쓰기(종목별 게시판)  ※ /cafe_soccer [tomorrow] 처럼 사용
+    app.add_handler(CommandHandler("cafe_soccer", cafe_soccer))
+    app.add_handler(CommandHandler("cafe_baseball", cafe_baseball))
+    app.add_handler(CommandHandler("cafe_basketball", cafe_basketball))
+    app.add_handler(CommandHandler("cafe_volleyball", cafe_volleyball))
+
+    # 네이버 카페 자동 글쓰기    # 분석 시트 부분 초기화 명령어들 (모두 tomorrow 시트 기준)
     app.add_handler(CommandHandler("soccerclean", soccerclean))
     app.add_handler(CommandHandler("baseballclean", baseballclean))
     app.add_handler(CommandHandler("basketclean", basketclean))
