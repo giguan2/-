@@ -606,7 +606,7 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             content = bodyv or ""
 
-        menuid = _naver_menu_id_for_sport(sportv)
+        menuid = _naver_menu_id_for_sport(sport_filter)
         to_post.append((sid, dayv, sportv, titlev, content, createdv, menuid))
 
     if not to_post:
@@ -618,17 +618,17 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
         # menuid 미설정이면 스킵
         if not menuid:
             fail_cnt += 1
-            ws_log.append_row([sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), "NO_MENU_ID"], value_input_option="RAW")
+            ws_log.append_row([sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), "NO_MENU_ID"], value_input_option="RAW", table_range="A1")
             continue
 
         subject = titlev or f"{sportv} 분석"
         success, info = _naver_cafe_post(subject=subject, content=content, clubid=NAVER_CAFE_CLUBID, menuid=menuid)
         if success:
             ok_cnt += 1
-            ws_log.append_row([sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, info, now_kst().isoformat(), "OK"], value_input_option="RAW")
+            ws_log.append_row([sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, info, now_kst().isoformat(), "OK"], value_input_option="RAW", table_range="A1")
         else:
             fail_cnt += 1
-            ws_log.append_row([sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), info], value_input_option="RAW")
+            ws_log.append_row([sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), info], value_input_option="RAW", table_range="A1")
 
         # 너무 빠른 연속 호출 방지
         await asyncio.sleep(0.3)
@@ -1180,7 +1180,7 @@ def append_analysis_rows(day_key: str, rows: list[list[str]]) -> bool:
         return False
 
     try:
-        ws.append_rows(rows, value_input_option="RAW")
+        ws.append_rows(rows, value_input_option="RAW", table_range="A1")
         print(f"[GSHEET][ANALYSIS] {sheet_name} 에 {len(rows)}건 추가")
         return True
     except Exception as e:
@@ -1285,7 +1285,7 @@ def append_site_export_rows(rows: list[list[str]]) -> bool:
                 rr.append(extract_simple_from_body(rr[4] if len(rr) > 4 else ""))
             fixed_rows.append(rr)
         rows = fixed_rows
-        ws.append_rows(rows, value_input_option="RAW")
+        ws.append_rows(rows, value_input_option="RAW", table_range="A1")
         print(f"[GSHEET][SITE_EXPORT] {SITE_EXPORT_SHEET_NAME} 에 {len(rows)}건 추가")
         return True
     except Exception as e:
@@ -1367,7 +1367,7 @@ def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
     rows = fixed_rows
 
     try:
-        ws.append_rows(rows, value_input_option="RAW")
+        ws.append_rows(rows, value_input_option="RAW", table_range="A1")
         return True
     except Exception as e:
         print(f"[GSHEET][EXPORT] append 실패({sheet_name}): {e}")
@@ -3025,7 +3025,7 @@ async def crawl_daum_news_common(
         ])
 
     try:
-        ws.append_rows(rows_to_append, value_input_option="RAW")
+        ws.append_rows(rows_to_append, value_input_option="RAW", table_range="A1")
     except Exception as e:
         await update.message.reply_text(f"시트 쓰기 오류: {e}")
         return
@@ -3960,7 +3960,7 @@ async def export_rollover(update: Update, context: ContextTypes.DEFAULT_TYPE):
             today_ws.update(values=[EXPORT_HEADER], range_name="A1")
 
         if to_move:
-            today_ws.append_rows(to_move, value_input_option="RAW")
+            today_ws.append_rows(to_move, value_input_option="RAW", table_range="A1")
 
         # export_tomorrow 초기화(헤더만)
         tomo_ws.clear()
