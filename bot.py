@@ -381,22 +381,13 @@ def _naver_refresh_access_token() -> str:
         print(f"[NAVER] token refresh exception: {e}")
         return ""
 
-def _naver_double_urlencode(value: str) -> str:
-    """
-    Naver Cafe Write API 가이드 방식:
-    1) UTF-8 로 URL 인코딩
-    2) 그 결과 문자열을 MS949(CP949) 로 다시 URL 인코딩
-    최종 결과는 ASCII(%,0-9,A-F)만 포함.
-    """
-    from urllib.parse import quote
-
-    value = value or ""
-    once = quote(value, safe="", encoding="utf-8", errors="strict")
-    twice = quote(once, safe="", encoding="cp949", errors="strict")
-    return twice
-
 def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tuple[bool, str]:
-    """네이버 카페에 글쓰기. (success, articleId_or_error)"""
+    """네이버 카페에 글쓰기. (success, articleId_or_error)
+
+    인코딩 이슈(시트에서는 정상인데 카페에서 깨짐)는 보통 서버가 form 바디를 EUC-KR/CP949로 디코딩해서 발생한다.
+    그래서 payload를 지정 인코딩으로 URL 인코딩(urlencode)한 뒤 전송한다.
+    - 기본: EUC-KR (NAVER_CAFE_FORM_ENCODING 환경변수로 변경 가능: euc-kr / cp949 / utf-8)
+    """
     token = _naver_refresh_access_token()
     if not token:
         return False, "NO_ACCESS_TOKEN"
@@ -409,24 +400,40 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
 
     safe_content = (content or "").replace("\r\n", "\n").replace("\r", "\n")
 
+    # 서버측 form 디코딩과 맞추기 위한 URL 인코딩
+    from urllib.parse import urlencode
+
+    form_enc = (os.getenv("NAVER_CAFE_FORM_ENCODING") or "euc-kr").strip().lower()
+    if form_enc in ("euckr", "euc_kr", "euc-kr"):
+        form_enc = "euc-kr"
+    elif form_enc in ("ms949", "cp949"):
+        form_enc = "cp949"
+    elif form_enc in ("utf8", "utf-8"):
+        form_enc = "utf-8"
+    else:
+        # 알 수 없는 값이면 안전하게 EUC-KR
+        form_enc = "euc-kr"
+
+    payload = {"subject": subject, "content": safe_content}
+
     try:
-        enc_subject = _naver_double_urlencode(subject)
-        enc_content = _naver_double_urlencode(safe_content)
-    except Exception as e:
-        return False, f"ENC_EXC:{e}"
+        body_str = urlencode(payload, encoding=form_enc, errors="strict")
+    except Exception:
+        # 일부 문자(이모지 등)가 해당 인코딩에 없으면 replace로 폴백
+        body_str = urlencode(payload, encoding=form_enc, errors="replace")
+
+    body = body_str.encode("ascii", errors="strict")
 
     url = f"https://openapi.naver.com/v1/cafe/{clubid}/menu/{menuid}/articles"
-    body = f"subject={enc_subject}&content={enc_content}".encode("ascii")
-
     headers = {
         "Authorization": f"Bearer {token}",
-        "Content-Type": "application/x-www-form-urlencoded; charset=MS949",
+        "Content-Type": f"application/x-www-form-urlencoded; charset={form_enc.upper()}",
     }
 
     try:
         resp = requests.post(url, headers=headers, data=body, timeout=30)
         if resp.status_code != 200:
-            return False, f"HTTP_{resp.status_code}:{resp.text[:500]}"
+            return False, f"HTTP_{resp.status_code}:{resp.text[:1000]}"
 
         article_id = ""
         try:
@@ -455,6 +462,7 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
         return True, (article_id or "OK")
     except Exception as e:
         return False, f"EXC:{e}"
+
 
 def get_cafe_log_ws():
     """cafe_log 워크시트 반환(없으면 생성 + 헤더 세팅)."""
