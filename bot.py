@@ -409,8 +409,8 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
     """네이버 카페에 글쓰기. (success, articleId_or_error)
 
     한글 깨짐 방지:
-    - 네이버 공식 가이드 예제(자바): URLEncoder.encode(URLEncoder.encode(text,'UTF-8'),'MS949')
-    - 따라서 subject/content를 위 방식으로 이중 URL-인코딩해서 전송
+    - 네이버 카페 글쓰기 API가 폼 인코딩을 MS949(CP949) 기준으로 처리하는 경우가 있어,
+      subject/content를 CP949로 퍼센트 인코딩해 전송한다.
     """
     token = _naver_refresh_access_token()
     if not token:
@@ -430,15 +430,21 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
 
     headers = {
         "Authorization": f"Bearer {token}",
-        "Content-Type": "application/x-www-form-urlencoded",
+        # 네이버 카페 글쓰기 API가 UTF-8을 항상 정상 처리하지 않아,
+        # 폼 데이터를 CP949(MS949) 기준으로 퍼센트 인코딩해서 전송한다.
+        "Content-Type": "application/x-www-form-urlencoded; charset=MS949",
     }
 
     safe_content = (content or "")
-    safe_content = safe_content.replace("\r\n", "\n").replace("\r", "\n")
+    safe_content = safe_content.replace("
+", "
+").replace("", "
+")
 
-    # 네이버 권장 인코딩(UTF-8 → MS949 이중 URL 인코딩)
-    subject_enc = _naver_double_urlencode(subject)
-    content_enc = _naver_double_urlencode(safe_content)
+    # CP949(MS949) 퍼센트 인코딩
+    from urllib.parse import quote_plus
+    subject_enc = quote_plus(subject, encoding="cp949", errors="replace")
+    content_enc = quote_plus(safe_content, encoding="cp949", errors="replace")
 
     body = f"subject={subject_enc}&content={content_enc}"
 
