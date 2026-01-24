@@ -278,14 +278,14 @@ import json
 import time
 
 
-def now_kst() -> datetime.datetime:
+def now_kst() -> datetime:
     """현재 KST(Asia/Seoul) datetime."""
     try:
         from zoneinfo import ZoneInfo
-        return datetime.datetime.now(ZoneInfo("Asia/Seoul"))
+        return datetime.now(ZoneInfo("Asia/Seoul"))
     except Exception:
         # zoneinfo 미지원 환경 대비
-        return datetime.datetime.utcnow() + datetime.timedelta(hours=9)
+        return datetime.utcnow() + timedelta(hours=9)
 import asyncio
 import re
 import requests
@@ -4048,7 +4048,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 
