@@ -1,8 +1,8 @@
 from __future__ import annotations
 from bs4 import BeautifulSoup
-import html
 
 import re as _re_simple
+import html
 from telegram.error import BadRequest
 
 # --- Time helpers ---
@@ -348,16 +348,6 @@ def _naver_menu_id_for_sport(sport: str) -> str:
 def _naver_have_config() -> bool:
     return bool(NAVER_CLIENT_ID and NAVER_CLIENT_SECRET and NAVER_REFRESH_TOKEN and NAVER_CAFE_CLUBID)
 
-
-def _is_naver_cafe_rate_limited(err: str) -> bool:
-    """네이버 카페 글쓰기 연속등록/레이트리밋 감지."""
-    if not err:
-        return False
-    # 보통 HTTP_403 + 메시지에 '연속'/'잠시 후'가 포함됨
-    if err.startswith("HTTP_403") and ("연속" in err or "잠시 후" in err or "등록할 수 없" in err):
-        return True
-    return False
-
 def _naver_refresh_access_token() -> str:
     """refresh_token으로 access_token 갱신(캐시 사용)."""
     now_ts = int(time.time())
@@ -391,29 +381,11 @@ def _naver_refresh_access_token() -> str:
         print(f"[NAVER] token refresh exception: {e}")
         return ""
 
-
-def _naver_double_urlencode(s: str) -> str:
-    """네이버 카페 API 가이드 권장 인코딩:
-    URLEncoder.encode(URLEncoder.encode(text, 'UTF-8'), 'MS949')
-    """
-    s = "" if s is None else str(s)
-    inner = quote(s, safe="", encoding="utf-8", errors="strict")
-    # Python 인코딩 이름은 ms949/cp949 모두 환경에 따라 다를 수 있어 fallback 처리
-    try:
-        outer = quote(inner, safe="", encoding="ms949", errors="strict")
-    except LookupError:
-        outer = quote(inner, safe="", encoding="cp949", errors="strict")
-    return outer
-
 def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tuple[bool, str]:
     """네이버 카페에 글쓰기. (success, articleId_or_error)
 
-    ⚠️ 인코딩 관련
-    - 네이버 카페 글쓰기 API는 환경/계정/서버 상태에 따라 폼 파싱 인코딩이 까다롭게 동작하는 경우가 있음.
-    - 그래서 전송 인코딩을 환경변수로 스위칭 가능하게 해둠.
-
-    환경변수:
-    - NAVER_CAFE_FORM_ENCODING: 기본 'euc-kr' (추천 순서: euc-kr → cp949 → utf-8)
+    네이버 개발자센터 명세에 따라 subject/content는
+    "UTF-8로 URL 인코딩 → MS949(CP949)로 재 URL 인코딩" 값을 전송한다.
     """
     token = _naver_refresh_access_token()
     if not token:
@@ -422,6 +394,7 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
     if not clubid or not menuid:
         return False, "NO_CLUBID_OR_MENUID"
 
+    # subject 길이 제한 대비(너무 길면 잘라냄)
     subject = (subject or "").strip() or "스포츠 분석"
     if len(subject) > 80:
         subject = subject[:80]
@@ -429,48 +402,34 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
     safe_content = (content or "")
     safe_content = safe_content.replace("\r\n", "\n").replace("\r", "\n")
 
-    form_encoding = (os.getenv("NAVER_CAFE_FORM_ENCODING", "euc-kr") or "euc-kr").strip().lower()
-
-    # Content-Type charset 표기 매핑
-    charset_map = {
-        "utf-8": "UTF-8",
-        "cp949": "MS949",
-        "ms949": "MS949",
-        "euc-kr": "EUC-KR",
-        "euckr": "EUC-KR",
-    }
-    charset = charset_map.get(form_encoding, form_encoding.upper())
-
     url = f"https://openapi.naver.com/v1/cafe/{clubid}/menu/{menuid}/articles"
     headers = {
         "Authorization": f"Bearer {token}",
-        "Content-Type": f"application/x-www-form-urlencoded; charset={charset}",
+        "Content-Type": "application/x-www-form-urlencoded",
     }
 
     from urllib.parse import quote_plus
 
-    def enc(v: str) -> str:
+    def double_urlencode(v: str) -> str:
         v = "" if v is None else str(v)
-        # 일부 파이썬 환경에서 euc-kr/cp949 인코딩명이 다를 수 있어 fallback
+        # 1) UTF-8로 1차 URL 인코딩
+        once = quote_plus(v, encoding="utf-8", errors="strict")
+        # 2) MS949(CP949)로 2차 URL 인코딩
+        #    (Java 예제의 URLEncoder.encode(URLEncoder.encode(..., "UTF-8"), "MS949")와 동일한 형태)
         try:
-            return quote_plus(v, encoding=form_encoding, errors="strict")
+            return quote_plus(once, encoding="cp949", errors="strict")
         except LookupError:
-            # cp949로 fallback
-            try:
-                return quote_plus(v, encoding="cp949", errors="strict")
-            except Exception:
-                return quote_plus(v, encoding="utf-8", errors="strict")
-        except UnicodeEncodeError:
-            # 표현 불가 문자는 replace로 넘김
-            return quote_plus(v, encoding=form_encoding, errors="replace")
+            return quote_plus(once, encoding="ms949", errors="strict")
 
-    body = f"subject={enc(subject)}&content={enc(safe_content)}"
+    body = f"subject={double_urlencode(subject)}&content={double_urlencode(safe_content)}"
 
     try:
         resp = requests.post(url, headers=headers, data=body.encode("ascii"), timeout=30)
         if resp.status_code != 200:
-            # 디버깅을 위해 응답을 더 길게 남김(로그 시트에서 확인)
+            # 디버깅을 위해 응답을 더 길게 남김
             return False, f"HTTP_{resp.status_code}:{resp.text[:800]}"
+
+        # 문서상 응답 포맷이 고정되어 있지 않아 안전하게 파싱
         article_id = ""
         try:
             j = resp.json()
@@ -480,6 +439,7 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
                     ("result", "articleid"),
                     ("message", "result", "articleId"),
                     ("message", "result", "articleid"),
+                    ("message", "result", "article_id"),
                 ]:
                     cur = j
                     ok = True
@@ -489,240 +449,16 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
                         else:
                             ok = False
                             break
-                    if ok and cur:
+                    if ok and cur is not None:
                         article_id = str(cur)
                         break
         except Exception:
             pass
+
         return True, article_id or "OK"
+
     except Exception as e:
         return False, f"EXC:{type(e).__name__}:{e}"
-
-def _center_html_content(text: str) -> str:
-    """네이버 카페 본문용: simple 텍스트를 HTML로 감싸 가운데 정렬한다."""
-    t = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-    if not t:
-        return ""
-    safe = html.escape(t)
-    safe = safe.replace("\n", "<br/>")
-    return f'<div style="text-align:center;">{safe}</div>'
-
-
-def get_cafe_log_ws():
-    """cafe_log 워크시트 반환(없으면 생성 + 헤더 세팅)."""
-    client_gs = get_gs_client()
-    spreadsheet_id = os.getenv("SPREADSHEET_ID")
-    if not (client_gs and spreadsheet_id):
-        return None
-    try:
-        sh = client_gs.open_by_key(spreadsheet_id)
-        ws = _get_ws_by_name(sh, CAFE_LOG_SHEET_NAME)
-        if not ws:
-            ws = sh.add_worksheet(title=CAFE_LOG_SHEET_NAME, rows=2000, cols=12)
-        ws.resize(cols=max(12, len(CAFE_LOG_HEADER)))
-        _ensure_header(ws, CAFE_LOG_HEADER)
-        return ws
-    except Exception as e:
-        print(f"[GSHEET] cafe_log ws error: {e}")
-        return None
-
-def _load_posted_src_ids(ws_log) -> set:
-    posted = set()
-    try:
-        vals = ws_log.get_all_values()
-        if not vals or len(vals) <= 1:
-            return posted
-        header = vals[0]
-        try:
-            idx = header.index("src_id")
-        except ValueError:
-            idx = 0
-        for r in vals[1:]:
-            if len(r) > idx and r[idx].strip():
-                posted.add(r[idx].strip())
-    except Exception:
-        pass
-    return posted
-
-
-def _cafe_sport_match(sport_value: str, sport_filter: str) -> bool:
-    """export 시트의 sport 값이 명령어 sport_filter(축구/야구/농구/배구)와 매칭되는지 판정."""
-    sv = (sport_value or "").strip().lower()
-    sf = (sport_filter or "").strip().lower()
-    if not sf:
-        return True
-    # 같은 값이면 바로 통과
-    if sv == sf:
-        return True
-
-    # 명령어 필터별 허용 sport 값(시트에서 쓰는 리그명까지 포함)
-    aliases = {
-        "soccer": {
-            "soccer", "football",
-            "축구", "해외축구", "국내축구", "해축", "국축", "k리그", "k리그1", "k리그2", "k-league", "kleague", "j리그", "j1", "j2", "jleague", "j-league", "j리그1", "j리그2", "epl", "ucl", "uefa", "챔피언스리그", "유로파", "컨퍼런스",
-        },
-        "baseball": {
-            "baseball", "야구",
-            "kbo", "mlb", "npb", "프로야구", "해외야구", "국내야구",
-        },
-        "basketball": {
-            "basketball", "농구",
-            "nba", "kbl", "wkbl", "wnba",
-        },
-        "volleyball": {
-            "volleyball", "배구",
-            "v리그", "vleague", "kovo", "프로배구", "남자배구", "여자배구", "vnl", "avc",
-        },
-    }
-    # sport_filter가 한글로 들어오는 경우도 대비
-    sf_norm = {
-        "축구": "soccer",
-        "야구": "baseball",
-        "농구": "basketball",
-        "배구": "volleyball",
-    }.get(sf, sf)
-
-    allowed = aliases.get(sf_norm, {sf_norm})
-    return sv in allowed
-
-
-async def _cafe_parse_which_arg(context: ContextTypes.DEFAULT_TYPE) -> str:
-    which = "today"
-    args = getattr(context, "args", None) or []
-    if args:
-        a0 = (args[0] or "").strip().lower()
-        if a0 in ("tomorrow", "tmr", "t", "내일"):
-            which = "tomorrow"
-    return which
-
-async def cafe_soccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    which = await _cafe_parse_which_arg(context)
-    return await cafe_post_from_export(update, context, which, sport_filter="soccer")
-
-async def cafe_baseball(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    which = await _cafe_parse_which_arg(context)
-    return await cafe_post_from_export(update, context, which, sport_filter="baseball")
-
-async def cafe_basketball(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    which = await _cafe_parse_which_arg(context)
-    return await cafe_post_from_export(update, context, which, sport_filter="basketball")
-
-async def cafe_volleyball(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    which = await _cafe_parse_which_arg(context)
-    return await cafe_post_from_export(update, context, which, sport_filter="volleyball")
-
-async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TYPE, which: str, sport_filter: str = ""):
-    """export_today/export_tomorrow 내용을 네이버 카페에 업로드."""
-    if not is_admin(update):
-        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
-        return
-
-    if not _naver_have_config():
-        await update.message.reply_text(
-            "네이버 카페 자동 글쓰기 설정이 비어있어. 환경변수에 아래를 넣어줘:\n"
-            "NAVER_CLIENT_ID, NAVER_CLIENT_SECRET, NAVER_REFRESH_TOKEN, NAVER_CAFE_CLUBID, NAVER_CAFE_MENU_ID_SOCCER/BASEBALL/BASKETBALL/VOLLEYBALL (또는 NAVER_CAFE_MENU_MAP/NAVER_CAFE_MENU_ID 폴백)"
-        )
-        return
-
-    sheet_name = EXPORT_TODAY_SHEET_NAME if which == "today" else EXPORT_TOMORROW_SHEET_NAME
-    ws = get_export_ws(sheet_name)
-    ws_log = get_cafe_log_ws()
-    if not ws:
-        await update.message.reply_text(f"{sheet_name} 시트를 못 찾았어.")
-        return
-    if not ws_log:
-        await update.message.reply_text("cafe_log 시트를 준비 못 했어(SPREADSHEET_ID 확인).")
-        return
-
-    vals = ws.get_all_values()
-    if not vals or len(vals) <= 1:
-        await update.message.reply_text(f"{sheet_name}에 업로드할 데이터가 없어.")
-        return
-
-    header = vals[0]
-    def col(name, default=-1):
-        try:
-            return header.index(name)
-        except ValueError:
-            return default
-
-    i_day = col("day", 0)
-    i_sport = col("sport", 1)
-    i_src = col("src_id", 2)
-    i_title = col("title", 3)
-    i_body = col("body", 4)
-    i_created = col("createdAt", 5)
-    i_simple = col("simple", 6)
-
-    posted = _load_posted_src_ids(ws_log)
-
-    to_post = []
-    for r in vals[1:]:
-        sid = (r[i_src].strip() if len(r) > i_src else "")
-        if not sid:
-            continue
-        if sid in posted:
-            continue
-        dayv = r[i_day].strip() if len(r) > i_day else ""
-        sportv = r[i_sport].strip() if len(r) > i_sport else ""
-        if sport_filter and (not _cafe_sport_match(sportv, sport_filter)):
-            continue
-        titlev = r[i_title].strip() if len(r) > i_title else ""
-        bodyv = r[i_body] if len(r) > i_body else ""
-        simplev = r[i_simple].strip() if len(r) > i_simple else ""
-        createdv = r[i_created].strip() if len(r) > i_created else ""
-
-        # content 구성: G열(simple)만 업로드 (가운데 정렬)
-        content = _center_html_content(simplev)
-        if not content:
-            # simple이 비어있으면 업로드 스킵(빈 글 방지)
-            continue
-
-        menuid = _naver_menu_id_for_sport(sport_filter)
-        to_post.append((sid, dayv, sportv, titlev, content, createdv, menuid))
-
-    if not to_post:
-        await update.message.reply_text("업로드할 새 글이 없어(이미 올린 src_id는 제외됨).")
-        return
-
-    ok_cnt, fail_cnt = 0, 0
-    post_delay_sec = float(os.getenv("CAFE_POST_DELAY_SEC", "7"))
-    rate_backoff_sec = float(os.getenv("CAFE_RATE_LIMIT_BACKOFF_SEC", "60"))
-    rate_retries = int(os.getenv("CAFE_RATE_LIMIT_RETRIES", "1"))
-    for (sid, dayv, sportv, titlev, content, createdv, menuid) in to_post:
-        # menuid 미설정이면 스킵
-        if not menuid:
-            fail_cnt += 1
-            ws_log.append_row([sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), "NO_MENU_ID"], value_input_option="RAW", table_range="A1")
-            continue
-
-        subject = titlev or f"{sportv} 분석"
-        success = False
-        info = ""
-        retries_left = rate_retries
-        status_tag = "OK"
-        while True:
-            success, info = _naver_cafe_post(subject=subject, content=content, clubid=NAVER_CAFE_CLUBID, menuid=menuid)
-            if success:
-                ok_cnt += 1
-                ws_log.append_row([sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, info, now_kst().isoformat(), status_tag], value_input_option="RAW", table_range="A1")
-                break
-
-            # 네이버 카페 연속 등록 차단(레이트리밋) 대응: 대기 후 재시도
-            if _is_naver_cafe_rate_limited(info) and retries_left > 0:
-                retries_left -= 1
-                status_tag = "OK_RETRY"
-                await asyncio.sleep(rate_backoff_sec)
-                continue
-
-            fail_cnt += 1
-            ws_log.append_row([sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), info], value_input_option="RAW", table_range="A1")
-            break
-
-        # 너무 빠른 연속 호출 방지(평상시 딜레이)
-        await asyncio.sleep(post_delay_sec)
-
-    await update.message.reply_text(f"카페 업로드 완료: 성공 {ok_cnt} / 실패 {fail_cnt} (중복 src_id는 제외됨)")
 
 
 def _log_httpx_exception(prefix: str, e: Exception) -> None:
@@ -792,7 +528,7 @@ async def _maz_warmup(client: httpx.AsyncClient) -> None:
 
 import math
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlencode, quote
+from urllib.parse import urljoin
 from openai import OpenAI
 
 from telegram import (
