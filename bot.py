@@ -1,3 +1,4 @@
+from __future__ import annotations
 from bs4 import BeautifulSoup
 
 import re as _re_simple
@@ -4080,7 +4081,6 @@ def main():
     _run_tornado_webhook_server(app, TOKEN, APP_URL)
 if __name__ == "__main__":
     main()
-
 
 
 
