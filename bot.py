@@ -1267,6 +1267,11 @@ def get_export_ws(sheet_name: str):
         return None
 
 
+
+
+def get_cafe_log_ws():
+    """cafe_log 워크시트를 반환"""
+    return get_gsheet().worksheet(CAFE_LOG_SHEET_NAME)
 def get_existing_export_src_ids(sheet_name: str) -> set[str]:
     """지정 export 시트에서 src_id 목록을 읽어 중복 저장 방지용 set으로 반환."""
     ws = get_export_ws(sheet_name)
@@ -3928,12 +3933,29 @@ async def export_rollover(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"롤오버 중 오류: {e}")
         return
 
+
+
+async def _tg_error_handler(update, context):
+    """예외 발생 시 로그를 남기고(가능하면) 사용자에게도 안내."""
+    try:
+        err = context.error
+        print("[TG_ERROR]", repr(err))
+        if update is not None and getattr(update, "effective_message", None):
+            msg = f"오류 발생: {type(err).__name__}: {err}"
+            if len(msg) > 350:
+                msg = msg[:350] + "…"
+            await update.effective_message.reply_text(msg)
+    except Exception as e:
+        print("[TG_ERROR_HANDLER_FAIL]", repr(e))
+
 def main():
     reload_analysis_from_sheet()
     reload_news_from_sheet()
 
     app = ApplicationBuilder().token(TOKEN).build()
 
+
+    app.add_error_handler(_tg_error_handler)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
