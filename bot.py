@@ -1,42 +1,3 @@
-
-def _match_export_sport(sport_filter: str, sport_value: str) -> bool:
-    """Return True if a sheet 'sport' cell belongs to the given high-level filter.
-
-    sport_filter: one of {"soccer","baseball","basketball","volleyball"} (case-insensitive)
-    sport_value: value from sheet column B (e.g., "해외축구", "NBA", "KBL", "WKBL", "KBO", "V리그", "J리그", ...)
-    """
-    sf = (sport_filter or "").strip().lower()
-    sv_raw = (sport_value or "").strip()
-    sv = sv_raw.lower()
-
-    if not sf:
-        return True
-    if not sv:
-        return False
-
-    mapping = {
-        # Soccer
-        "soccer": {
-            "해외축구", "국내축구", "j리그", "k리그", "k league", "j league",
-        },
-        # Baseball
-        "baseball": {
-            "야구", "kbo", "mlb", "npb",
-        },
-        # Basketball
-        "basketball": {
-            "농구", "nba", "kbl", "wkbl",
-        },
-        # Volleyball
-        "volleyball": {
-            "배구", "v리그", "v-league", "v league", "kovo",
-        },
-    }
-
-    if sf in mapping:
-        return sv in {x.lower() for x in mapping[sf]}
-    return sv == sf
-
 from __future__ import annotations
 from bs4 import BeautifulSoup
 
@@ -315,100 +276,22 @@ def _normalize_match_date(target_ymd: str, kickoff_raw: str) -> str:
 import os
 import json
 import time
+
+
+def now_kst() -> datetime.datetime:
+    """현재 KST(Asia/Seoul) datetime."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.datetime.now(ZoneInfo("Asia/Seoul"))
+    except Exception:
+        # zoneinfo 미지원 환경 대비
+        return datetime.datetime.utcnow() + datetime.timedelta(hours=9)
 import asyncio
 import re
 import requests
 import httpx
 
-
-import tornado.web
-import tornado.httpserver
-import tornado.ioloop
-from tornado.platform.asyncio import AsyncIOMainLoop
 import traceback
-
-
-# ───────────────── Render Web Server (Webhook + Naver OAuth Callback) ─────────────────
-# Render는 외부에서 접근 가능한 단일 포트(환경변수 PORT)에 HTTP 서버가 떠 있어야 한다.
-# 기존 PTB(app.run_webhook)는 커스텀 라우트를 추가하기가 까다로워서,
-# Tornado로 웹훅(/<TOKEN>) + 네이버 콜백(/naver/callback) + 헬스(/)를 함께 제공한다.
-
-def _build_tornado_app(ptb_app, token: str):
-    class HealthHandler(tornado.web.RequestHandler):
-        def get(self):
-            self.set_header("Content-Type", "text/plain; charset=utf-8")
-            self.write("OK")
-
-    class NaverCallbackHandler(tornado.web.RequestHandler):
-        def get(self):
-            code = self.get_argument("code", default="")
-            state = self.get_argument("state", default="")
-            self.set_header("Content-Type", "text/plain; charset=utf-8")
-            if code:
-                self.write("NAVER OAuth callback received.\n\n")
-                self.write(f"code={code}\n")
-                self.write(f"state={state}\n\n")
-                self.write("이 창은 닫아도 된다. code 값을 복사해서 사용하면 된다.")
-            else:
-                self.write("Missing 'code' parameter.")
-
-    class TelegramWebhookHandler(tornado.web.RequestHandler):
-        def initialize(self, ptb_app):
-            self.ptb_app = ptb_app
-
-        async def post(self):
-            try:
-                payload = self.request.body.decode("utf-8")
-                data = json.loads(payload) if payload else {}
-            except Exception:
-                self.set_status(400)
-                self.write("invalid json")
-                return
-
-            try:
-                from telegram import Update
-                update = Update.de_json(data, self.ptb_app.bot)
-                # PTB Application에 업데이트 전달
-                await self.ptb_app.process_update(update)
-            except Exception:
-                traceback.print_exc()
-            self.set_header("Content-Type", "text/plain; charset=utf-8")
-            self.write("ok")
-
-    # TOKEN은 URL path로 쓰이므로 regex-safe 처리
-    token_path = re.escape(token)
-    return tornado.web.Application([
-        (r"/", HealthHandler),
-        (r"/naver/callback", NaverCallbackHandler),
-        (rf"/{token_path}", TelegramWebhookHandler, dict(ptb_app=ptb_app)),
-    ])
-
-
-def _run_tornado_webhook_server(ptb_app, token: str, app_url: str):
-    """PTB Application을 초기화/시작하고, Tornado 서버를 PORT에 바인딩한다."""
-    AsyncIOMainLoop().install()
-
-    port = int(os.environ.get("PORT", "10000"))
-    web_app = _build_tornado_app(ptb_app, token)
-    server = tornado.httpserver.HTTPServer(web_app)
-    server.listen(port, address="0.0.0.0")
-
-    async def _startup():
-        await ptb_app.initialize()
-        await ptb_app.start()
-        # webhook 설정(네이버 콜백과 무관). APP_URL이 Render 도메인과 정확히 일치해야 한다.
-        await ptb_app.bot.set_webhook(url=f"{app_url}/{token}")
-
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(_startup())
-
-    try:
-        tornado.ioloop.IOLoop.current().start()
-    finally:
-        # 종료 시 정리
-        loop.run_until_complete(ptb_app.stop())
-        loop.run_until_complete(ptb_app.shutdown())
-
 # ───────────────── 네이버 카페 자동 글쓰기 (추후: '네이버 카페 자동 글쓰기') ─────────────────
 # 공식 문서:
 # - 네이버 로그인 토큰 발급/갱신: https://nid.naver.com/oauth2.0/token
@@ -588,6 +471,49 @@ def _load_posted_src_ids(ws_log) -> set:
         pass
     return posted
 
+def _match_export_sport(sport_value: str, sport_filter: str) -> bool:
+    """export 시트 sport 값(NBA/KBL/해외축구/국내축구/J리그 등)을 sport_filter(basketball/soccer/baseball/volleyball)에 매칭."""
+    sf = (sport_filter or "").strip().lower()
+    sv_raw = (sport_value or "").strip()
+    sv = sv_raw.lower()
+
+    if not sf:
+        return True
+
+    if sf == "basketball":
+        return (sv in {"nba","kbl","wkbl","wnba","ncaab","ncaawb"} or "농구" in sv)
+
+    if sf == "baseball":
+        return (sv in {"kbo","mlb","npb","cpbl"} or "야구" in sv)
+
+    if sf == "volleyball":
+        return (sv in {"v리그","v-league","kovo"} or "배구" in sv)
+
+    if sf == "soccer":
+        # export_tomorrow에 들어오는 값: 해외축구/국내축구/J리그 등 + 리그명이 직접 들어올 수도 있음
+        soccer_keywords = ["축구","epl","k리그","j리그","챔피언스","유로파","라리가","세리에","분데스","리그앙","ucl","uel"]
+        return any(k in sv for k in soccer_keywords)
+
+    # 알 수 없는 필터면 통과(안전)
+    return True
+
+
+def _infer_sport_key_from_export(sport_value: str) -> str:
+    """export 시트 sport 값을 네이버 카페 메뉴키(soccer/baseball/basketball/volleyball)로 추론."""
+    sv = (sport_value or "").strip().lower()
+    if not sv:
+        return ""
+    if _match_export_sport(sport_value, "basketball"):
+        return "basketball"
+    if _match_export_sport(sport_value, "baseball"):
+        return "baseball"
+    if _match_export_sport(sport_value, "volleyball"):
+        return "volleyball"
+    if _match_export_sport(sport_value, "soccer"):
+        return "soccer"
+    return ""
+
+
 async def _cafe_parse_which_arg(context: ContextTypes.DEFAULT_TYPE) -> str:
     which = "today"
     args = getattr(context, "args", None) or []
@@ -667,7 +593,7 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
             continue
         dayv = r[i_day].strip() if len(r) > i_day else ""
         sportv = r[i_sport].strip() if len(r) > i_sport else ""
-        if sport_filter and (not _match_export_sport(sport_filter, sportv)):
+        if sport_filter and (not _match_export_sport(sportv, sport_filter)):
             continue
         titlev = r[i_title].strip() if len(r) > i_title else ""
         bodyv = r[i_body] if len(r) > i_body else ""
@@ -681,7 +607,8 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             content = bodyv or ""
 
-        menuid = _naver_menu_id_for_sport(sportv)
+        sport_key = (sport_filter.strip().lower() if sport_filter else _infer_sport_key_from_export(sportv))
+        menuid = _naver_menu_id_for_sport(sport_key)
         to_post.append((sid, dayv, sportv, titlev, content, createdv, menuid))
 
     if not to_post:
@@ -788,14 +715,7 @@ from telegram import (
     InlineKeyboardMarkup,
 )
 
-from datetime import datetime, timedelta, date, timezone
-
-
-KST = timezone(timedelta(hours=9))
-
-def now_kst() -> datetime:
-    """Return timezone-aware KST datetime."""
-    return datetime.now(KST)
+from datetime import datetime, timedelta, date
 
 from telegram.ext import (
     ApplicationBuilder,
@@ -4116,8 +4036,16 @@ def main():
 
 
     app.add_handler(CallbackQueryHandler(on_callback))
-    # Webhook(/<TOKEN>) + /naver/callback 라우트를 함께 제공
-    _run_tornado_webhook_server(app, TOKEN, APP_URL)
+
+    port = int(os.environ.get("PORT", "10000"))
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=TOKEN,
+        webhook_url=f"{APP_URL}/{TOKEN}",
+    )
+
+
 if __name__ == "__main__":
     main()
 
