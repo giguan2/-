@@ -382,21 +382,19 @@ def _naver_refresh_access_token() -> str:
         return ""
 
 def _naver_double_urlencode(value: str) -> str:
-    """
-    Naver Cafe Write API 가이드/포럼에서 안내하는 한글 처리 방식:
-    1) UTF-8로 URL 인코딩(URLEncoder: 공백은 +)
-    2) 그 결과 문자열을 MS949로 다시 URL 인코딩
-    최종 결과는 ASCII(%,0-9,A-F,+)만 포함.
-    """
-    from urllib.parse import quote_plus
-
-    value = value or ""
-    once = quote_plus(value, safe="", encoding="utf-8", errors="strict")
-    twice = quote_plus(once, safe="", encoding="cp949", errors="strict")
-    return twice
+    """(Deprecated) Kept for backward compatibility; not used."""
+    return value or ""
 
 def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tuple[bool, str]:
-    """네이버 카페에 글쓰기. (success, articleId_or_error)"""
+    """네이버 카페에 글쓰기. (success, articleId_or_error)
+
+    ✅ 한글 깨짐 방지 포인트:
+    - requests에 dict를 넘기면 보통 UTF-8 기준으로 인코딩되는데,
+      네이버 카페 글쓰기 API는 서버 측 폼 디코딩이 MS949/CP949 계열로 동작하는 경우가 많아
+      업로드는 성공해도 한글이 깨질 수 있음.
+    - 그래서 payload를 직접 application/x-www-form-urlencoded 형태로 만들고,
+      urlencode(encoding='cp949')로 퍼센트 인코딩된 ASCII 문자열을 만들어 전송한다.
+    """
     token = _naver_refresh_access_token()
     if not token:
         return False, "NO_ACCESS_TOKEN"
@@ -409,53 +407,34 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
 
     safe_content = (content or "").replace("\r\n", "\n").replace("\r", "\n")
 
+    url = f"https://openapi.naver.com/v1/cafe/{clubid}/menu/{menuid}/articles"
+
+    from urllib.parse import urlencode
+
     try:
-        enc_subject = _naver_double_urlencode(subject)
-        enc_content = _naver_double_urlencode(safe_content)
+        # cp949(MS949) 기준으로 percent-encoding된 ASCII 바디 생성
+        body_str = urlencode(
+            {"subject": subject, "content": safe_content},
+            encoding="cp949",
+            errors="strict",
+        )
     except Exception as e:
         return False, f"ENC_EXC:{e}"
 
-    url = f"https://openapi.naver.com/v1/cafe/{clubid}/menu/{menuid}/articles"
-    postParams = f"subject={enc_subject}&content={enc_content}"
-    body = postParams.encode("ascii", errors="strict")
-
     headers = {
         "Authorization": f"Bearer {token}",
+        # charset 강제 지정은 서버 파싱과 충돌하는 경우가 있어 생략
         "Content-Type": "application/x-www-form-urlencoded",
     }
 
     try:
-        resp = requests.post(url, headers=headers, data=body, timeout=30)
+        resp = requests.post(url, headers=headers, data=body_str.encode("ascii"), timeout=30)
         if resp.status_code != 200:
             return False, f"HTTP_{resp.status_code}:{resp.text[:500]}"
-
-        article_id = ""
-        try:
-            j = resp.json()
-            if isinstance(j, dict):
-                for key_path in [
-                    ("result", "articleId"),
-                    ("result", "articleid"),
-                    ("message", "result", "articleId"),
-                    ("message", "result", "articleid"),
-                ]:
-                    cur = j
-                    ok = True
-                    for k in key_path:
-                        if isinstance(cur, dict) and k in cur:
-                            cur = cur[k]
-                        else:
-                            ok = False
-                            break
-                    if ok and cur:
-                        article_id = str(cur)
-                        break
-        except Exception:
-            pass
-
-        return True, (article_id or "OK")
+        return True, "OK"
     except Exception as e:
-        return False, f"EXC:{e}"
+        return False, f"REQ_EXC:{e}"
+
 
 def get_cafe_log_ws():
     """cafe_log 워크시트 반환(없으면 생성 + 헤더 세팅)."""
