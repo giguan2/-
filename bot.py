@@ -1,3 +1,42 @@
+
+def _match_export_sport(sport_filter: str, sport_value: str) -> bool:
+    """Return True if a sheet 'sport' cell belongs to the given high-level filter.
+
+    sport_filter: one of {"soccer","baseball","basketball","volleyball"} (case-insensitive)
+    sport_value: value from sheet column B (e.g., "해외축구", "NBA", "KBL", "WKBL", "KBO", "V리그", "J리그", ...)
+    """
+    sf = (sport_filter or "").strip().lower()
+    sv_raw = (sport_value or "").strip()
+    sv = sv_raw.lower()
+
+    if not sf:
+        return True
+    if not sv:
+        return False
+
+    mapping = {
+        # Soccer
+        "soccer": {
+            "해외축구", "국내축구", "j리그", "k리그", "k league", "j league",
+        },
+        # Baseball
+        "baseball": {
+            "야구", "kbo", "mlb", "npb",
+        },
+        # Basketball
+        "basketball": {
+            "농구", "nba", "kbl", "wkbl",
+        },
+        # Volleyball
+        "volleyball": {
+            "배구", "v리그", "v-league", "v league", "kovo",
+        },
+    }
+
+    if sf in mapping:
+        return sv in {x.lower() for x in mapping[sf]}
+    return sv == sf
+
 from __future__ import annotations
 from bs4 import BeautifulSoup
 
@@ -628,7 +667,7 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
             continue
         dayv = r[i_day].strip() if len(r) > i_day else ""
         sportv = r[i_sport].strip() if len(r) > i_sport else ""
-        if sport_filter and sportv.strip().lower() != sport_filter.strip().lower():
+        if sport_filter and (not _match_export_sport(sport_filter, sportv)):
             continue
         titlev = r[i_title].strip() if len(r) > i_title else ""
         bodyv = r[i_body] if len(r) > i_body else ""
