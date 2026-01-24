@@ -1,18 +1,7 @@
-from __future__ import annotations
 from bs4 import BeautifulSoup
 
 import re as _re_simple
 from telegram.error import BadRequest
-
-# --- Time helpers ---
-from datetime import datetime, timedelta, timezone
-
-KST = timezone(timedelta(hours=9))
-
-def now_kst() -> datetime:
-    """Return timezone-aware KST datetime."""
-    return datetime.now(KST)
-
 
 def extract_simple_from_body(body: str) -> str:
     """서술형 body에서 '핵심 포인트 요약'을 한 줄로 압축해 반환.
@@ -291,7 +280,95 @@ import re
 import requests
 import httpx
 
+
+import tornado.web
+import tornado.httpserver
+import tornado.ioloop
+from tornado.platform.asyncio import AsyncIOMainLoop
 import traceback
+
+
+# ───────────────── Render Web Server (Webhook + Naver OAuth Callback) ─────────────────
+# Render는 외부에서 접근 가능한 단일 포트(환경변수 PORT)에 HTTP 서버가 떠 있어야 한다.
+# 기존 PTB(app.run_webhook)는 커스텀 라우트를 추가하기가 까다로워서,
+# Tornado로 웹훅(/<TOKEN>) + 네이버 콜백(/naver/callback) + 헬스(/)를 함께 제공한다.
+
+def _build_tornado_app(ptb_app, token: str):
+    class HealthHandler(tornado.web.RequestHandler):
+        def get(self):
+            self.set_header("Content-Type", "text/plain; charset=utf-8")
+            self.write("OK")
+
+    class NaverCallbackHandler(tornado.web.RequestHandler):
+        def get(self):
+            code = self.get_argument("code", default="")
+            state = self.get_argument("state", default="")
+            self.set_header("Content-Type", "text/plain; charset=utf-8")
+            if code:
+                self.write("NAVER OAuth callback received.\n\n")
+                self.write(f"code={code}\n")
+                self.write(f"state={state}\n\n")
+                self.write("이 창은 닫아도 된다. code 값을 복사해서 사용하면 된다.")
+            else:
+                self.write("Missing 'code' parameter.")
+
+    class TelegramWebhookHandler(tornado.web.RequestHandler):
+        def initialize(self, ptb_app):
+            self.ptb_app = ptb_app
+
+        async def post(self):
+            try:
+                payload = self.request.body.decode("utf-8")
+                data = json.loads(payload) if payload else {}
+            except Exception:
+                self.set_status(400)
+                self.write("invalid json")
+                return
+
+            try:
+                from telegram import Update
+                update = Update.de_json(data, self.ptb_app.bot)
+                # PTB Application에 업데이트 전달
+                await self.ptb_app.process_update(update)
+            except Exception:
+                traceback.print_exc()
+            self.set_header("Content-Type", "text/plain; charset=utf-8")
+            self.write("ok")
+
+    # TOKEN은 URL path로 쓰이므로 regex-safe 처리
+    token_path = re.escape(token)
+    return tornado.web.Application([
+        (r"/", HealthHandler),
+        (r"/naver/callback", NaverCallbackHandler),
+        (rf"/{token_path}", TelegramWebhookHandler, dict(ptb_app=ptb_app)),
+    ])
+
+
+def _run_tornado_webhook_server(ptb_app, token: str, app_url: str):
+    """PTB Application을 초기화/시작하고, Tornado 서버를 PORT에 바인딩한다."""
+    AsyncIOMainLoop().install()
+
+    port = int(os.environ.get("PORT", "10000"))
+    web_app = _build_tornado_app(ptb_app, token)
+    server = tornado.httpserver.HTTPServer(web_app)
+    server.listen(port, address="0.0.0.0")
+
+    async def _startup():
+        await ptb_app.initialize()
+        await ptb_app.start()
+        # webhook 설정(네이버 콜백과 무관). APP_URL이 Render 도메인과 정확히 일치해야 한다.
+        await ptb_app.bot.set_webhook(url=f"{app_url}/{token}")
+
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(_startup())
+
+    try:
+        tornado.ioloop.IOLoop.current().start()
+    finally:
+        # 종료 시 정리
+        loop.run_until_complete(ptb_app.stop())
+        loop.run_until_complete(ptb_app.shutdown())
+
 # ───────────────── 네이버 카페 자동 글쓰기 (추후: '네이버 카페 자동 글쓰기') ─────────────────
 # 공식 문서:
 # - 네이버 로그인 토큰 발급/갱신: https://nid.naver.com/oauth2.0/token
@@ -471,48 +548,6 @@ def _load_posted_src_ids(ws_log) -> set:
         pass
     return posted
 
-
-def _cafe_sport_match(sport_value: str, sport_filter: str) -> bool:
-    """export 시트의 sport 값이 명령어 sport_filter(축구/야구/농구/배구)와 매칭되는지 판정."""
-    sv = (sport_value or "").strip().lower()
-    sf = (sport_filter or "").strip().lower()
-    if not sf:
-        return True
-    # 같은 값이면 바로 통과
-    if sv == sf:
-        return True
-
-    # 명령어 필터별 허용 sport 값(시트에서 쓰는 리그명까지 포함)
-    aliases = {
-        "soccer": {
-            "soccer", "football",
-            "축구", "해외축구", "국내축구", "해축", "국축", "k리그", "k리그1", "k리그2", "k-league", "kleague", "epl", "ucl", "uefa", "챔피언스리그", "유로파", "컨퍼런스",
-        },
-        "baseball": {
-            "baseball", "야구",
-            "kbo", "mlb", "npb", "프로야구", "해외야구", "국내야구",
-        },
-        "basketball": {
-            "basketball", "농구",
-            "nba", "kbl", "wkbl", "wnba",
-        },
-        "volleyball": {
-            "volleyball", "배구",
-            "v리그", "vleague", "kovo", "프로배구", "남자배구", "여자배구", "vnl", "avc",
-        },
-    }
-    # sport_filter가 한글로 들어오는 경우도 대비
-    sf_norm = {
-        "축구": "soccer",
-        "야구": "baseball",
-        "농구": "basketball",
-        "배구": "volleyball",
-    }.get(sf, sf)
-
-    allowed = aliases.get(sf_norm, {sf_norm})
-    return sv in allowed
-
-
 async def _cafe_parse_which_arg(context: ContextTypes.DEFAULT_TYPE) -> str:
     which = "today"
     args = getattr(context, "args", None) or []
@@ -592,7 +627,7 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
             continue
         dayv = r[i_day].strip() if len(r) > i_day else ""
         sportv = r[i_sport].strip() if len(r) > i_sport else ""
-        if sport_filter and (not _cafe_sport_match(sportv, sport_filter)):
+        if sport_filter and sportv.strip().lower() != sport_filter.strip().lower():
             continue
         titlev = r[i_title].strip() if len(r) > i_title else ""
         bodyv = r[i_body] if len(r) > i_body else ""
@@ -606,7 +641,7 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             content = bodyv or ""
 
-        menuid = _naver_menu_id_for_sport(sport_filter)
+        menuid = _naver_menu_id_for_sport(sportv)
         to_post.append((sid, dayv, sportv, titlev, content, createdv, menuid))
 
     if not to_post:
@@ -618,17 +653,17 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
         # menuid 미설정이면 스킵
         if not menuid:
             fail_cnt += 1
-            ws_log.append_row([sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), "NO_MENU_ID"], value_input_option="RAW", table_range="A1")
+            ws_log.append_row([sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), "NO_MENU_ID"], value_input_option="RAW")
             continue
 
         subject = titlev or f"{sportv} 분석"
         success, info = _naver_cafe_post(subject=subject, content=content, clubid=NAVER_CAFE_CLUBID, menuid=menuid)
         if success:
             ok_cnt += 1
-            ws_log.append_row([sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, info, now_kst().isoformat(), "OK"], value_input_option="RAW", table_range="A1")
+            ws_log.append_row([sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, info, now_kst().isoformat(), "OK"], value_input_option="RAW")
         else:
             fail_cnt += 1
-            ws_log.append_row([sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), info], value_input_option="RAW", table_range="A1")
+            ws_log.append_row([sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), info], value_input_option="RAW")
 
         # 너무 빠른 연속 호출 방지
         await asyncio.sleep(0.3)
@@ -713,7 +748,14 @@ from telegram import (
     InlineKeyboardMarkup,
 )
 
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
+
+
+KST = timezone(timedelta(hours=9))
+
+def now_kst() -> datetime:
+    """Return timezone-aware KST datetime."""
+    return datetime.now(KST)
 
 from telegram.ext import (
     ApplicationBuilder,
@@ -1180,7 +1222,7 @@ def append_analysis_rows(day_key: str, rows: list[list[str]]) -> bool:
         return False
 
     try:
-        ws.append_rows(rows, value_input_option="RAW", table_range="A1")
+        ws.append_rows(rows, value_input_option="RAW")
         print(f"[GSHEET][ANALYSIS] {sheet_name} 에 {len(rows)}건 추가")
         return True
     except Exception as e:
@@ -1285,7 +1327,7 @@ def append_site_export_rows(rows: list[list[str]]) -> bool:
                 rr.append(extract_simple_from_body(rr[4] if len(rr) > 4 else ""))
             fixed_rows.append(rr)
         rows = fixed_rows
-        ws.append_rows(rows, value_input_option="RAW", table_range="A1")
+        ws.append_rows(rows, value_input_option="RAW")
         print(f"[GSHEET][SITE_EXPORT] {SITE_EXPORT_SHEET_NAME} 에 {len(rows)}건 추가")
         return True
     except Exception as e:
@@ -1367,7 +1409,7 @@ def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
     rows = fixed_rows
 
     try:
-        ws.append_rows(rows, value_input_option="RAW", table_range="A1")
+        ws.append_rows(rows, value_input_option="RAW")
         return True
     except Exception as e:
         print(f"[GSHEET][EXPORT] append 실패({sheet_name}): {e}")
@@ -3025,7 +3067,7 @@ async def crawl_daum_news_common(
         ])
 
     try:
-        ws.append_rows(rows_to_append, value_input_option="RAW", table_range="A1")
+        ws.append_rows(rows_to_append, value_input_option="RAW")
     except Exception as e:
         await update.message.reply_text(f"시트 쓰기 오류: {e}")
         return
@@ -3960,7 +4002,7 @@ async def export_rollover(update: Update, context: ContextTypes.DEFAULT_TYPE):
             today_ws.update(values=[EXPORT_HEADER], range_name="A1")
 
         if to_move:
-            today_ws.append_rows(to_move, value_input_option="RAW", table_range="A1")
+            today_ws.append_rows(to_move, value_input_option="RAW")
 
         # export_tomorrow 초기화(헤더만)
         tomo_ws.clear()
@@ -4034,18 +4076,11 @@ def main():
 
 
     app.add_handler(CallbackQueryHandler(on_callback))
-
-    port = int(os.environ.get("PORT", "10000"))
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=port,
-        url_path=TOKEN,
-        webhook_url=f"{APP_URL}/{TOKEN}",
-    )
-
-
+    # Webhook(/<TOKEN>) + /naver/callback 라우트를 함께 제공
+    _run_tornado_webhook_server(app, TOKEN, APP_URL)
 if __name__ == "__main__":
     main()
+
 
 
 
