@@ -381,14 +381,22 @@ def _naver_refresh_access_token() -> str:
         print(f"[NAVER] token refresh exception: {e}")
         return ""
 
-def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tuple[bool, str]:
-    """네이버 카페에 글쓰기. (success, articleId_or_error)
-
-    ✅ 한글 깨짐(시트는 정상인데 카페에서 깨짐) 해결:
-    네이버 카페 글쓰기 API는 subject/content를 'UTF-8로 1차 URL 인코딩' 후,
-    그 결과 문자열을 다시 'MS949(CP949)로 2차 URL 인코딩'해서 보내는 방식이
-    가장 안정적으로 동작하는 케이스가 많다. (네이버 개발자센터 예제 방식)
+def _naver_double_urlencode(value: str) -> str:
     """
+    Naver Cafe Write API 가이드/포럼에서 안내하는 한글 처리 방식:
+    1) UTF-8로 URL 인코딩(URLEncoder: 공백은 +)
+    2) 그 결과 문자열을 MS949로 다시 URL 인코딩
+    최종 결과는 ASCII(%,0-9,A-F,+)만 포함.
+    """
+    from urllib.parse import quote_plus
+
+    value = value or ""
+    once = quote_plus(value, safe="", encoding="utf-8", errors="strict")
+    twice = quote_plus(once, safe="", encoding="cp949", errors="strict")
+    return twice
+
+def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tuple[bool, str]:
+    """네이버 카페에 글쓰기. (success, articleId_or_error)"""
     token = _naver_refresh_access_token()
     if not token:
         return False, "NO_ACCESS_TOKEN"
@@ -401,39 +409,25 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
 
     safe_content = (content or "").replace("\r\n", "\n").replace("\r", "\n")
 
-    from urllib.parse import quote_plus
-
-    def _double_urlencode(val: str) -> str:
-        # 1) UTF-8 URL-encode
-        try:
-            step1 = quote_plus(val, encoding="utf-8", errors="strict")
-        except Exception:
-            step1 = quote_plus(val, encoding="utf-8", errors="replace")
-
-        # 2) MS949(CP949) URL-encode the encoded string
-        try:
-            step2 = quote_plus(step1, encoding="cp949", errors="strict")
-        except Exception:
-            step2 = quote_plus(step1, encoding="cp949", errors="replace")
-        return step2
-
-    subj_enc = _double_urlencode(subject)
-    cont_enc = _double_urlencode(safe_content)
-
-    body_str = f"subject={subj_enc}&content={cont_enc}"
-    body = body_str.encode("ascii", errors="strict")
+    try:
+        enc_subject = _naver_double_urlencode(subject)
+        enc_content = _naver_double_urlencode(safe_content)
+    except Exception as e:
+        return False, f"ENC_EXC:{e}"
 
     url = f"https://openapi.naver.com/v1/cafe/{clubid}/menu/{menuid}/articles"
+    postParams = f"subject={enc_subject}&content={enc_content}"
+    body = postParams.encode("ascii", errors="strict")
+
     headers = {
         "Authorization": f"Bearer {token}",
-        # 네이버 예제는 주로 기본 form 전송이지만, charset을 명시하면 일부 환경에서 도움이 됨
-        "Content-Type": "application/x-www-form-urlencoded; charset=MS949",
+        "Content-Type": "application/x-www-form-urlencoded",
     }
 
     try:
         resp = requests.post(url, headers=headers, data=body, timeout=30)
         if resp.status_code != 200:
-            return False, f"HTTP_{resp.status_code}:{resp.text[:1000]}"
+            return False, f"HTTP_{resp.status_code}:{resp.text[:500]}"
 
         article_id = ""
         try:
@@ -453,15 +447,16 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
                         else:
                             ok = False
                             break
-                    if ok and cur is not None:
+                    if ok and cur:
                         article_id = str(cur)
                         break
         except Exception:
-            article_id = ""
+            pass
 
         return True, (article_id or "OK")
     except Exception as e:
-        return False, f"EXC:{type(e).__name__}:{e}"
+        return False, f"EXC:{e}"
+
 def get_cafe_log_ws():
     """cafe_log 워크시트 반환(없으면 생성 + 헤더 세팅)."""
     client_gs = get_gs_client()
