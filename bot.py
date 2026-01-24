@@ -392,8 +392,26 @@ def _naver_refresh_access_token() -> str:
         return ""
 
 
+def _naver_double_urlencode(s: str) -> str:
+    """네이버 카페 API 가이드 권장 인코딩:
+    URLEncoder.encode(URLEncoder.encode(text, 'UTF-8'), 'MS949')
+    """
+    s = "" if s is None else str(s)
+    inner = quote(s, safe="", encoding="utf-8", errors="strict")
+    # Python 인코딩 이름은 ms949/cp949 모두 환경에 따라 다를 수 있어 fallback 처리
+    try:
+        outer = quote(inner, safe="", encoding="ms949", errors="strict")
+    except LookupError:
+        outer = quote(inner, safe="", encoding="cp949", errors="strict")
+    return outer
+
 def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tuple[bool, str]:
-    """네이버 카페에 글쓰기. (success, articleId_or_error)"""
+    """네이버 카페에 글쓰기. (success, articleId_or_error)
+
+    한글 깨짐 방지:
+    - 네이버 공식 가이드 예제(자바): URLEncoder.encode(URLEncoder.encode(text,'UTF-8'),'MS949')
+    - 따라서 subject/content를 위 방식으로 이중 URL-인코딩해서 전송
+    """
     token = _naver_refresh_access_token()
     if not token:
         return False, "NO_ACCESS_TOKEN"
@@ -410,21 +428,23 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
 
     url = f"https://openapi.naver.com/v1/cafe/{clubid}/menu/{menuid}/articles"
 
-    # 인코딩 깨짐 방지: charset 명시 + utf-8 urlencode
     headers = {
         "Authorization": f"Bearer {token}",
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Content-Type": "application/x-www-form-urlencoded",
     }
 
     safe_content = (content or "")
-    # 줄바꿈 정규화
     safe_content = safe_content.replace("\r\n", "\n").replace("\r", "\n")
 
-    payload = {"subject": subject, "content": safe_content}
+    # 네이버 권장 인코딩(UTF-8 → MS949 이중 URL 인코딩)
+    subject_enc = _naver_double_urlencode(subject)
+    content_enc = _naver_double_urlencode(safe_content)
+
+    body = f"subject={subject_enc}&content={content_enc}"
 
     try:
-        body = urlencode(payload, encoding="utf-8")
-        resp = requests.post(url, headers=headers, data=body.encode("utf-8"), timeout=30)
+        # body는 %xx 형태의 ASCII로 구성되므로 ascii로 인코딩해 전송
+        resp = requests.post(url, headers=headers, data=body.encode("ascii"), timeout=30)
         if resp.status_code != 200:
             return False, f"HTTP_{resp.status_code}:{resp.text[:300]}"
 
@@ -432,7 +452,6 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
         article_id = ""
         try:
             j = resp.json()
-            # 흔히 result/articleId 또는 message.result.articleId 형태
             if isinstance(j, dict):
                 for key_path in [
                     ("result", "articleId"),
@@ -452,12 +471,11 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
                         article_id = str(cur)
                         break
         except Exception:
-            pass
+            article_id = ""
 
-        return True, (article_id or "OK")
+        return True, article_id or "OK"
     except Exception as e:
-        return False, f"EXC:{e}"
-
+        return False, f"EXC:{type(e).__name__}:{e}"
 
 def _center_html_content(text: str) -> str:
     """네이버 카페 본문용: simple 텍스트를 HTML로 감싸 가운데 정렬한다."""
@@ -753,7 +771,7 @@ async def _maz_warmup(client: httpx.AsyncClient) -> None:
 
 import math
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlencode
+from urllib.parse import urljoin, urlencode, quote
 from openai import OpenAI
 
 from telegram import (
