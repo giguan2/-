@@ -408,9 +408,12 @@ def _naver_double_urlencode(s: str) -> str:
 def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tuple[bool, str]:
     """네이버 카페에 글쓰기. (success, articleId_or_error)
 
-    한글 깨짐 방지:
-    - 네이버 카페 글쓰기 API가 폼 인코딩을 MS949(CP949) 기준으로 처리하는 경우가 있어,
-      subject/content를 CP949로 퍼센트 인코딩해 전송한다.
+    ⚠️ 인코딩 관련
+    - 네이버 카페 글쓰기 API는 환경/계정/서버 상태에 따라 폼 파싱 인코딩이 까다롭게 동작하는 경우가 있음.
+    - 그래서 전송 인코딩을 환경변수로 스위칭 가능하게 해둠.
+
+    환경변수:
+    - NAVER_CAFE_FORM_ENCODING: 기본 'euc-kr' (추천 순서: euc-kr → cp949 → utf-8)
     """
     token = _naver_refresh_access_token()
     if not token:
@@ -419,39 +422,55 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
     if not clubid or not menuid:
         return False, "NO_CLUBID_OR_MENUID"
 
-    # subject 길이 제한 대비(너무 길면 잘라냄)
-    subject = (subject or "").strip()
-    if not subject:
-        subject = "스포츠 분석"
+    subject = (subject or "").strip() or "스포츠 분석"
     if len(subject) > 80:
         subject = subject[:80]
-
-    url = f"https://openapi.naver.com/v1/cafe/{clubid}/menu/{menuid}/articles"
-
-    headers = {
-        "Authorization": f"Bearer {token}",
-        # 네이버 카페 글쓰기 API가 UTF-8을 항상 정상 처리하지 않아,
-        # 폼 데이터를 CP949(MS949) 기준으로 퍼센트 인코딩해서 전송한다.
-        "Content-Type": "application/x-www-form-urlencoded; charset=MS949",
-    }
 
     safe_content = (content or "")
     safe_content = safe_content.replace("\r\n", "\n").replace("\r", "\n")
 
-    # CP949(MS949) 퍼센트 인코딩
-    from urllib.parse import quote_plus
-    subject_enc = quote_plus(subject, encoding="cp949", errors="replace")
-    content_enc = quote_plus(safe_content, encoding="cp949", errors="replace")
+    form_encoding = (os.getenv("NAVER_CAFE_FORM_ENCODING", "euc-kr") or "euc-kr").strip().lower()
 
-    body = f"subject={subject_enc}&content={content_enc}"
+    # Content-Type charset 표기 매핑
+    charset_map = {
+        "utf-8": "UTF-8",
+        "cp949": "MS949",
+        "ms949": "MS949",
+        "euc-kr": "EUC-KR",
+        "euckr": "EUC-KR",
+    }
+    charset = charset_map.get(form_encoding, form_encoding.upper())
+
+    url = f"https://openapi.naver.com/v1/cafe/{clubid}/menu/{menuid}/articles"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": f"application/x-www-form-urlencoded; charset={charset}",
+    }
+
+    from urllib.parse import quote_plus
+
+    def enc(v: str) -> str:
+        v = "" if v is None else str(v)
+        # 일부 파이썬 환경에서 euc-kr/cp949 인코딩명이 다를 수 있어 fallback
+        try:
+            return quote_plus(v, encoding=form_encoding, errors="strict")
+        except LookupError:
+            # cp949로 fallback
+            try:
+                return quote_plus(v, encoding="cp949", errors="strict")
+            except Exception:
+                return quote_plus(v, encoding="utf-8", errors="strict")
+        except UnicodeEncodeError:
+            # 표현 불가 문자는 replace로 넘김
+            return quote_plus(v, encoding=form_encoding, errors="replace")
+
+    body = f"subject={enc(subject)}&content={enc(safe_content)}"
 
     try:
-        # body는 %xx 형태의 ASCII로 구성되므로 ascii로 인코딩해 전송
         resp = requests.post(url, headers=headers, data=body.encode("ascii"), timeout=30)
         if resp.status_code != 200:
-            return False, f"HTTP_{resp.status_code}:{resp.text[:300]}"
-
-        # 문서상 응답 포맷이 고정되어 있지 않아 안전하게 파싱
+            # 디버깅을 위해 응답을 더 길게 남김(로그 시트에서 확인)
+            return False, f"HTTP_{resp.status_code}:{resp.text[:800]}"
         article_id = ""
         try:
             j = resp.json()
@@ -474,8 +493,7 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
                         article_id = str(cur)
                         break
         except Exception:
-            article_id = ""
-
+            pass
         return True, article_id or "OK"
     except Exception as e:
         return False, f"EXC:{type(e).__name__}:{e}"
