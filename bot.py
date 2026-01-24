@@ -4,6 +4,16 @@ from bs4 import BeautifulSoup
 import re as _re_simple
 from telegram.error import BadRequest
 
+# --- Time helpers ---
+from datetime import datetime, timedelta, timezone
+
+KST = timezone(timedelta(hours=9))
+
+def now_kst() -> datetime:
+    """Return timezone-aware KST datetime."""
+    return datetime.now(KST)
+
+
 def extract_simple_from_body(body: str) -> str:
     """서술형 body에서 '핵심 포인트 요약'을 한 줄로 압축해 반환.
     - [핵심 포인트 요약] / 핵심 포인트 요약 / 핵심포인트요약 등 다양한 표기 지원
@@ -276,17 +286,6 @@ def _normalize_match_date(target_ymd: str, kickoff_raw: str) -> str:
 import os
 import json
 import time
-
-
-def now_kst() -> datetime:
-    """Return current time in Asia/Seoul as a timezone-aware datetime when possible."""
-    try:
-        from zoneinfo import ZoneInfo
-        return datetime.now(ZoneInfo("Asia/Seoul"))
-    except Exception:
-        # Fallback (naive UTC + 9h) for environments without zoneinfo
-        return datetime.utcnow() + timedelta(hours=9)
-
 import asyncio
 import re
 import requests
@@ -367,7 +366,7 @@ def _naver_refresh_access_token() -> str:
     }
     try:
         r = requests.get(url, params=params, timeout=20)
-        if r.status_code != 200:
+        if not (200 <= r.status_code < 300):
             print(f"[NAVER] token refresh failed status={r.status_code} body={r.text[:500]}")
             return ""
         data = r.json()
@@ -381,77 +380,138 @@ def _naver_refresh_access_token() -> str:
         print(f"[NAVER] token refresh exception: {e}")
         return ""
 
-def _naver_cafe_post(clubid: str, menuid: str, subject: str, content: str) -> tuple[bool, str]:
-    """Post an article to Naver Cafe.
+def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tuple[bool, str]:
+    """네이버 카페에 글쓰기. (success, articleId_or_error)"""
+    token = _naver_refresh_access_token()
+    if not token:
+        return False, "NO_ACCESS_TOKEN"
 
-    Note:
-    - Depending on the endpoint/tenant, Naver Cafe APIs may accept either:
-      (A) OAuth Bearer access token, or
-      (B) X-Naver-Client-Id/Secret headers (non-login style)
-    - We try both to avoid '024' authentication failures.
-    """
-    cid = os.getenv("NAVER_CLIENT_ID", "").strip()
-    sec = os.getenv("NAVER_CLIENT_SECRET", "").strip()
+    if not clubid or not menuid:
+        return False, "NO_CLUBID_OR_MENUID"
 
-    token, token_info = _naver_refresh_access_token()
-
-    base_headers: dict[str, str] = {}
-    if cid and sec:
-        base_headers["X-Naver-Client-Id"] = cid
-        base_headers["X-Naver-Client-Secret"] = sec
-
-    # Try header combinations in a safe order.
-    attempts: list[tuple[str, dict[str, str]]] = []
-    if token:
-        h = dict(base_headers)
-        h["Authorization"] = f"Bearer {token}"
-        attempts.append(("bearer+client", h))
-    if base_headers:
-        attempts.append(("client_only", dict(base_headers)))
-    if token:
-        attempts.append(("bearer_only", {"Authorization": f"Bearer {token}"}))
-
-    if not attempts:
-        return False, "NO_AUTH_HEADERS"
+    # subject 길이 제한 대비(너무 길면 잘라냄)
+    subject = (subject or "").strip()
+    if not subject:
+        subject = "스포츠 분석"
+    if len(subject) > 80:
+        subject = subject[:80]
 
     url = f"https://openapi.naver.com/v1/cafe/{clubid}/menu/{menuid}/articles"
-    data = {
-        "subject": subject,
-        "content": content,
-        # 일부 환경에서 필요할 수 있어 기본으로 넣어둠(없어도 되는 경우가 많음)
-        "openyn": "Y",
-    }
+    headers = {"Authorization": f"Bearer {token}"}
+    data = {"subject": subject, "content": content or ""}
 
-    last_err = "UNKNOWN"
-    for tag, headers in attempts:
+    try:
+        resp = requests.post(url, headers=headers, data=data, timeout=30)
+        if resp.status_code != 200:
+            return False, f"HTTP_{resp.status_code}:{resp.text[:300]}"
+
+        # 문서상 응답 포맷이 고정되어 있지 않아 안전하게 파싱
+        article_id = ""
         try:
-            resp = requests.post(url, headers=headers, data=data, timeout=30)
-        except Exception as ex:
-            last_err = f"{tag}:EXC:{type(ex).__name__}:{ex}"
-            continue
+            j = resp.json()
+            # 흔히 result/articleId 또는 message.result.articleId 형태
+            if isinstance(j, dict):
+                for key_path in [
+                    ("result", "articleId"),
+                    ("result", "articleid"),
+                    ("message", "result", "articleId"),
+                    ("message", "result", "articleid"),
+                ]:
+                    cur = j
+                    ok = True
+                    for k in key_path:
+                        if isinstance(cur, dict) and k in cur:
+                            cur = cur[k]
+                        else:
+                            ok = False
+                            break
+                    if ok and cur:
+                        article_id = str(cur)
+                        break
+        except Exception:
+            pass
 
-        if resp.status_code in (200, 201):
-            try:
-                j = resp.json()
-                article_id = (
-                    j.get("result", {}).get("articleid")
-                    or j.get("result", {}).get("articleId")
-                    or j.get("articleid")
-                    or j.get("articleId")
-                    or ""
-                )
-            except Exception:
-                article_id = ""
-            return True, article_id or "OK"
+        return True, (article_id or "OK")
+    except Exception as e:
+        return False, f"EXC:{e}"
 
-        # Keep the most informative error for logging.
-        last_err = f"{tag}:HTTP_{resp.status_code}:{resp.text}"
+def get_cafe_log_ws():
+    """cafe_log 워크시트 반환(없으면 생성 + 헤더 세팅)."""
+    client_gs = get_gs_client()
+    spreadsheet_id = os.getenv("SPREADSHEET_ID")
+    if not (client_gs and spreadsheet_id):
+        return None
+    try:
+        sh = client_gs.open_by_key(spreadsheet_id)
+        ws = _get_ws_by_name(sh, CAFE_LOG_SHEET_NAME)
+        if not ws:
+            ws = sh.add_worksheet(title=CAFE_LOG_SHEET_NAME, rows=2000, cols=12)
+        ws.resize(cols=max(12, len(CAFE_LOG_HEADER)))
+        _ensure_header(ws, CAFE_LOG_HEADER)
+        return ws
+    except Exception as e:
+        print(f"[GSHEET] cafe_log ws error: {e}")
+        return None
 
-        # If it's clearly not an auth issue, don't waste retries.
-        if resp.status_code not in (401, 403):
-            break
+def _load_posted_src_ids(ws_log) -> set:
+    posted = set()
+    try:
+        vals = ws_log.get_all_values()
+        if not vals or len(vals) <= 1:
+            return posted
+        header = vals[0]
+        try:
+            idx = header.index("src_id")
+        except ValueError:
+            idx = 0
+        for r in vals[1:]:
+            if len(r) > idx and r[idx].strip():
+                posted.add(r[idx].strip())
+    except Exception:
+        pass
+    return posted
 
-    return False, last_err
+
+def _cafe_sport_match(sport_value: str, sport_filter: str) -> bool:
+    """export 시트의 sport 값이 명령어 sport_filter(축구/야구/농구/배구)와 매칭되는지 판정."""
+    sv = (sport_value or "").strip().lower()
+    sf = (sport_filter or "").strip().lower()
+    if not sf:
+        return True
+    # 같은 값이면 바로 통과
+    if sv == sf:
+        return True
+
+    # 명령어 필터별 허용 sport 값(시트에서 쓰는 리그명까지 포함)
+    aliases = {
+        "soccer": {
+            "soccer", "football",
+            "축구", "해외축구", "국내축구", "해축", "국축", "k리그", "k리그1", "k리그2", "k-league", "kleague", "j리그", "j1", "j2", "jleague", "j-league", "j리그1", "j리그2", "epl", "ucl", "uefa", "챔피언스리그", "유로파", "컨퍼런스",
+        },
+        "baseball": {
+            "baseball", "야구",
+            "kbo", "mlb", "npb", "프로야구", "해외야구", "국내야구",
+        },
+        "basketball": {
+            "basketball", "농구",
+            "nba", "kbl", "wkbl", "wnba",
+        },
+        "volleyball": {
+            "volleyball", "배구",
+            "v리그", "vleague", "kovo", "프로배구", "남자배구", "여자배구", "vnl", "avc",
+        },
+    }
+    # sport_filter가 한글로 들어오는 경우도 대비
+    sf_norm = {
+        "축구": "soccer",
+        "야구": "baseball",
+        "농구": "basketball",
+        "배구": "volleyball",
+    }.get(sf, sf)
+
+    allowed = aliases.get(sf_norm, {sf_norm})
+    return sv in allowed
+
 
 async def _cafe_parse_which_arg(context: ContextTypes.DEFAULT_TYPE) -> str:
     which = "today"
@@ -478,18 +538,6 @@ async def cafe_volleyball(update: Update, context: ContextTypes.DEFAULT_TYPE):
     which = await _cafe_parse_which_arg(context)
     return await cafe_post_from_export(update, context, which, sport_filter="volleyball")
 
-def _ensure_cafe_log_header(ws_log) -> None:
-    """Ensure cafe_log has a header row (A1:H1) so append_row doesn't drift."""
-    try:
-        first = ws_log.row_values(1)
-        if not first or all((c or "").strip() == "" for c in first):
-            ws_log.update("A1:H1", [[
-                "src_id", "day", "sport", "clubid", "menuid", "article_id", "logged_at", "result"
-            ]])
-    except Exception:
-        # Logging sheet issues should never block posting.
-        pass
-
 async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TYPE, which: str, sport_filter: str = ""):
     """export_today/export_tomorrow 내용을 네이버 카페에 업로드."""
     if not is_admin(update):
@@ -506,7 +554,6 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
     sheet_name = EXPORT_TODAY_SHEET_NAME if which == "today" else EXPORT_TOMORROW_SHEET_NAME
     ws = get_export_ws(sheet_name)
     ws_log = get_cafe_log_ws()
-    _ensure_cafe_log_header(ws_log)
     if not ws:
         await update.message.reply_text(f"{sheet_name} 시트를 못 찾았어.")
         return
@@ -545,7 +592,7 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
             continue
         dayv = r[i_day].strip() if len(r) > i_day else ""
         sportv = r[i_sport].strip() if len(r) > i_sport else ""
-        if sport_filter and (not _match_export_sport(sportv, sport_filter)):
+        if sport_filter and (not _cafe_sport_match(sportv, sport_filter)):
             continue
         titlev = r[i_title].strip() if len(r) > i_title else ""
         bodyv = r[i_body] if len(r) > i_body else ""
@@ -559,8 +606,7 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             content = bodyv or ""
 
-        sport_key = (sport_filter.strip().lower() if sport_filter else _infer_sport_key_from_export(sportv))
-        menuid = _naver_menu_id_for_sport(sport_key)
+        menuid = _naver_menu_id_for_sport(sport_filter)
         to_post.append((sid, dayv, sportv, titlev, content, createdv, menuid))
 
     if not to_post:
@@ -572,17 +618,17 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
         # menuid 미설정이면 스킵
         if not menuid:
             fail_cnt += 1
-            ws_log.append_row([sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), "NO_MENU_ID"], value_input_option="RAW")
+            ws_log.append_row([sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), "NO_MENU_ID"], value_input_option="RAW", table_range="A1")
             continue
 
         subject = titlev or f"{sportv} 분석"
         success, info = _naver_cafe_post(subject=subject, content=content, clubid=NAVER_CAFE_CLUBID, menuid=menuid)
         if success:
             ok_cnt += 1
-            ws_log.append_row([sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, info, now_kst().isoformat(), "OK"], value_input_option="RAW")
+            ws_log.append_row([sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, info, now_kst().isoformat(), "OK"], value_input_option="RAW", table_range="A1")
         else:
             fail_cnt += 1
-            ws_log.append_row([sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), info], value_input_option="RAW")
+            ws_log.append_row([sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), info], value_input_option="RAW", table_range="A1")
 
         # 너무 빠른 연속 호출 방지
         await asyncio.sleep(0.3)
@@ -1134,7 +1180,7 @@ def append_analysis_rows(day_key: str, rows: list[list[str]]) -> bool:
         return False
 
     try:
-        ws.append_rows(rows, value_input_option="RAW")
+        ws.append_rows(rows, value_input_option="RAW", table_range="A1")
         print(f"[GSHEET][ANALYSIS] {sheet_name} 에 {len(rows)}건 추가")
         return True
     except Exception as e:
@@ -1239,7 +1285,7 @@ def append_site_export_rows(rows: list[list[str]]) -> bool:
                 rr.append(extract_simple_from_body(rr[4] if len(rr) > 4 else ""))
             fixed_rows.append(rr)
         rows = fixed_rows
-        ws.append_rows(rows, value_input_option="RAW")
+        ws.append_rows(rows, value_input_option="RAW", table_range="A1")
         print(f"[GSHEET][SITE_EXPORT] {SITE_EXPORT_SHEET_NAME} 에 {len(rows)}건 추가")
         return True
     except Exception as e:
@@ -1267,11 +1313,6 @@ def get_export_ws(sheet_name: str):
         return None
 
 
-
-
-def get_cafe_log_ws():
-    """cafe_log 워크시트를 반환"""
-    return get_gsheet().worksheet(CAFE_LOG_SHEET_NAME)
 def get_existing_export_src_ids(sheet_name: str) -> set[str]:
     """지정 export 시트에서 src_id 목록을 읽어 중복 저장 방지용 set으로 반환."""
     ws = get_export_ws(sheet_name)
@@ -1326,7 +1367,7 @@ def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
     rows = fixed_rows
 
     try:
-        ws.append_rows(rows, value_input_option="RAW")
+        ws.append_rows(rows, value_input_option="RAW", table_range="A1")
         return True
     except Exception as e:
         print(f"[GSHEET][EXPORT] append 실패({sheet_name}): {e}")
@@ -2984,7 +3025,7 @@ async def crawl_daum_news_common(
         ])
 
     try:
-        ws.append_rows(rows_to_append, value_input_option="RAW")
+        ws.append_rows(rows_to_append, value_input_option="RAW", table_range="A1")
     except Exception as e:
         await update.message.reply_text(f"시트 쓰기 오류: {e}")
         return
@@ -3919,7 +3960,7 @@ async def export_rollover(update: Update, context: ContextTypes.DEFAULT_TYPE):
             today_ws.update(values=[EXPORT_HEADER], range_name="A1")
 
         if to_move:
-            today_ws.append_rows(to_move, value_input_option="RAW")
+            today_ws.append_rows(to_move, value_input_option="RAW", table_range="A1")
 
         # export_tomorrow 초기화(헤더만)
         tomo_ws.clear()
@@ -3933,29 +3974,12 @@ async def export_rollover(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"롤오버 중 오류: {e}")
         return
 
-
-
-async def _tg_error_handler(update, context):
-    """예외 발생 시 로그를 남기고(가능하면) 사용자에게도 안내."""
-    try:
-        err = context.error
-        print("[TG_ERROR]", repr(err))
-        if update is not None and getattr(update, "effective_message", None):
-            msg = f"오류 발생: {type(err).__name__}: {err}"
-            if len(msg) > 350:
-                msg = msg[:350] + "…"
-            await update.effective_message.reply_text(msg)
-    except Exception as e:
-        print("[TG_ERROR_HANDLER_FAIL]", repr(e))
-
 def main():
     reload_analysis_from_sheet()
     reload_news_from_sheet()
 
     app = ApplicationBuilder().token(TOKEN).build()
 
-
-    app.add_error_handler(_tg_error_handler)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
