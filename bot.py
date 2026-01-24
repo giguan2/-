@@ -1,5 +1,6 @@
 from __future__ import annotations
 from bs4 import BeautifulSoup
+import html
 
 import re as _re_simple
 from telegram.error import BadRequest
@@ -4084,7 +4085,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 
