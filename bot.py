@@ -436,10 +436,7 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
     }
 
     safe_content = (content or "")
-    safe_content = safe_content.replace("
-", "
-").replace("", "
-")
+    safe_content = safe_content.replace("\r\n", "\n").replace("\r", "\n")
 
     # CP949(MS949) 퍼센트 인코딩
     from urllib.parse import quote_plus
