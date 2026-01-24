@@ -279,13 +279,14 @@ import time
 
 
 def now_kst() -> datetime:
-    """현재 KST(Asia/Seoul) datetime."""
+    """Return current time in Asia/Seoul as a timezone-aware datetime when possible."""
     try:
         from zoneinfo import ZoneInfo
         return datetime.now(ZoneInfo("Asia/Seoul"))
     except Exception:
-        # zoneinfo 미지원 환경 대비
+        # Fallback (naive UTC + 9h) for environments without zoneinfo
         return datetime.utcnow() + timedelta(hours=9)
+
 import asyncio
 import re
 import requests
@@ -380,139 +381,77 @@ def _naver_refresh_access_token() -> str:
         print(f"[NAVER] token refresh exception: {e}")
         return ""
 
-def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tuple[bool, str]:
-    """네이버 카페에 글쓰기. (success, articleId_or_error)"""
-    token = _naver_refresh_access_token()
-    if not token:
-        return False, "NO_ACCESS_TOKEN"
+def _naver_cafe_post(clubid: str, menuid: str, subject: str, content: str) -> tuple[bool, str]:
+    """Post an article to Naver Cafe.
 
-    if not clubid or not menuid:
-        return False, "NO_CLUBID_OR_MENUID"
+    Note:
+    - Depending on the endpoint/tenant, Naver Cafe APIs may accept either:
+      (A) OAuth Bearer access token, or
+      (B) X-Naver-Client-Id/Secret headers (non-login style)
+    - We try both to avoid '024' authentication failures.
+    """
+    cid = os.getenv("NAVER_CLIENT_ID", "").strip()
+    sec = os.getenv("NAVER_CLIENT_SECRET", "").strip()
 
-    # subject 길이 제한 대비(너무 길면 잘라냄)
-    subject = (subject or "").strip()
-    if not subject:
-        subject = "스포츠 분석"
-    if len(subject) > 80:
-        subject = subject[:80]
+    token, token_info = _naver_refresh_access_token()
+
+    base_headers: dict[str, str] = {}
+    if cid and sec:
+        base_headers["X-Naver-Client-Id"] = cid
+        base_headers["X-Naver-Client-Secret"] = sec
+
+    # Try header combinations in a safe order.
+    attempts: list[tuple[str, dict[str, str]]] = []
+    if token:
+        h = dict(base_headers)
+        h["Authorization"] = f"Bearer {token}"
+        attempts.append(("bearer+client", h))
+    if base_headers:
+        attempts.append(("client_only", dict(base_headers)))
+    if token:
+        attempts.append(("bearer_only", {"Authorization": f"Bearer {token}"}))
+
+    if not attempts:
+        return False, "NO_AUTH_HEADERS"
 
     url = f"https://openapi.naver.com/v1/cafe/{clubid}/menu/{menuid}/articles"
-    headers = {"Authorization": f"Bearer {token}"}
-    data = {"subject": subject, "content": content or ""}
+    data = {
+        "subject": subject,
+        "content": content,
+        # 일부 환경에서 필요할 수 있어 기본으로 넣어둠(없어도 되는 경우가 많음)
+        "openyn": "Y",
+    }
 
-    try:
-        resp = requests.post(url, headers=headers, data=data, timeout=30)
-        if resp.status_code != 200:
-            return False, f"HTTP_{resp.status_code}:{resp.text[:300]}"
-
-        # 문서상 응답 포맷이 고정되어 있지 않아 안전하게 파싱
-        article_id = ""
+    last_err = "UNKNOWN"
+    for tag, headers in attempts:
         try:
-            j = resp.json()
-            # 흔히 result/articleId 또는 message.result.articleId 형태
-            if isinstance(j, dict):
-                for key_path in [
-                    ("result", "articleId"),
-                    ("result", "articleid"),
-                    ("message", "result", "articleId"),
-                    ("message", "result", "articleid"),
-                ]:
-                    cur = j
-                    ok = True
-                    for k in key_path:
-                        if isinstance(cur, dict) and k in cur:
-                            cur = cur[k]
-                        else:
-                            ok = False
-                            break
-                    if ok and cur:
-                        article_id = str(cur)
-                        break
-        except Exception:
-            pass
+            resp = requests.post(url, headers=headers, data=data, timeout=30)
+        except Exception as ex:
+            last_err = f"{tag}:EXC:{type(ex).__name__}:{ex}"
+            continue
 
-        return True, (article_id or "OK")
-    except Exception as e:
-        return False, f"EXC:{e}"
+        if resp.status_code in (200, 201):
+            try:
+                j = resp.json()
+                article_id = (
+                    j.get("result", {}).get("articleid")
+                    or j.get("result", {}).get("articleId")
+                    or j.get("articleid")
+                    or j.get("articleId")
+                    or ""
+                )
+            except Exception:
+                article_id = ""
+            return True, article_id or "OK"
 
-def get_cafe_log_ws():
-    """cafe_log 워크시트 반환(없으면 생성 + 헤더 세팅)."""
-    client_gs = get_gs_client()
-    spreadsheet_id = os.getenv("SPREADSHEET_ID")
-    if not (client_gs and spreadsheet_id):
-        return None
-    try:
-        sh = client_gs.open_by_key(spreadsheet_id)
-        ws = _get_ws_by_name(sh, CAFE_LOG_SHEET_NAME)
-        if not ws:
-            ws = sh.add_worksheet(title=CAFE_LOG_SHEET_NAME, rows=2000, cols=12)
-        ws.resize(cols=max(12, len(CAFE_LOG_HEADER)))
-        _ensure_header(ws, CAFE_LOG_HEADER)
-        return ws
-    except Exception as e:
-        print(f"[GSHEET] cafe_log ws error: {e}")
-        return None
+        # Keep the most informative error for logging.
+        last_err = f"{tag}:HTTP_{resp.status_code}:{resp.text}"
 
-def _load_posted_src_ids(ws_log) -> set:
-    posted = set()
-    try:
-        vals = ws_log.get_all_values()
-        if not vals or len(vals) <= 1:
-            return posted
-        header = vals[0]
-        try:
-            idx = header.index("src_id")
-        except ValueError:
-            idx = 0
-        for r in vals[1:]:
-            if len(r) > idx and r[idx].strip():
-                posted.add(r[idx].strip())
-    except Exception:
-        pass
-    return posted
+        # If it's clearly not an auth issue, don't waste retries.
+        if resp.status_code not in (401, 403):
+            break
 
-def _match_export_sport(sport_value: str, sport_filter: str) -> bool:
-    """export 시트 sport 값(NBA/KBL/해외축구/국내축구/J리그 등)을 sport_filter(basketball/soccer/baseball/volleyball)에 매칭."""
-    sf = (sport_filter or "").strip().lower()
-    sv_raw = (sport_value or "").strip()
-    sv = sv_raw.lower()
-
-    if not sf:
-        return True
-
-    if sf == "basketball":
-        return (sv in {"nba","kbl","wkbl","wnba","ncaab","ncaawb"} or "농구" in sv)
-
-    if sf == "baseball":
-        return (sv in {"kbo","mlb","npb","cpbl"} or "야구" in sv)
-
-    if sf == "volleyball":
-        return (sv in {"v리그","v-league","kovo"} or "배구" in sv)
-
-    if sf == "soccer":
-        # export_tomorrow에 들어오는 값: 해외축구/국내축구/J리그 등 + 리그명이 직접 들어올 수도 있음
-        soccer_keywords = ["축구","epl","k리그","j리그","챔피언스","유로파","라리가","세리에","분데스","리그앙","ucl","uel"]
-        return any(k in sv for k in soccer_keywords)
-
-    # 알 수 없는 필터면 통과(안전)
-    return True
-
-
-def _infer_sport_key_from_export(sport_value: str) -> str:
-    """export 시트 sport 값을 네이버 카페 메뉴키(soccer/baseball/basketball/volleyball)로 추론."""
-    sv = (sport_value or "").strip().lower()
-    if not sv:
-        return ""
-    if _match_export_sport(sport_value, "basketball"):
-        return "basketball"
-    if _match_export_sport(sport_value, "baseball"):
-        return "baseball"
-    if _match_export_sport(sport_value, "volleyball"):
-        return "volleyball"
-    if _match_export_sport(sport_value, "soccer"):
-        return "soccer"
-    return ""
-
+    return False, last_err
 
 async def _cafe_parse_which_arg(context: ContextTypes.DEFAULT_TYPE) -> str:
     which = "today"
@@ -539,6 +478,18 @@ async def cafe_volleyball(update: Update, context: ContextTypes.DEFAULT_TYPE):
     which = await _cafe_parse_which_arg(context)
     return await cafe_post_from_export(update, context, which, sport_filter="volleyball")
 
+def _ensure_cafe_log_header(ws_log) -> None:
+    """Ensure cafe_log has a header row (A1:H1) so append_row doesn't drift."""
+    try:
+        first = ws_log.row_values(1)
+        if not first or all((c or "").strip() == "" for c in first):
+            ws_log.update("A1:H1", [[
+                "src_id", "day", "sport", "clubid", "menuid", "article_id", "logged_at", "result"
+            ]])
+    except Exception:
+        # Logging sheet issues should never block posting.
+        pass
+
 async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TYPE, which: str, sport_filter: str = ""):
     """export_today/export_tomorrow 내용을 네이버 카페에 업로드."""
     if not is_admin(update):
@@ -555,6 +506,7 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
     sheet_name = EXPORT_TODAY_SHEET_NAME if which == "today" else EXPORT_TOMORROW_SHEET_NAME
     ws = get_export_ws(sheet_name)
     ws_log = get_cafe_log_ws()
+    _ensure_cafe_log_header(ws_log)
     if not ws:
         await update.message.reply_text(f"{sheet_name} 시트를 못 찾았어.")
         return
@@ -4048,6 +4000,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
