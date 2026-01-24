@@ -1,5 +1,6 @@
 from __future__ import annotations
 from bs4 import BeautifulSoup
+import html
 
 import re as _re_simple
 from telegram.error import BadRequest
@@ -347,6 +348,16 @@ def _naver_menu_id_for_sport(sport: str) -> str:
 def _naver_have_config() -> bool:
     return bool(NAVER_CLIENT_ID and NAVER_CLIENT_SECRET and NAVER_REFRESH_TOKEN and NAVER_CAFE_CLUBID)
 
+
+def _is_naver_cafe_rate_limited(err: str) -> bool:
+    """네이버 카페 글쓰기 연속등록/레이트리밋 감지."""
+    if not err:
+        return False
+    # 보통 HTTP_403 + 메시지에 '연속'/'잠시 후'가 포함됨
+    if err.startswith("HTTP_403") and ("연속" in err or "잠시 후" in err or "등록할 수 없" in err):
+        return True
+    return False
+
 def _naver_refresh_access_token() -> str:
     """refresh_token으로 access_token 갱신(캐시 사용)."""
     now_ts = int(time.time())
@@ -380,6 +391,7 @@ def _naver_refresh_access_token() -> str:
         print(f"[NAVER] token refresh exception: {e}")
         return ""
 
+
 def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tuple[bool, str]:
     """네이버 카페에 글쓰기. (success, articleId_or_error)"""
     token = _naver_refresh_access_token()
@@ -397,11 +409,22 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
         subject = subject[:80]
 
     url = f"https://openapi.naver.com/v1/cafe/{clubid}/menu/{menuid}/articles"
-    headers = {"Authorization": f"Bearer {token}"}
-    data = {"subject": subject, "content": content or ""}
+
+    # 인코딩 깨짐 방지: charset 명시 + utf-8 urlencode
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    }
+
+    safe_content = (content or "")
+    # 줄바꿈 정규화
+    safe_content = safe_content.replace("\r\n", "\n").replace("\r", "\n")
+
+    payload = {"subject": subject, "content": safe_content}
 
     try:
-        resp = requests.post(url, headers=headers, data=data, timeout=30)
+        body = urlencode(payload, encoding="utf-8")
+        resp = requests.post(url, headers=headers, data=body.encode("utf-8"), timeout=30)
         if resp.status_code != 200:
             return False, f"HTTP_{resp.status_code}:{resp.text[:300]}"
 
@@ -434,6 +457,17 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
         return True, (article_id or "OK")
     except Exception as e:
         return False, f"EXC:{e}"
+
+
+def _center_html_content(text: str) -> str:
+    """네이버 카페 본문용: simple 텍스트를 HTML로 감싸 가운데 정렬한다."""
+    t = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not t:
+        return ""
+    safe = html.escape(t)
+    safe = safe.replace("\n", "<br/>")
+    return f'<div style="text-align:center;">{safe}</div>'
+
 
 def get_cafe_log_ws():
     """cafe_log 워크시트 반환(없으면 생성 + 헤더 세팅)."""
@@ -599,12 +633,11 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
         simplev = r[i_simple].strip() if len(r) > i_simple else ""
         createdv = r[i_created].strip() if len(r) > i_created else ""
 
-        # content 구성: simple 1줄 + 공백 + body
-        content = ""
-        if simplev:
-            content = simplev + "\n\n" + (bodyv or "")
-        else:
-            content = bodyv or ""
+        # content 구성: G열(simple)만 업로드 (가운데 정렬)
+        content = _center_html_content(simplev)
+        if not content:
+            # simple이 비어있으면 업로드 스킵(빈 글 방지)
+            continue
 
         menuid = _naver_menu_id_for_sport(sport_filter)
         to_post.append((sid, dayv, sportv, titlev, content, createdv, menuid))
@@ -614,6 +647,9 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     ok_cnt, fail_cnt = 0, 0
+    post_delay_sec = float(os.getenv("CAFE_POST_DELAY_SEC", "7"))
+    rate_backoff_sec = float(os.getenv("CAFE_RATE_LIMIT_BACKOFF_SEC", "60"))
+    rate_retries = int(os.getenv("CAFE_RATE_LIMIT_RETRIES", "1"))
     for (sid, dayv, sportv, titlev, content, createdv, menuid) in to_post:
         # menuid 미설정이면 스킵
         if not menuid:
@@ -622,16 +658,30 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
             continue
 
         subject = titlev or f"{sportv} 분석"
-        success, info = _naver_cafe_post(subject=subject, content=content, clubid=NAVER_CAFE_CLUBID, menuid=menuid)
-        if success:
-            ok_cnt += 1
-            ws_log.append_row([sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, info, now_kst().isoformat(), "OK"], value_input_option="RAW", table_range="A1")
-        else:
+        success = False
+        info = ""
+        retries_left = rate_retries
+        status_tag = "OK"
+        while True:
+            success, info = _naver_cafe_post(subject=subject, content=content, clubid=NAVER_CAFE_CLUBID, menuid=menuid)
+            if success:
+                ok_cnt += 1
+                ws_log.append_row([sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, info, now_kst().isoformat(), status_tag], value_input_option="RAW", table_range="A1")
+                break
+
+            # 네이버 카페 연속 등록 차단(레이트리밋) 대응: 대기 후 재시도
+            if _is_naver_cafe_rate_limited(info) and retries_left > 0:
+                retries_left -= 1
+                status_tag = "OK_RETRY"
+                await asyncio.sleep(rate_backoff_sec)
+                continue
+
             fail_cnt += 1
             ws_log.append_row([sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), info], value_input_option="RAW", table_range="A1")
+            break
 
-        # 너무 빠른 연속 호출 방지
-        await asyncio.sleep(0.3)
+        # 너무 빠른 연속 호출 방지(평상시 딜레이)
+        await asyncio.sleep(post_delay_sec)
 
     await update.message.reply_text(f"카페 업로드 완료: 성공 {ok_cnt} / 실패 {fail_cnt} (중복 src_id는 제외됨)")
 
@@ -703,7 +753,7 @@ async def _maz_warmup(client: httpx.AsyncClient) -> None:
 
 import math
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlencode
 from openai import OpenAI
 
 from telegram import (
