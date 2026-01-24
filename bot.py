@@ -384,9 +384,10 @@ def _naver_refresh_access_token() -> str:
 def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tuple[bool, str]:
     """네이버 카페에 글쓰기. (success, articleId_or_error)
 
-    인코딩 이슈(시트에서는 정상인데 카페에서 깨짐)는 보통 서버가 form 바디를 EUC-KR/CP949로 디코딩해서 발생한다.
-    그래서 payload를 지정 인코딩으로 URL 인코딩(urlencode)한 뒤 전송한다.
-    - 기본: EUC-KR (NAVER_CAFE_FORM_ENCODING 환경변수로 변경 가능: euc-kr / cp949 / utf-8)
+    ✅ 한글 깨짐(시트는 정상인데 카페에서 깨짐) 해결:
+    네이버 카페 글쓰기 API는 subject/content를 'UTF-8로 1차 URL 인코딩' 후,
+    그 결과 문자열을 다시 'MS949(CP949)로 2차 URL 인코딩'해서 보내는 방식이
+    가장 안정적으로 동작하는 케이스가 많다. (네이버 개발자센터 예제 방식)
     """
     token = _naver_refresh_access_token()
     if not token:
@@ -400,34 +401,33 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
 
     safe_content = (content or "").replace("\r\n", "\n").replace("\r", "\n")
 
-    # 서버측 form 디코딩과 맞추기 위한 URL 인코딩
-    from urllib.parse import urlencode
+    from urllib.parse import quote_plus
 
-    form_enc = (os.getenv("NAVER_CAFE_FORM_ENCODING") or "euc-kr").strip().lower()
-    if form_enc in ("euckr", "euc_kr", "euc-kr"):
-        form_enc = "euc-kr"
-    elif form_enc in ("ms949", "cp949"):
-        form_enc = "cp949"
-    elif form_enc in ("utf8", "utf-8"):
-        form_enc = "utf-8"
-    else:
-        # 알 수 없는 값이면 안전하게 EUC-KR
-        form_enc = "euc-kr"
+    def _double_urlencode(val: str) -> str:
+        # 1) UTF-8 URL-encode
+        try:
+            step1 = quote_plus(val, encoding="utf-8", errors="strict")
+        except Exception:
+            step1 = quote_plus(val, encoding="utf-8", errors="replace")
 
-    payload = {"subject": subject, "content": safe_content}
+        # 2) MS949(CP949) URL-encode the encoded string
+        try:
+            step2 = quote_plus(step1, encoding="cp949", errors="strict")
+        except Exception:
+            step2 = quote_plus(step1, encoding="cp949", errors="replace")
+        return step2
 
-    try:
-        body_str = urlencode(payload, encoding=form_enc, errors="strict")
-    except Exception:
-        # 일부 문자(이모지 등)가 해당 인코딩에 없으면 replace로 폴백
-        body_str = urlencode(payload, encoding=form_enc, errors="replace")
+    subj_enc = _double_urlencode(subject)
+    cont_enc = _double_urlencode(safe_content)
 
+    body_str = f"subject={subj_enc}&content={cont_enc}"
     body = body_str.encode("ascii", errors="strict")
 
     url = f"https://openapi.naver.com/v1/cafe/{clubid}/menu/{menuid}/articles"
     headers = {
         "Authorization": f"Bearer {token}",
-        "Content-Type": f"application/x-www-form-urlencoded; charset={form_enc.upper()}",
+        # 네이버 예제는 주로 기본 form 전송이지만, charset을 명시하면 일부 환경에서 도움이 됨
+        "Content-Type": "application/x-www-form-urlencoded; charset=MS949",
     }
 
     try:
@@ -453,17 +453,15 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
                         else:
                             ok = False
                             break
-                    if ok and cur:
+                    if ok and cur is not None:
                         article_id = str(cur)
                         break
         except Exception:
-            pass
+            article_id = ""
 
         return True, (article_id or "OK")
     except Exception as e:
-        return False, f"EXC:{e}"
-
-
+        return False, f"EXC:{type(e).__name__}:{e}"
 def get_cafe_log_ws():
     """cafe_log 워크시트 반환(없으면 생성 + 헤더 세팅)."""
     client_gs = get_gs_client()
