@@ -1,12 +1,12 @@
 from __future__ import annotations
 from bs4 import BeautifulSoup
+import html
 
 import re as _re_simple
 from telegram.error import BadRequest
 
 # --- Time helpers ---
 from datetime import datetime, timedelta, timezone
-import html
 
 KST = timezone(timedelta(hours=9))
 
@@ -381,25 +381,16 @@ def _naver_refresh_access_token() -> str:
         print(f"[NAVER] token refresh exception: {e}")
         return ""
 
-def _naver_double_urlencode(value: str) -> str:
-    """
-    Naver Cafe Write API 가이드 방식:
-    1) UTF-8 로 URL 인코딩
-    2) 그 결과 문자열을 MS949(CP949) 로 다시 URL 인코딩
-    최종 결과는 ASCII(%,0-9,A-F)만 포함.
-    """
-    from urllib.parse import quote
-
-    value = value or ""
-    once = quote(value, safe="", encoding="utf-8", errors="strict")
-    twice = quote(once, safe="", encoding="cp949", errors="strict")
-    return twice
-
 def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tuple[bool, str]:
-    """네이버 카페에 글쓰기. (success, articleId_or_error)"""
+    """네이버 카페에 글쓰기. (success, articleId_or_error)
+
+    ⚠️ form-urlencoded(data=dict)로 보내면 한글/HTML이 깨지거나 HTTP_403 + 내부 500/999가 반복되는 케이스가 있어
+    multipart/form-data로 전송한다.
+    """
     token = _naver_refresh_access_token()
     if not token:
         return False, "NO_ACCESS_TOKEN"
+
     if not clubid or not menuid:
         return False, "NO_CLUBID_OR_MENUID"
 
@@ -407,27 +398,24 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
     if len(subject) > 80:
         subject = subject[:80]
 
-    safe_content = (content or "").replace("\r\n", "\n").replace("\r", "\n")
-
-    try:
-        enc_subject = _naver_double_urlencode(subject)
-        enc_content = _naver_double_urlencode(safe_content)
-    except Exception as e:
-        return False, f"ENC_EXC:{e}"
-
     url = f"https://openapi.naver.com/v1/cafe/{clubid}/menu/{menuid}/articles"
-    body = f"subject={enc_subject}&content={enc_content}".encode("ascii")
+    headers = {"Authorization": f"Bearer {token}"}
 
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/x-www-form-urlencoded; charset=MS949",
+    # requests multipart: (filename, content, mimetype) 대신 (None, value) 사용 → 일반 폼 필드
+    files = {
+        "subject": (None, subject),
+        "content": (None, content or ""),
     }
 
     try:
-        resp = requests.post(url, headers=headers, data=body, timeout=30)
-        if resp.status_code != 200:
-            return False, f"HTTP_{resp.status_code}:{resp.text[:500]}"
+        resp = requests.post(url, headers=headers, files=files, timeout=30)
 
+        if resp.status_code != 200:
+            # 최대한 원인 확인 가능하도록 본문 일부 남김
+            txt = (resp.text or "")
+            return False, f"HTTP_{resp.status_code}:{txt[:800]}"
+
+        # 응답 포맷이 고정되어 있지 않아서 안전 파싱
         article_id = ""
         try:
             j = resp.json()
@@ -453,6 +441,7 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
             pass
 
         return True, (article_id or "OK")
+
     except Exception as e:
         return False, f"EXC:{e}"
 
@@ -560,7 +549,12 @@ async def cafe_volleyball(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await cafe_post_from_export(update, context, which, sport_filter="volleyball")
 
 async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TYPE, which: str, sport_filter: str = ""):
-    """export_today/export_tomorrow 내용을 네이버 카페에 업로드."""
+    """export_today/export_tomorrow 내용을 네이버 카페에 업로드.
+
+    - export_* 시트의 G열(simple)만 사용
+    - 본문은 가운데 정렬(white-space:pre-wrap)로 업로드
+    - 연속 등록 제한 대응: 기본 딜레이 + 403/연속등록/999류 백오프 후 재시도
+    """
     if not is_admin(update):
         await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
         return
@@ -568,7 +562,8 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
     if not _naver_have_config():
         await update.message.reply_text(
             "네이버 카페 자동 글쓰기 설정이 비어있어. 환경변수에 아래를 넣어줘:\n"
-            "NAVER_CLIENT_ID, NAVER_CLIENT_SECRET, NAVER_REFRESH_TOKEN, NAVER_CAFE_CLUBID, NAVER_CAFE_MENU_ID_SOCCER/BASEBALL/BASKETBALL/VOLLEYBALL (또는 NAVER_CAFE_MENU_MAP/NAVER_CAFE_MENU_ID 폴백)"
+            "NAVER_CLIENT_ID, NAVER_CLIENT_SECRET, NAVER_REFRESH_TOKEN, NAVER_CAFE_CLUBID, "
+            "NAVER_CAFE_MENU_ID_SOCCER/BASEBALL/BASKETBALL/VOLLEYBALL (또는 NAVER_CAFE_MENU_MAP/NAVER_CAFE_MENU_ID 폴백)"
         )
         return
 
@@ -588,6 +583,7 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     header = vals[0]
+
     def col(name, default=-1):
         try:
             return header.index(name)
@@ -598,7 +594,6 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
     i_sport = col("sport", 1)
     i_src = col("src_id", 2)
     i_title = col("title", 3)
-    i_body = col("body", 4)
     i_created = col("createdAt", 5)
     i_simple = col("simple", 6)
 
@@ -611,64 +606,102 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
             continue
         if sid in posted:
             continue
+
         dayv = r[i_day].strip() if len(r) > i_day else ""
         sportv = r[i_sport].strip() if len(r) > i_sport else ""
         if sport_filter and (not _cafe_sport_match(sportv, sport_filter)):
             continue
-        titlev = r[i_title].strip() if len(r) > i_title else ""
-        bodyv = r[i_body] if len(r) > i_body else ""
-        simplev = r[i_simple].strip() if len(r) > i_simple else ""
-        createdv = r[i_created].strip() if len(r) > i_created else ""
 
-        # content 구성: export_*의 simple(G열)만 사용 + 가운데 정렬(HTML)
-        if not simplev:
-            # simple이 비어있으면 빈 글 방지로 스킵
-            continue
-        safe_simple = html.escape(simplev).replace("\r\n", "\n").replace("\r", "\n")
-        content = f'<div style="text-align:center; white-space:pre-wrap;">{safe_simple}</div>'
+        titlev = r[i_title].strip() if len(r) > i_title else ""
+        createdv = r[i_created].strip() if len(r) > i_created else ""
+        simplev = r[i_simple] if len(r) > i_simple else ""
 
         menuid = _naver_menu_id_for_sport(sport_filter)
-        to_post.append((sid, dayv, sportv, titlev, content, createdv, menuid))
+        to_post.append((sid, dayv, sportv, titlev, simplev, createdv, menuid))
 
     if not to_post:
         await update.message.reply_text("업로드할 새 글이 없어(이미 올린 src_id는 제외됨).")
         return
 
+    delay_sec = float(os.getenv("CAFE_POST_DELAY_SEC", "7"))
+    backoff_sec = float(os.getenv("CAFE_RATE_LIMIT_BACKOFF_SEC", "60"))
+    retries = int(os.getenv("CAFE_RATE_LIMIT_RETRIES", "1"))
+
+    def _is_rate_limited(err: str) -> bool:
+        e = (err or "")
+        if "연속" in e and "등록" in e:
+            return True
+        # 403 + 내부 500/999 케이스도 너무 빠를 때 뜨는 경우가 많아서 백오프 대상으로 본다
+        if "HTTP_403" in e and '"code":"999"' in e:
+            return True
+        return False
+
     ok_cnt, fail_cnt = 0, 0
-    for (sid, dayv, sportv, titlev, content, createdv, menuid) in to_post:
-        # menuid 미설정이면 스킵
+    for (sid, dayv, sportv, titlev, simplev, createdv, menuid) in to_post:
         if not menuid:
             fail_cnt += 1
-            ws_log.append_row([sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), "NO_MENU_ID"], value_input_option="RAW", table_range="A1")
+            ws_log.append_row(
+                [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), "NO_MENU_ID"],
+                value_input_option="RAW",
+                table_range="A1",
+            )
             continue
 
-        subject = titlev or f"{sportv} 분석"
-
-        delay_sec = float(os.getenv("CAFE_POST_DELAY_SEC", "7") or 7)
-        backoff_sec = float(os.getenv("CAFE_RATE_LIMIT_BACKOFF_SEC", "60") or 60)
-        retries = int(os.getenv("CAFE_RATE_LIMIT_RETRIES", "1") or 1)
-
-        success, info = _naver_cafe_post(subject=subject, content=content, clubid=NAVER_CAFE_CLUBID, menuid=menuid)
-        status_tag = "OK" if success else info
-
-        if (not success) and retries > 0:
-            if ("HTTP_403" in info) and ("연속" in info or '"code":"999"' in info or '"status":"500"' in info):
-                await asyncio.sleep(backoff_sec)
-                success2, info2 = _naver_cafe_post(subject=subject, content=content, clubid=NAVER_CAFE_CLUBID, menuid=menuid)
-                if success2:
-                    success = True
-                    info = info2
-                    status_tag = "OK_RETRY"
-                else:
-                    info = info2
-                    status_tag = info2
-
-        if success:
-            ok_cnt += 1
-            ws_log.append_row([sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, info, now_kst().isoformat(), status_tag], value_input_option="RAW", table_range="A1")
-        else:
+        # simple만 사용 (빈 값이면 스킵)
+        simple_txt = (simplev or "").strip()
+        if not simple_txt:
             fail_cnt += 1
-            ws_log.append_row([sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), status_tag], value_input_option="RAW", table_range="A1")
+            ws_log.append_row(
+                [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), "NO_SIMPLE"],
+                value_input_option="RAW",
+                table_range="A1",
+            )
+            continue
+
+        # HTML 안전 처리 + 줄바꿈 정규화
+        safe_simple = html.escape(simple_txt).replace("\r\n", "\n").replace("\r", "\n").strip()
+
+        # 가운데 정렬 + 줄바꿈 유지
+        content_html = f'<div style="text-align:center; white-space:pre-wrap;">{safe_simple}</div>'
+        content_plain = safe_simple  # fallback
+
+        subject = (titlev or "").strip() or f"{sportv} 분석"
+        if len(subject) > 80:
+            subject = subject[:80]
+
+        attempt = 0
+        tried_plain = False
+        while True:
+            success, info = _naver_cafe_post(subject=subject, content=(content_plain if tried_plain else content_html),
+                                            clubid=NAVER_CAFE_CLUBID, menuid=menuid)
+
+            if success:
+                ok_cnt += 1
+                ws_log.append_row(
+                    [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, info, now_kst().isoformat(), "OK"],
+                    value_input_option="RAW",
+                    table_range="A1",
+                )
+                break
+
+            # 999 내부 오류가 HTML 파싱/필터링 문제일 수도 있어서 plain 텍스트로 1회 폴백
+            if (not tried_plain) and ("HTTP_403" in (info or "")) and ('"code":"999"' in (info or "")):
+                tried_plain = True
+                continue
+
+            # 연속등록/레이트리밋은 백오프 후 재시도
+            if _is_rate_limited(info) and attempt < retries:
+                attempt += 1
+                await asyncio.sleep(backoff_sec)
+                continue
+
+            fail_cnt += 1
+            ws_log.append_row(
+                [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), info],
+                value_input_option="RAW",
+                table_range="A1",
+            )
+            break
 
         await asyncio.sleep(delay_sec)
 
