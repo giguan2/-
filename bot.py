@@ -1,6 +1,7 @@
 from __future__ import annotations
 from bs4 import BeautifulSoup
 import html
+import hashlib
 
 import re as _re_simple
 from telegram.error import BadRequest
@@ -3437,6 +3438,194 @@ def classify_basketball_volleyball_sport(league: str) -> str:
     # 정말 정보가 없으면 농구로
     return "농구"
 
+
+# --- Cafe G열(simple) 동적 구성 helpers ---
+_HASHTAG_SAFE_RE = re.compile(r"[^0-9A-Za-z가-힣]+")
+
+def _strip_date_prefix(title: str) -> str:
+    """'1월 25일 ' 같은 날짜 프리픽스 제거."""
+    return re.sub(r"^\s*\d{1,2}\s*월\s*\d{1,2}\s*일\s+", "", (title or "").strip())
+
+def _hashtagify(text: str) -> str:
+    s = (text or "").strip()
+    s = s.replace("·", " ").replace("/", " ").replace("(", " ").replace(")", " ").replace("[", " ").replace("]", " ")
+    s = _HASHTAG_SAFE_RE.sub("", s)
+    if not s:
+        return ""
+    return f"#{s}"
+
+def _deterministic_pick(key: str, items: list[str]) -> str:
+    if not items:
+        return ""
+    h = hashlib.md5((key or "").encode("utf-8")).hexdigest()
+    idx = int(h[:8], 16) % len(items)
+    return items[idx]
+
+def _extract_match_phrase(title_wo_date: str) -> str:
+    # "[리그] 홈 vs 원정 스포츠분석" 에서 "홈 vs 원정" 만 뽑기
+    t = title_wo_date
+    # 대괄호 리그 제거
+    t2 = re.sub(r"^\[[^\]]+\]\s*", "", t).strip()
+    # 스포츠분석 꼬리 제거
+    t2 = re.sub(r"\s*스포츠분석\s*$", "", t2).strip()
+    # 남은 게 너무 길면 앞부분만
+    return t2 if t2 else title_wo_date
+
+def _keyword_tags_from_text(text: str, max_n: int = 4) -> list[str]:
+    """본문에서 자주 등장하는 키워드(고정 후보군)만 뽑아 해시태그로."""
+    if not text:
+        return []
+    pool = [
+        "세트피스", "역습", "중원압박", "압박", "피지컬", "체력",
+        "수비", "공격", "전술", "점유", "전환", "측면", "크로스",
+        "결장", "부상", "홈", "원정", "기복", "라인업", "로테이션",
+        "득점", "실점", "초반", "후반", "경합", "세컨볼",
+    ]
+    low = text
+    counts = []
+    for kw in pool:
+        c = low.count(kw)
+        if c:
+            counts.append((c, kw))
+    counts.sort(reverse=True)
+    out = []
+    for _, kw in counts[:max_n]:
+        tag = _hashtagify(kw)
+        if tag:
+            out.append(tag)
+    return out
+
+def build_dynamic_cafe_simple(
+    *,
+    title: str,
+    body: str,
+    row_id: str,
+    sport: str,
+    league: str = "",
+    home: str = "",
+    away: str = "",
+) -> str:
+    """
+    G열(simple)용 텍스트를 '도입/중간/마무리' 3회 자연스러운 언급 + 해시태그까지 포함해 생성.
+    - 문장 패턴은 row_id 기반 deterministic 선택(재실행해도 동일 글은 동일 문장) => 관리 편함.
+    """
+    t = (title or "").strip()
+    b = (body or "").strip()
+    t_wo_date = _strip_date_prefix(t)
+    match_phrase = _extract_match_phrase(t_wo_date)
+
+    # 도입/중간/마무리 문장 풀 (고정 문장 반복 최소화)
+    intro_templates = [
+        "{t}은 오늘 흐름을 가르는 포인트가 분명하다.",
+        "{t}에서 가장 먼저 볼 건 수비 밸런스와 전환 속도다.",
+        "이번 {t}은 초반 압박과 세트피스 대응이 핵심으로 보인다.",
+        "{t}은 전력 공백과 체력 싸움이 변수가 될 가능성이 있다.",
+        "{t}은 전술 상성에서 갈리는 지점이 꽤 뚜렷하다.",
+        "지금 공개된 정보 기준으로 {t}은 한쪽 흐름으로 기울기 쉽다.",
+        "{t}은 라인업과 운영에서 차이가 나는 매치업이다.",
+        "{t}은 후반으로 갈수록 격차가 벌어질 그림이 보인다.",
+    ]
+    mid_templates = [
+        "중반 구간에서 {m} 스포츠분석 포인트는 전환 상황에서의 수비 대응이다.",
+        "흐름이 이어질수록 {m}은 압박 강도와 체력에서 차이가 드러날 수 있다.",
+        "{m}은 세트피스 한 번에 분위기가 바뀔 여지가 있다.",
+        "{m}은 원정/홈 운영 차이가 결과에 직접 연결될 가능성이 높다.",
+        "경기 템포가 올라가면 {m} 쪽에서 실수가 먼저 나올 수 있다.",
+        "전반을 버텨도 후반 들어 {m}은 라인 간격이 벌어질 수 있다.",
+        "{m}은 공격 전개보다 수비 조직력이 먼저 시험대에 오른다.",
+    ]
+    outro_templates = [
+        "{m} 스포츠분석 기준으로 결론은 깔끔하게 가져가는 쪽이 유리하다.",
+        "정리하면 {m}은 변수보다 기본 전력 차이를 우선으로 봐야 한다.",
+        "결국 {m}은 세트피스/전환에서 우위가 승부를 가를 가능성이 크다.",
+        "{m}은 초반보다 후반에 승부가 갈릴 그림이다.",
+        "한 줄로 요약하면 {m}은 운영 안정감이 승부를 가른다.",
+        "{m}은 실점 관리가 되는 팀이 마무리까지 가져갈 확률이 높다.",
+    ]
+
+    intro = _deterministic_pick(f"{row_id}:intro", intro_templates).format(t=t_wo_date, m=match_phrase)
+    mid = _deterministic_pick(f"{row_id}:mid", mid_templates).format(t=t_wo_date, m=match_phrase)
+    outro = _deterministic_pick(f"{row_id}:outro", outro_templates).format(t=t_wo_date, m=match_phrase)
+
+    # 본문 안에 [최종 픽]이 있으면 그 직전에 mid 문장 삽입
+    b_norm = b.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if "[최종 픽]" in b_norm:
+        parts = b_norm.split("[최종 픽]", 1)
+        main = parts[0].rstrip()
+        rest = parts[1].lstrip()
+        composed = f"{intro}\n\n{main}\n\n{mid}\n\n[최종 픽]\n{rest}".strip()
+    else:
+        # 없으면 2문단 기준으로 중간 삽입
+        paras = [p.strip() for p in re.split(r"\n{2,}", b_norm) if p.strip()]
+        if len(paras) >= 2:
+            composed = f"{intro}\n\n{paras[0]}\n\n{mid}\n\n" + "\n\n".join(paras[1:])
+        else:
+            composed = f"{intro}\n\n{b_norm}\n\n{mid}".strip()
+
+    # 마무리 문장은 픽 뒤쪽(또는 끝)에 한 번 더
+    composed = composed.rstrip() + "\n\n" + outro
+
+    # 해시태그 구성
+    tags = []
+    tags += ["#스포츠분석", "#해외스포츠"]
+
+    # 종목 태그
+    if sport in ("해외축구", "K리그", "J리그", "축구"):
+        tags += ["#축구분석"]
+        tags += ["#K리그"] if sport == "K리그" else (["#J리그"] if sport == "J리그" else ["#해외축구"])
+    elif sport in ("KBO", "NPB", "MLB", "해외야구", "야구"):
+        tags += ["#야구분석"]
+        if sport == "KBO":
+            tags += ["#KBO"]
+        elif sport == "NPB":
+            tags += ["#NPB"]
+        elif sport == "MLB":
+            tags += ["#MLB"]
+        else:
+            tags += ["#해외야구"]
+    elif sport == "V리그":
+        tags += ["#배구분석", "#V리그"]
+    elif sport in ("배구",):
+        tags += ["#배구분석"]
+    elif sport in ("NBA", "농구"):
+        tags += ["#농구분석"]
+        if sport == "NBA":
+            tags += ["#NBA"]
+    elif sport == "KBL":
+        tags += ["#농구분석", "#KBL"]
+    elif sport == "WKBL":
+        tags += ["#농구분석", "#WKBL"]
+
+    # 리그 태그/팀 태그
+    lg = (league or "").strip()
+    if lg:
+        tags.append(_hashtagify(lg))
+    if home:
+        tags.append(_hashtagify(home))
+    if away:
+        tags.append(_hashtagify(away))
+
+    # 본문 기반 키워드 태그
+    tags += _keyword_tags_from_text(b_norm, max_n=4)
+
+    # 중복 제거 + 공백 제거 + 빈 태그 제거
+    seen = set()
+    uniq = []
+    for ttag in tags:
+        if not ttag:
+            continue
+        if ttag in seen:
+            continue
+        seen.add(ttag)
+        uniq.append(ttag)
+
+    # 너무 길면 컷
+    uniq = uniq[:12]
+
+    # 하단: 빈 줄 3번 + 제목 1회 + 해시태그
+    composed = composed.strip() + "\n\n\n" + t_wo_date + "\n" + " ".join(uniq)
+    return composed.strip()
+
 async def crawl_maz_analysis_common(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -3649,6 +3838,21 @@ async def crawl_maz_analysis_common(
                         row_sport = classify_basketball_volleyball_sport(league or "")
 
                     if needs_analysis:
+                        # ✅ G열(simple)용 본문에 제목 3회 자연스러운 삽입 + 해시태그 자동 생성
+                        try:
+                            if new_title and new_body:
+                                new_body = build_dynamic_cafe_simple(
+                                    title=new_title,
+                                    body=new_body,
+                                    row_id=row_id,
+                                    sport=row_sport,
+                                    league=league,
+                                    home=home,
+                                    away=away,
+                                )
+                        except Exception as e:
+                            print(f"[CAFE_SIMPLE][ERR] id={row_id}: {e}")
+
                         rows_to_append.append([row_sport, row_id, new_title, new_body])
 
                     # ✅ 사이트 업로드용(site_export)도 같이 저장
