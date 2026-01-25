@@ -635,6 +635,33 @@ def _cafe_format_text(text: str) -> str:
     # '[최종 픽]' 표기 통일 + 섹션 분리
     t = re.sub(r"\s*\[\s*최종\s*픽\s*\]\s*", "\n\n[최종 픽]\n", t)
 
+    # '[최종 픽]' 섹션이 한 줄로 뭉쳐 들어오는 경우를 줄 단위로 강제 분해
+    # 예) "[최종 픽] - 승패: A - 핸디: B - 언오버: C" 또는 "승패: A · 핸디: B · 언오버: C"
+    if "[최종 픽]\n" in t:
+        pre, post = t.split("[최종 픽]\n", 1)
+        post = (post or "").replace("\r\n", "\n").replace("\r", "\n")
+
+        # 키워드 앞 구분자( - / · | 등 )를 줄바꿈으로 치환
+        post = re.sub(r"\s*[-·ㆍ\|/]+\s*(?=(승패|핸디|언오버)\s*[:：])", "\n", post)
+
+        fixed_lines: list[str] = []
+        for raw in post.split("\n"):
+            s = (raw or "").strip()
+            if not s:
+                continue
+
+            # 기존 불릿 기호 제거
+            s = re.sub(r"^[\-\•\*]+\s*", "", s)
+
+            # 승패/핸디/언오버 라인은 불릿으로 고정
+            if re.match(r"^(승패|핸디|언오버)\s*[:：]", s):
+                fixed_lines.append("- " + s)
+            else:
+                fixed_lines.append(s)
+
+        post = "\n".join(fixed_lines).strip()
+        t = (pre.rstrip() + "\n\n[최종 픽]\n" + post).strip()
+
     # 리스트 항목 형태 통일
     t = re.sub(r"\n\s*-\s*", "\n- ", t)
 
@@ -653,20 +680,25 @@ def _cafe_text_to_center_html(text: str) -> str:
     - 가운데 정렬은 align + style을 같이 사용(살아남는 쪽으로)
 
     NOTE:
-    - 여기서는 사용자가 입력한 HTML을 허용하지 않고(escape),
-      오직 우리가 만든 <p> 태그만 사용한다.
+    - 카페 API 명세에 따르면 content는 HTML 태그 사용 가능하며 줄바꿈은 <br> 사용을 권장합니다.
+      (<br/> 또는 style 속성이 필터링되는 카페가 있어, <br> + <p align> 조합으로 단순화)
+    - 사용자가 입력한 HTML은 허용하지 않음(escape)
     """
     t = (text or "").replace("\r\n", "\n").replace("\r", "\n")
     lines = t.split("\n")
-    parts: list[str] = []
+
+    # HTML 태그는 최소화: <p align="center"> ... <br> ... </p>
+    # - <br> (슬래시 없는 형태)만 사용
+    # - 빈 줄은 &nbsp;를 한 줄로 넣어 <br> 사이 공백 줄이 보이게 함
+    esc_lines: list[str] = []
     for ln in lines:
-        esc = html.escape(ln)
-        if not esc.strip():
-            # 빈 줄은 &nbsp;로 유지(빈 p는 렌더링 시 높이가 0이 될 수 있음)
-            parts.append('<p align="center" style="text-align:center;">&nbsp;</p>')
+        if not (ln or "").strip():
+            esc_lines.append("&nbsp;")
         else:
-            parts.append(f'<p align="center" style="text-align:center;">{esc}</p>')
-    return "\r\n".join(parts)
+            esc_lines.append(html.escape(ln))
+
+    inner = "<br>".join(esc_lines)
+    return f'<p align="center">{inner}</p>'
 async def _cafe_parse_which_arg(context: ContextTypes.DEFAULT_TYPE) -> str:
     which = "today"
     args = getattr(context, "args", None) or []
