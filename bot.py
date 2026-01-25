@@ -3464,6 +3464,10 @@ async def crawl_maz_analysis_common(
 
     target_date = datetime.strptime(target_ymd, "%Y-%m-%d").date()
 
+    # ✅ 제목 앞 날짜 프리픽스 (today/tomorrow 명령어용)
+    # 예: '1월 25일 [분데스리가] ... 스포츠분석'
+    date_prefix = f"{target_date.month}월 {target_date.day}일 " if day_key in ("today", "tomorrow") else ""
+
     await update.message.reply_text(
         f"mazgtv {sport_label} 분석 페이지에서 {target_ymd} 경기 분석글을 가져옵니다. 잠시만 기다려 주세요..."
     )
@@ -3615,6 +3619,10 @@ async def crawl_maz_analysis_common(
                     else:
                         new_title, new_body = "", ""
 
+                    # ✅ today/tomorrow 크롤링은 시트 제목에 날짜를 붙인다
+                    if new_title and date_prefix and not new_title.startswith(date_prefix):
+                        new_title = date_prefix + new_title
+
                     # ✅ sport 세부 분류
                     row_sport = sport_label
 
@@ -3657,6 +3665,10 @@ async def crawl_maz_analysis_common(
                             except Exception as e:
                                 print(f"[SITE_EXPORT][ERR] id={board_id}: {e}")
                             else:
+                                # ✅ site_export 제목에도 날짜 프리픽스 적용
+                                if site_title and date_prefix and not site_title.startswith(date_prefix):
+                                    site_title = date_prefix + site_title
+
                                 site_rows_to_append.append([
                                     day_key,
                                     row_sport,
@@ -3697,7 +3709,7 @@ async def crawl_maz_analysis_common(
 
     extra = ""
     if export_site:
-        extra = f"\\nexport 시트에도 {len(site_rows_to_append)}건을 저장했습니다."
+        extra = f"\nexport 시트에도 {len(site_rows_to_append)}건을 저장했습니다."
 
     saved_analysis_cnt = len(rows_to_append)
     saved_export_cnt = len(site_rows_to_append) if export_site else 0
@@ -3809,6 +3821,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_reply_markup(
             reply_markup=build_analysis_match_menu(key, subsport, page=1)
         )
+
         return
 
     # 야구 하위 카테고리 (해외야구 / KBO / NPB)
@@ -4329,8 +4342,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
 
 
 
