@@ -1560,13 +1560,13 @@ def append_site_export_rows(rows: list[list[str]]) -> bool:
                 continue
             rr = list(r)
             if len(rr) == 6:
-                rr.append(extract_simple_from_body(rr[4] if len(rr) > 4 else ""))
+                rr.append(build_dynamic_cafe_simple(title=rr[3] if len(rr)>3 else "", body=rr[4] if len(rr)>4 else "", row_id=rr[2] if len(rr)>2 else "", sport=rr[1] if len(rr)>1 else ""))
             elif len(rr) >= 7:
                 rr = rr[:7]
             else:
                 while len(rr) < 6:
                     rr.append("")
-                rr.append(extract_simple_from_body(rr[4] if len(rr) > 4 else ""))
+                rr.append(build_dynamic_cafe_simple(title=rr[3] if len(rr)>3 else "", body=rr[4] if len(rr)>4 else "", row_id=rr[2] if len(rr)>2 else "", sport=rr[1] if len(rr)>1 else ""))
             fixed_rows.append(rr)
         rows = fixed_rows
         ws.append_rows(rows, value_input_option="RAW", table_range="A1")
@@ -1638,15 +1638,15 @@ def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
             continue
         rr = list(r)
         if len(rr) == 6:
-            rr.append(extract_simple_from_body(rr[4] if len(rr) > 4 else ""))
+            rr.append(build_dynamic_cafe_simple(title=rr[3] if len(rr)>3 else "", body=rr[4] if len(rr)>4 else "", row_id=rr[2] if len(rr)>2 else "", sport=rr[1] if len(rr)>1 else ""))
         elif len(rr) >= 7:
             rr = rr[:7]
             if not str(rr[6]).strip():
-                rr[6] = extract_simple_from_body(rr[4] if len(rr) > 4 else "")
+                rr[6] = build_dynamic_cafe_simple(title=rr[3] if len(rr)>3 else "", body=rr[4] if len(rr)>4 else "", row_id=rr[2] if len(rr)>2 else "", sport=rr[1] if len(rr)>1 else "")
         else:
             while len(rr) < 6:
                 rr.append("")
-            rr.append(extract_simple_from_body(rr[4] if len(rr) > 4 else ""))
+            rr.append(build_dynamic_cafe_simple(title=rr[3] if len(rr)>3 else "", body=rr[4] if len(rr)>4 else "", row_id=rr[2] if len(rr)>2 else "", sport=rr[1] if len(rr)>1 else ""))
         fixed_rows.append(rr)
     rows = fixed_rows
 
