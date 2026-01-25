@@ -292,7 +292,7 @@ import re
 import requests
 import httpx
 import unicodedata
-from urllib.parse import quote
+from urllib.parse import quote, quote_plus
 
 import traceback
 # ───────────────── 네이버 카페 자동 글쓰기 (추후: '네이버 카페 자동 글쓰기') ─────────────────
@@ -402,22 +402,29 @@ def _naver_clean_text(s: str) -> str:
     return s2.strip()
 
 
-def _naver_quote(s: str, *, double: bool = False) -> str:
-    """URL-encode a field for application/x-www-form-urlencoded.
+def _naver_quote(s: str, *, double: bool = True) -> str:
+    """네이버 카페 API subject/content 인코딩.
 
-    - default: single UTF-8 quote
-    - double=True: quote twice (utf-8 -> cp949) as a fallback for some legacy behaviors
+    공식 문서(Java 예제) 및 포럼 답변 기준:
+    - 1차: UTF-8로 URL 인코딩
+    - 2차: 1차 결과를 다시 MS949로 URL 인코딩(퍼센트(%)가 %25로 한 번 더 인코딩됨)
+
+    참고:
+    - Java URLEncoder 동작과 최대한 맞추기 위해 quote_plus 사용(공백은 +)
     """
     base = _naver_clean_text(s)
-    q1 = quote(base, safe="", encoding="utf-8")
+    q1 = quote_plus(base, safe="", encoding="utf-8")
+
     if not double:
         return q1
 
-    # 2차 인코딩(문서 일부 예시의 MS949 단계 대응용)
+    # 입력은 ASCII(%,0-9,A-F,+ 등) 위주라 실제 핵심은 'double encode'이며
+    # encoding은 문서 표기(MS949)에 맞춰 ms949 우선 적용
     try:
-        return quote(q1, safe="", encoding="cp949")
-    except Exception:
-        return quote(q1, safe="", encoding="utf-8")
+        return quote_plus(q1, safe="", encoding="ms949")
+    except LookupError:
+        return quote_plus(q1, safe="", encoding="cp949")
+
 
 
 def _naver_is_code_999(err: str) -> bool:
@@ -459,10 +466,12 @@ def _naver_extract_err(resp) -> str:
 def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tuple[bool, str]:
     """네이버 카페에 글쓰기. (success, articleId_or_error)
 
-    핵심:
-    - Content-Type: application/x-www-form-urlencoded
-    - subject/content를 URL 인코딩(quote, UTF-8)해서 전송 (한글/HTML 깨짐 방지)
-    - 403 + code=999 케이스는 'double encode' 1회 폴백
+    네이버 Developers 공식 문서(Java 예제) 및 포럼 안내 기준으로 subject/content는
+    'UTF-8로 1차 URL 인코딩' 후, 그 결과를 'MS949로 2차 URL 인코딩'하는 방식(이중 인코딩)이
+    한글 깨짐 방지에 가장 안정적입니다.
+
+    - 기본값: 이중 인코딩 사용
+    - 끄고 싶으면: 환경변수 NAVER_CAFE_DOUBLE_ENCODE=0
     """
     token = _naver_refresh_access_token()
     if not token:
@@ -482,27 +491,24 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
     url = f"https://openapi.naver.com/v1/cafe/{clubid}/menu/{menuid}/articles"
     headers = {
         "Authorization": f"Bearer {token}",
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Content-Type": "application/x-www-form-urlencoded",
     }
 
-    def _do_post(double: bool = False):
-        body = f"subject={_naver_quote(subject_raw, double=double)}&content={_naver_quote(content_raw, double=double)}"
-        return requests.post(url, headers=headers, data=body.encode("utf-8"), timeout=30)
+    # double URL encode on/off
+    de = os.getenv("NAVER_CAFE_DOUBLE_ENCODE", "1").strip().lower()
+    use_double = de not in ("0", "false", "no", "off")
+
+    body = (
+        f"subject={_naver_quote(subject_raw, double=use_double)}"
+        f"&content={_naver_quote(content_raw, double=use_double)}"
+    )
 
     try:
-        resp = _do_post(double=False)
+        # body는 URL 인코딩 결과로 ASCII만 포함(%,0-9,A-F,+ 등) → 어떤 charset이든 안전
+        resp = requests.post(url, headers=headers, data=body.encode("ascii"), timeout=30)
 
         if resp.status_code != 200:
-            err1 = _naver_extract_err(resp)
-
-            # 403 + 999류는 1회 double-encode 폴백
-            if _naver_is_code_999(err1):
-                resp2 = _do_post(double=True)
-                if resp2.status_code != 200:
-                    return False, _naver_extract_err(resp2)
-                resp = resp2  # 성공하면 아래 파싱으로 진행
-            else:
-                return False, err1
+            return False, _naver_extract_err(resp)
 
         # 응답 포맷이 고정되어 있지 않아서 안전 파싱
         article_id = ""
@@ -533,6 +539,7 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
 
     except Exception as e:
         return False, f"EXC:{e}"
+
 
 def get_cafe_log_ws():
     """cafe_log 워크시트 반환(없으면 생성 + 헤더 세팅)."""
