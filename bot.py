@@ -3495,6 +3495,7 @@ def _keyword_tags_from_text(text: str, max_n: int = 4) -> list[str]:
             out.append(tag)
     return out
 
+
 def build_dynamic_cafe_simple(
     *,
     title: str,
@@ -3505,974 +3506,249 @@ def build_dynamic_cafe_simple(
     home: str = "",
     away: str = "",
 ) -> str:
-    """
-    G열(simple)용 텍스트를 '도입/중간/마무리' 3회 자연스러운 언급 + 해시태그까지 포함해 생성.
-    - 문장 패턴은 row_id 기반 deterministic 선택(재실행해도 동일 글은 동일 문장) => 관리 편함.
+    """G열(simple)용 '짧은 카페 원고' 생성.
+
+    목표:
+    - body 전체를 복사하지 않는다.
+    - [핵심 포인트 요약]을 1문장으로 요약(가능하면) + [최종 픽] 블록만 포함.
+    - 제목/매치업을 도입/중간/마무리에 자연스럽게 1회씩(총 3회) 노출.
+    - 끝에 해시태그 자동 생성.
+
+    주의:
+    - 템플릿 문장은 row_id 기반 deterministic 선택(재실행해도 동일 글은 동일 문장).
     """
     t = (title or "").strip()
     b = (body or "").strip()
-    t_wo_date = _strip_date_prefix(t)
-    match_phrase = _extract_match_phrase(t_wo_date)
+    rid = (row_id or "").strip() or (hashlib.sha1((t + b).encode("utf-8")).hexdigest()[:12])
+    sp = (sport or "").strip()
 
-    # 도입/중간/마무리 문장 풀 (고정 문장 반복 최소화)
-    intro_templates = [
-        "{t}은 오늘 흐름을 가르는 포인트가 분명하다.",
-        "{t}에서 가장 먼저 볼 건 수비 밸런스와 전환 속도다.",
-        "이번 {t}은 초반 압박과 세트피스 대응이 핵심으로 보인다.",
-        "{t}은 전력 공백과 체력 싸움이 변수가 될 가능성이 있다.",
-        "{t}은 전술 상성에서 갈리는 지점이 꽤 뚜렷하다.",
-        "지금 공개된 정보 기준으로 {t}은 한쪽 흐름으로 기울기 쉽다.",
-        "{t}은 라인업과 운영에서 차이가 나는 매치업이다.",
-        "{t}은 후반으로 갈수록 격차가 벌어질 그림이 보인다.",
-    ]
-    mid_templates = [
-        "중반 구간에서 {m} 스포츠분석 포인트는 전환 상황에서의 수비 대응이다.",
-        "흐름이 이어질수록 {m}은 압박 강도와 체력에서 차이가 드러날 수 있다.",
-        "{m}은 세트피스 한 번에 분위기가 바뀔 여지가 있다.",
-        "{m}은 원정/홈 운영 차이가 결과에 직접 연결될 가능성이 높다.",
-        "경기 템포가 올라가면 {m} 쪽에서 실수가 먼저 나올 수 있다.",
-        "전반을 버텨도 후반 들어 {m}은 라인 간격이 벌어질 수 있다.",
-        "{m}은 공격 전개보다 수비 조직력이 먼저 시험대에 오른다.",
-    ]
-    outro_templates = [
-        "{m} 스포츠분석 기준으로 결론은 깔끔하게 가져가는 쪽이 유리하다.",
-        "정리하면 {m}은 변수보다 기본 전력 차이를 우선으로 봐야 한다.",
-        "결국 {m}은 세트피스/전환에서 우위가 승부를 가를 가능성이 크다.",
-        "{m}은 초반보다 후반에 승부가 갈릴 그림이다.",
-        "한 줄로 요약하면 {m}은 운영 안정감이 승부를 가른다.",
-        "{m}은 실점 관리가 되는 팀이 마무리까지 가져갈 확률이 높다.",
-    ]
+    # --- helpers ---
+    def _seed_int(s: str) -> int:
+        return int(hashlib.sha1(s.encode("utf-8")).hexdigest()[:8], 16)
 
-    intro = _deterministic_pick(f"{row_id}:intro", intro_templates).format(t=t_wo_date, m=match_phrase)
-    mid = _deterministic_pick(f"{row_id}:mid", mid_templates).format(t=t_wo_date, m=match_phrase)
-    outro = _deterministic_pick(f"{row_id}:outro", outro_templates).format(t=t_wo_date, m=match_phrase)
+    seed = _seed_int(rid)
 
-    # 본문 안에 [최종 픽]이 있으면 그 직전에 mid 문장 삽입
-    b_norm = b.replace("\r\n", "\n").replace("\r", "\n").strip()
-    if "[최종 픽]" in b_norm:
-        parts = b_norm.split("[최종 픽]", 1)
-        main = parts[0].rstrip()
-        rest = parts[1].lstrip()
-        composed = f"{intro}\n\n{main}\n\n{mid}\n\n[최종 픽]\n{rest}".strip()
+    def _pick(lst, k=0):
+        if not lst:
+            return ""
+        return lst[(seed + k) % len(lst)]
+
+    def _clean_spaces(x: str) -> str:
+        x = (x or "").strip()
+        x = re.sub(r"\s+", " ", x).strip()
+        return x
+
+    def _strip_date_prefix_local(x: str) -> str:
+        # 기존 _strip_date_prefix가 있으면 우선 사용
+        try:
+            return _strip_date_prefix(x)
+        except Exception:
+            return re.sub(r"^\s*\d{1,2}월\s*\d{1,2}일\s+", "", x).strip()
+
+    def _parse_league_from_title(x: str) -> str:
+        x2 = _strip_date_prefix_local(x)
+        m = re.match(r"^\[(.+?)\]\s*", x2)
+        return (m.group(1).strip() if m else "")
+
+    def _remove_league_bracket(x: str) -> str:
+        x2 = _strip_date_prefix_local(x)
+        x2 = re.sub(r"^\[.+?\]\s*", "", x2).strip()
+        return x2
+
+    def _parse_matchup_from_title(x: str) -> tuple[str, str]:
+        x2 = _remove_league_bracket(x)
+        # 뒤쪽 수식어 제거
+        x2 = re.sub(r"\s*스포츠분석\s*$", "", x2).strip()
+        # separators
+        if " vs " in x2:
+            a, b2 = x2.split(" vs ", 1)
+            return _clean_spaces(a), _clean_spaces(b2)
+        if " VS " in x2:
+            a, b2 = x2.split(" VS ", 1)
+            return _clean_spaces(a), _clean_spaces(b2)
+        if "vs" in x2:
+            a, b2 = x2.split("vs", 1)
+            return _clean_spaces(a), _clean_spaces(b2)
+        # fallback: "A 대 B"
+        if " 대 " in x2:
+            a, b2 = x2.split(" 대 ", 1)
+            return _clean_spaces(a), _clean_spaces(b2)
+        return "", ""
+
+    def _topic_particle(word: str) -> str:
+        # 받침 있으면 '은', 없으면 '는'
+        if not word:
+            return "는"
+        ch = word[-1]
+        code = ord(ch)
+        if 0xAC00 <= code <= 0xD7A3:
+            jong = (code - 0xAC00) % 28
+            return "은" if jong != 0 else "는"
+        return "는"
+
+    # infer league/home/away
+    lg = (league or "").strip() or _parse_league_from_title(t)
+    h = (home or "").strip()
+    a = (away or "").strip()
+    if not (h and a):
+        ph, pa = _parse_matchup_from_title(t)
+        h = h or ph
+        a = a or pa
+
+    matchup = ""
+    if h and a:
+        matchup = f"{h} vs {a}"
     else:
-        # 없으면 2문단 기준으로 중간 삽입
-        paras = [p.strip() for p in re.split(r"\n{2,}", b_norm) if p.strip()]
-        if len(paras) >= 2:
-            composed = f"{intro}\n\n{paras[0]}\n\n{mid}\n\n" + "\n\n".join(paras[1:])
-        else:
-            composed = f"{intro}\n\n{b_norm}\n\n{mid}".strip()
+        matchup = _remove_league_bracket(t)
 
-    # 마무리 문장은 픽 뒤쪽(또는 끝)에 한 번 더
-    composed = composed.rstrip() + "\n\n" + outro
+    # --- 핵심 요약 + 픽 블록 ---
+    core = extract_simple_from_body(b) or ""
+    # extract_simple_from_body는 '요약\n\n[최종 픽]...' 형태일 수 있음
+    core = core.replace("\r\n", "\n").replace("\r", "\n").strip()
 
-    # 해시태그 구성
-    tags = []
-    tags += ["#스포츠분석", "#해외스포츠"]
+    summary_line = ""
+    pick_block = ""
+    if core:
+        parts = [p.strip() for p in core.split("\n\n") if p.strip()]
+        if parts:
+            summary_line = parts[0]
+            if len(parts) >= 2 and ("최종" in parts[1] or "승패" in parts[1] or "핸디" in parts[1] or "언오버" in parts[1]):
+                pick_block = "\n\n".join(parts[1:]).strip()
 
-    # 종목 태그
-    if sport in ("해외축구", "K리그", "J리그", "축구"):
-        tags += ["#축구분석"]
-        tags += ["#K리그"] if sport == "K리그" else (["#J리그"] if sport == "J리그" else ["#해외축구"])
-    elif sport in ("KBO", "NPB", "MLB", "해외야구", "야구"):
-        tags += ["#야구분석"]
-        if sport == "KBO":
-            tags += ["#KBO"]
-        elif sport == "NPB":
-            tags += ["#NPB"]
-        elif sport == "MLB":
-            tags += ["#MLB"]
-        else:
-            tags += ["#해외야구"]
-    elif sport == "V리그":
-        tags += ["#배구분석", "#V리그"]
-    elif sport in ("배구",):
-        tags += ["#배구분석"]
-    elif sport in ("NBA", "농구"):
-        tags += ["#농구분석"]
-        if sport == "NBA":
-            tags += ["#NBA"]
-    elif sport == "KBL":
-        tags += ["#농구분석", "#KBL"]
-    elif sport == "WKBL":
-        tags += ["#농구분석", "#WKBL"]
+    # fallback summary if 핵심 포인트 요약이 없을 때
+    if not summary_line:
+        # body의 첫 1~2문장만 추출
+        plain = b
+        plain = plain.replace("\r\n", "\n").replace("\r", "\n")
+        plain = re.sub(r"<br\s*/?>", "\n", plain, flags=re.I)
+        plain = re.sub(r"</(p|div|li)>", "\n", plain, flags=re.I)
+        plain = re.sub(r"<[^>]+>", "", plain)
+        plain = plain.replace("&nbsp;", " ")
+        plain = re.sub(r"\s+", " ", plain).strip()
+        # 문장 분리(간단)
+        sents = re.split(r"(?<=[\.\!\?。])\s+", plain)
+        summary_line = " ".join([s.strip() for s in sents[:2] if s.strip()])[:220].strip()
+        if not summary_line:
+            summary_line = matchup + " 경기 핵심 포인트를 정리했다."
 
-    # 리그 태그/팀 태그
-    lg = (league or "").strip()
+    # 최종 픽이 body에 있는데 core에서 못 잡았으면 추출
+    if not pick_block:
+        try:
+            pick_block = extract_final_pick_from_body(b) or ""
+        except Exception:
+            pick_block = ""
+        pick_block = pick_block.strip()
+
+    # --- 템플릿(도입/중간/마무리) ---
     if lg:
-        tags.append(_hashtagify(lg))
-    if home:
-        tags.append(_hashtagify(home))
-    if away:
-        tags.append(_hashtagify(away))
-
-    # 본문 기반 키워드 태그
-    tags += _keyword_tags_from_text(b_norm, max_n=4)
-
-    # 중복 제거 + 공백 제거 + 빈 태그 제거
-    seen = set()
-    uniq = []
-    for ttag in tags:
-        if not ttag:
-            continue
-        if ttag in seen:
-            continue
-        seen.add(ttag)
-        uniq.append(ttag)
-
-    # 너무 길면 컷
-    uniq = uniq[:12]
-
-    # 하단: 빈 줄 3번 + 제목 1회 + 해시태그
-    composed = composed.strip() + "\n\n\n" + t_wo_date + "\n" + " ".join(uniq)
-    return composed.strip()
-
-async def crawl_maz_analysis_common(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    *,
-    base_url: str,
-    sport_label: str,
-    league_default: str,
-    day_key: str = "tomorrow",
-    max_pages: int = 5,
-    board_type: int = 2,
-    category: int = 1,
-    target_ymd: str | None = None,
-    export_site: bool = False,
-):
-    if not is_admin(update):
-        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
-        return
-
-    # ✅ 날짜 기준 설정 (today/tomorrow)
-    if target_ymd is None:
-        base_date = get_kst_now().date()
-        if day_key == "tomorrow":
-            base_date += timedelta(days=1)
-        target_ymd = base_date.strftime("%Y-%m-%d")
-
-    target_date = datetime.strptime(target_ymd, "%Y-%m-%d").date()
-
-    # ✅ 제목 앞 날짜 프리픽스 (today/tomorrow 명령어용)
-    # 예: '1월 25일 [분데스리가] ... 스포츠분석'
-    date_prefix = f"{target_date.month}월 {target_date.day}일 " if day_key in ("today", "tomorrow") else ""
-
-    await update.message.reply_text(
-        f"mazgtv {sport_label} 분석 페이지에서 {target_ymd} 경기 분석글을 가져옵니다. 잠시만 기다려 주세요..."
-    )
-
-    rows_to_append: list[list[str]] = []
-
-    # ✅ 중복 방지: 이미 today/tomorrow 시트에 있는 src_id 모으기
-    existing_ids = get_existing_analysis_ids(day_key)
-
-    # ✅ site_export 시트 중복 방지용
-    export_sheet_name = EXPORT_TODAY_SHEET_NAME if day_key == "today" else EXPORT_TOMORROW_SHEET_NAME
-    existing_export_src_ids = get_existing_export_src_ids(export_sheet_name) if export_site else set()
-    site_rows_to_append: list[list[str]] = []
-
-    try:
-        async with httpx.AsyncClient(
-            headers={"User-Agent": "Mozilla/5.0"},
-            follow_redirects=True,
-        ) as client:
-            await _maz_warmup(client)
-
-            for page in range(1, max_pages + 1):
-                list_url = (
-                    f"{MAZ_LIST_API}"
-                    f"?page={page}&perpage=20"
-                    f"&boardType={board_type}&category={category}"
-                    f"&sort=b.game_start_at+DESC,+b.created_at+DESC"
-                )
-
-                r = await client.get(list_url, timeout=10.0)
-                r.raise_for_status()
-
-                try:
-                    data = r.json()
-                except Exception as e:
-                    print(f"[MAZ][LIST] JSON 파싱 실패(page={page}): {e}")
-                    print("  응답 일부:", r.text[:200])
-                    continue
-
-                if isinstance(data, dict):
-                    items = (
-                        data.get("rows")
-                        or (data.get("data") or {}).get("rows")
-                        or data.get("list")
-                        or data.get("items")
-                    )
-                else:
-                    items = data
-
-                if not isinstance(items, list) or not items:
-                    print(f"[MAZ][LIST] page={page} 항목 없음 → 반복 종료")
-                    break
-
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-
-                    board_id = item.get("id")
-                    if not board_id:
-                        continue
-
-                    row_id = f"maz_{board_id}"
-
-                    # ✅ 중복 처리
-                    needs_analysis = row_id not in existing_ids
-                    needs_export = bool(export_site) and (row_id not in existing_export_src_ids)
-                    if (not needs_analysis) and (not needs_export):
-                        print(f"[MAZ][SKIP_DUP] already exists (analysis+export): {row_id}")
-                        continue
-                    if (not needs_analysis) and needs_export:
-                        print(f"[MAZ][BACKFILL] analysis exists but export missing: {row_id}")
-
-                    game_start_at = (
-                        item.get("gameStartAt")
-                        or item.get("game_start_at")
-                        or ""
-                    )
-                    game_start_at = str(game_start_at).strip()
-
-                    game_start_at_text = str(item.get("gameStartAtText") or "").strip()
-                    print(
-                        f"[MAZ][DEBUG] page={page} id={board_id} "
-                        f"gameStartAt='{game_start_at}' gameStartAtText='{game_start_at_text}'"
-                    )
-
-                    # 1) gameStartAt로 날짜 파싱
-                    item_date = _parse_game_start_date(game_start_at)
-
-                    # 2) 실패하면 item 전체에서 날짜 패턴 탐색 (연도 보정용)
-                    if not item_date:
-                        item_date = detect_game_date_from_item(item, target_date)
-
-                    print(f"[MAZ][DEBUG_DATE] page={page} id={board_id} item_date={item_date}")
-
-                    if not item_date:
-                        continue
-
-                    # ✅ 날짜 필터링
-                    # - 축구/농구/배구: target_date와 정확히 일치만
-                    # - 야구: (혹시 주간 카드로 들어오는 경우) 일치가 아니면 같은 주(0~6일)까지 허용
-                    if sport_label == "야구":
-                        if item_date != target_date:
-                            delta_days = (target_date - item_date).days
-                            if delta_days < 0 or delta_days >= 7:
-                                continue
-                    else:
-                        if item_date != target_date:
-                            continue
-
-                    league = item.get("leagueName") or league_default
-                    home = item.get("homeTeamName") or ""
-                    away = item.get("awayTeamName") or ""
-
-                    detail_url = MAZ_DETAIL_API_TEMPLATE.format(board_id=board_id)
-                    try:
-                        r2 = await client.get(detail_url, timeout=10.0)
-                        r2.raise_for_status()
-                        detail = r2.json()
-                    except Exception as e:
-                        print(f"[MAZ][DETAIL] id={board_id} 요청 실패: {e}")
-                        continue
-
-                    content_html = detail.get("content") or ""
-                    if not str(content_html).strip():
-                        print(f"[MAZ][DETAIL] id={board_id} content 없음")
-                        continue
-
-                    soup = BeautifulSoup(content_html, "html.parser")
-                    try:
-                        for bad in soup.select("script, style, .ad, .banner"):
-                            bad.decompose()
-                    except Exception:
-                        pass
-
-                    full_text = soup.get_text("\n", strip=True)
-                    full_text = clean_maz_text(full_text)
-                    if not full_text:
-                        print(f"[MAZ][DETAIL] id={board_id} 본문 텍스트 없음")
-                        continue
-
-                    if needs_analysis:
-                        new_title, new_body = summarize_analysis_with_gemini(
-                            full_text,
-                            league=league,
-                            home_team=home,
-                            away_team=away,
-                            max_chars=900,
-                        )
-                    else:
-                        new_title, new_body = "", ""
-
-                    # ✅ today/tomorrow 크롤링은 시트 제목에 날짜를 붙인다
-                    if new_title and date_prefix and not new_title.startswith(date_prefix):
-                        new_title = date_prefix + new_title
-
-                    # ✅ sport 세부 분류
-                    row_sport = sport_label
-
-                    if sport_label == "축구":
-                        if "K리그" in league:
-                            row_sport = "K리그"
-                        elif "J리그" in league:
-                            row_sport = "J리그"
-                        else:
-                            row_sport = "해외축구"
-
-                    elif sport_label == "야구":
-                        upper_league = (league or "").upper()
-                        if "KBO" in upper_league:
-                            row_sport = "KBO"
-                        elif "NPB" in upper_league:
-                            row_sport = "NPB"
-                        elif "MLB" in upper_league:
-                            row_sport = "해외야구"
-                        else:
-                            row_sport = "해외야구"
-
-                    elif sport_label in ("농구", "농구/배구"):
-                        row_sport = classify_basketball_volleyball_sport(league or "")
-
-                    if needs_analysis:
-                        # ✅ G열(simple)용 본문에 제목 3회 자연스러운 삽입 + 해시태그 자동 생성
-                        try:
-                            if new_title and new_body:
-                                new_body = build_dynamic_cafe_simple(
-                                    title=new_title,
-                                    body=new_body,
-                                    row_id=row_id,
-                                    sport=row_sport,
-                                    league=league,
-                                    home=home,
-                                    away=away,
-                                )
-                        except Exception as e:
-                            print(f"[CAFE_SIMPLE][ERR] id={row_id}: {e}")
-
-                        rows_to_append.append([row_sport, row_id, new_title, new_body])
-
-                    # ✅ 사이트 업로드용(site_export)도 같이 저장
-                    if export_site and needs_export:
-                        # export 시트에만 백필/저장
-                        
-                            try:
-                                site_title, site_body = rewrite_for_site_openai(
-                                    full_text,
-                                    league=league,
-                                    home_team=home,
-                                    away_team=away,
-                                )
-                            except Exception as e:
-                                print(f"[SITE_EXPORT][ERR] id={board_id}: {e}")
-                            else:
-                                # ✅ site_export 제목에도 날짜 프리픽스 적용
-                                if site_title and date_prefix and not site_title.startswith(date_prefix):
-                                    site_title = date_prefix + site_title
-
-                                site_rows_to_append.append([
-                                    day_key,
-                                    row_sport,
-                                    row_id,
-                                    site_title,
-                                    site_body,
-                                    get_kst_now().strftime("%Y-%m-%d %H:%M:%S"),
-                                ])
-                                existing_export_src_ids.add(row_id)
-
-    except Exception as e:
-        # ✅ 여기 except는 try와 같은 들여쓰기 레벨이어야 함
-        await update.message.reply_text(f"요청 오류가 발생했습니다: {e}")
-        return
-
-    if (not rows_to_append) and (not site_rows_to_append):
-        await update.message.reply_text(
-            f"mazgtv {sport_label} 분석에서 {target_ymd} 경기 분석글을 찾지 못했습니다."
-        )
-        return
-
-    if rows_to_append:
-        ok = append_analysis_rows(day_key, rows_to_append)
-        if not ok:
-            await update.message.reply_text("구글시트에 분석 데이터를 저장하지 못했습니다.")
-            return
+        title_phrase = f"[{lg}] {matchup} 스포츠분석"
     else:
-        ok = True
+        title_phrase = f"{matchup} 스포츠분석"
 
-    # ✅ site_export 시트 저장
-    if export_site and site_rows_to_append:
-        ok2 = append_export_rows(export_sheet_name, site_rows_to_append)
-        if not ok2:
-            await update.message.reply_text("site_export 시트 저장 중 오류가 발생했습니다.")
+    intro_pool = [
+        f"{title_phrase}은 전술과 흐름에서 변수가 뚜렷한 매치업이다.",
+        f"오늘 {title_phrase}은 구도 차이가 승부를 가를 가능성이 크다.",
+        f"{title_phrase}은 약점이 드러나는 구간을 먼저 확인해야 한다.",
+        f"{title_phrase}은 라인 간격과 세트피스 대응이 핵심 포인트다.",
+        f"{title_phrase}은 운영 방향이 갈리는 경기다.",
+    ]
+
+    mid_pool = [
+        f"흐름을 보면 {matchup}{_topic_particle(matchup)} 특정 구간에서 우위가 갈릴 수 있다.",
+        f"전개가 길어질수록 {matchup}{_topic_particle(matchup)} 체력과 전환에서 차이가 난다.",
+        f"결국 {matchup}{_topic_particle(matchup)} 세트피스/전환 타이밍이 승부처가 된다.",
+        f"중원 싸움이 붙으면 {matchup}{_topic_particle(matchup)} 압박과 탈압박에서 갈린다.",
+        f"상대 약점을 파고드는 쪽이 {matchup}에서 먼저 점수를 낼 가능성이 높다.",
+    ]
+
+    outro_pool = [
+        f"정리하면 {matchup}{_topic_particle(matchup)} 핵심 한두 장면에서 우위가 결정될 가능성이 크다.",
+        f"결론적으로 {matchup}{_topic_particle(matchup)} 운영 완성도 차이가 결과로 이어질 수 있다.",
+        f"마무리는 {matchup}{_topic_particle(matchup)} 변수 대응과 세트피스에서 갈릴 수 있다.",
+        f"한 줄로 보면 {matchup}{_topic_particle(matchup)} 흐름이 넘어가는 시점이 승부처다.",
+        f"최종적으로 {matchup}{_topic_particle(matchup)} 전환 속도와 마무리에서 차이가 난다.",
+    ]
+
+    intro = _pick(intro_pool, 0)
+    mid = _pick(mid_pool, 2)
+    outro = _pick(outro_pool, 4)
+
+    # --- 해시태그 ---
+    tags = []
+    def _add(tag: str):
+        tag = (tag or "").strip()
+        if not tag:
             return
-
-    reload_analysis_from_sheet()
-
-    extra = ""
-    if export_site:
-        extra = f"\nexport 시트에도 {len(site_rows_to_append)}건을 저장했습니다."
-
-    saved_analysis_cnt = len(rows_to_append)
-    saved_export_cnt = len(site_rows_to_append) if export_site else 0
-    await update.message.reply_text(
-        f"mazgtv {sport_label} 분석에서 {target_ymd} 저장 완료: "
-        f"분석시트 {saved_analysis_cnt}건, export {saved_export_cnt}건." + extra + "\n"
-        "텔레그램에서 경기 분석픽 메뉴를 열어 확인해보세요."
-    )
-
-# ───────────────── 종목별 (Daum 뉴스) 크롤링 명령어 ─────────────────
-
-# 해외축구
-async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cat_id = DAUM_CATEGORY_IDS.get("world_soccer")
-    await crawl_daum_news_common(
-        update,
-        context,
-        category_id=cat_id,
-        sport_label="축구",
-        max_articles=5,
-    )
-
-
-# 국내축구 (K리그 등, 5개)
-async def crawlsoccerkr(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cat_id = DAUM_CATEGORY_IDS.get("soccer_kleague")
-    await crawl_daum_news_common(
-        update,
-        context,
-        category_id=cat_id,
-        sport_label="축구",   # 해외/국내를 한 카테고리에 묶어서 보여주기
-        max_articles=5,
-    )
-
-
-# KBO 야구
-async def crawlbaseball(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cat_id = DAUM_CATEGORY_IDS.get("baseball_kbo")
-    await crawl_daum_news_common(
-        update,
-        context,
-        category_id=cat_id,
-        sport_label="야구",
-        max_articles=5,
-    )
-
-
-# 해외야구 (MLB 등)
-async def crawloverbaseball(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cat_id = DAUM_CATEGORY_IDS.get("baseball_world")
-    await crawl_daum_news_common(
-        update,
-        context,
-        category_id=cat_id,
-        sport_label="야구",  # 필요하면 '해외야구'로 분리해서도 가능
-        max_articles=5,
-    )
-
-
-# 농구
-async def crawlbasketball(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cat_id = DAUM_CATEGORY_IDS.get("basketball")
-    await crawl_daum_news_common(
-        update,
-        context,
-        category_id=cat_id,
-        sport_label="농구",
-        max_articles=10,
-    )
-
-
-# 배구
-async def crawlvolleyball(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cat_id = DAUM_CATEGORY_IDS.get("volleyball")
-    await crawl_daum_news_common(
-        update,
-        context,
-        category_id=cat_id,
-        sport_label="배구",
-        max_articles=10,
-    )
-
-# 4) 인라인 버튼 콜백 처리 (분석/뉴스 팝업)
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if q:
-        # callback query는 생성 후 짧은 시간 내에 answer 해야 오류가 안 난다.
-        try:
-            await q.answer()
-        except BadRequest as e:
-            if "Query is too old" in str(e) or "query id is invalid" in str(e):
-                pass
-            else:
-                raise
-    data = q.data or ""
-    # 아무 동작 안 하는 더미
-    if data == "noop":
-        return
-
-    # 메인 메뉴로
-    if data == "back_main":
-        await q.edit_message_reply_markup(reply_markup=build_main_inline_menu())
-        return
-
-    # 축구 하위 카테고리 (해외축구 / K리그 / J리그)
-    if data.startswith("soccer_cat:"):
-        _, key, subsport = data.split(":", 2)
-        # subsport: "해외축구", "K리그", "J리그"
-        await q.edit_message_reply_markup(
-            reply_markup=build_analysis_match_menu(key, subsport, page=1)
-        )
-
-        return
-
-    # 야구 하위 카테고리 (해외야구 / KBO / NPB)
-    if data.startswith("baseball_cat:"):
-        _, key, subsport = data.split(":", 2)
-        # subsport: "해외야구", "KBO", "NPB"
-        await q.edit_message_reply_markup(
-            reply_markup=build_analysis_match_menu(key, subsport, page=1)
-        )
-        return
-
-        # 농구 하위 카테고리 (NBA / KBL)
-    if data.startswith("basket_cat:"):
-        _, key, subsport = data.split(":", 2)
-        # subsport: "NBA", "KBL"
-        await q.edit_message_reply_markup(
-            reply_markup=build_analysis_match_menu(key, subsport, page=1)
-        )
-        return
-
-    # 배구 하위 카테고리 (V리그)
-    if data.startswith("volley_cat:"):
-        _, key, subsport = data.split(":", 2)  # subsport == "V리그"
-        await q.edit_message_reply_markup(
-            reply_markup=build_analysis_match_menu(key, subsport, page=1)
-        )
-        return
-  
-    # 종목 선택으로 돌아가기
-    if data.startswith("analysis_root:"):
-        _, key = data.split(":", 1)
-        await q.edit_message_reply_markup(reply_markup=build_analysis_category_menu(key))
-        return
-
-    # 종목 선택 (축구/농구/야구/배구)
-    if data.startswith("analysis_cat:"):
-        _, key, sport = data.split(":", 2)
-
-        # ⚽ 축구 → 해외축구 / K리그 / J리그 하위 메뉴
-        if sport == "축구":
-            await q.edit_message_reply_markup(
-                reply_markup=build_soccer_subcategory_menu(key)
-            )
-            return
-
-        # ⚾ 야구 → 해외야구 / KBO / NPB 하위 메뉴
-        if sport == "야구":
-            await q.edit_message_reply_markup(
-                reply_markup=build_baseball_subcategory_menu(key)
-            )
-            return
-
-        # 🏀 농구 → NBA / KBL 하위 메뉴
-        if sport == "농구":
-            await q.edit_message_reply_markup(
-                reply_markup=build_basketball_subcategory_menu(key)
-            )
-            return
-
-        # 🏐 배구 → V리그 하위 메뉴
-        if sport == "배구":
-            await q.edit_message_reply_markup(
-                reply_markup=build_volleyball_subcategory_menu(key)
-            )
-            return        
-
-        # 그 외 종목(배구 등)은 바로 경기 리스트 1페이지
-        await q.edit_message_reply_markup(
-            reply_markup=build_analysis_match_menu(key, sport, page=1)
-        )
-        return
-        
-    # 경기 리스트 페이지 이동 (이전/다음)
-    if data.startswith("match_page:"):
-        _, key, sport, page_str = data.split(":", 3)
-        try:
-            page = int(page_str)
-        except ValueError:
-            page = 1
-
-        await q.edit_message_reply_markup(
-            reply_markup=build_analysis_match_menu(key, sport, page=page)
-        )
-        return
-
-    # 개별 경기 선택
-    if data.startswith("match:"):
-        _, key, sport, match_id = data.split(":", 3)
-        items = ANALYSIS_DATA_MAP.get(key, {}).get(sport, [])
-
-        title = "선택한 경기"
-        summary = "해당 경기 분석을 찾을 수 없습니다."
-
-        for item in items:
-            if item["id"] == match_id:
-                title = item["title"]
-                summary = item["summary"]
-                break
-
-        text = f"📌 경기 분석 – {title}\n\n{summary}"
-
-        buttons = [
-            [InlineKeyboardButton("📺 스포츠 무료 중계", url="https://goat-tv.com")],
-            [InlineKeyboardButton("📝 분석글 더 보기", callback_data=f"analysis_root:{key}")],
-            [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
-        ]
-
-        await q.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-        return
-
-    # 뉴스 루트
-    if data == "news_root":
-        await q.edit_message_reply_markup(reply_markup=build_news_category_menu())
-        return
-
-    # 뉴스 종목 선택
-    if data.startswith("news_cat:"):
-        sport = data.split(":", 1)[1]
-        await q.edit_message_reply_markup(reply_markup=build_news_list_menu(sport))
-        return
-
-    # 뉴스 아이템 선택
-    if data.startswith("news_item:"):
-        try:
-            _, sport, news_id = data.split(":", 2)
-            items = NEWS_DATA.get(sport, [])
-            title = "뉴스 정보 없음"
-            summary = "해당 뉴스 정보를 찾을 수 없습니다."
-
-            for item in items:
-                if item["id"] == news_id:
-                    title = item["title"]
-                    summary = item["summary"]
-                    break
-        except Exception:
-            title = "뉴스 정보 없음"
-            summary = "해당 뉴스 정보를 찾을 수 없습니다."
-
-        text = f"📰 뉴스 요약 – {title}\n\n{summary}"
-
-        buttons = [
-            [InlineKeyboardButton("📺 스포츠무료중계", url="https://goat-tv.com")],
-            [InlineKeyboardButton("📰 다른 뉴스 보기", callback_data="news_root")],
-            [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
-        ]
-
-        await q.message.reply_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
-        return
-
-async def crawlmazsoccer_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # 1) 해외축구
-    await crawl_maz_analysis_common(
-        update,
-        context,
-        base_url="https://mazgtv1.com/analyze/overseas",
-        sport_label="축구",
-        league_default="해외축구",
-        day_key="tomorrow",
-        max_pages=5,
-        board_type=2,
-        category=1,
-        export_site=True,   # ✅ 추가
-    )
-
-    # 2) K리그/J리그(asia)
-    await crawl_maz_analysis_common(
-        update,
-        context,
-        base_url="https://mazgtv1.com/analyze/asia",
-        sport_label="축구",
-        league_default="K리그/J리그",
-        day_key="tomorrow",
-        max_pages=5,
-        board_type=2,
-        category=2,
-        export_site=True,   # ✅ 추가
-    )
-
-    await update.message.reply_text("⚽ 텔레그램용 + 사이트용(내일) 분석 크롤링을 모두 저장했습니다.")
-
-
-# 야구(MLB · KBO · NPB) 분석 (내일 경기 → tomorrow 시트)
-async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    mazgtv 야구(MLB / KBO / NPB) 내일 경기 분석을 크롤링해서
-    'tomorrow' 시트에 저장한다. 축구용과 동일한 구조.
-    """
-    # 해외야구(MLB)
-    await crawl_maz_analysis_common(
-        update,
-        context,
-        base_url="https://mazgtv1.com/analyze/mlb",
-        sport_label="야구",
-        league_default="해외야구",
-        day_key="tomorrow",
-        max_pages=5,
-        board_type=2,
-        category=3,
-        export_site=True,
-    )
-
-    # KBO + NPB
-    await crawl_maz_analysis_common(
-        update,
-        context,
-        base_url="https://mazgtv1.com/analyze/baseball",
-        sport_label="야구",
-        league_default="KBO/NPB",
-        day_key="tomorrow",
-        max_pages=5,
-        board_type=2,
-        category=4,
-        export_site=True,
-    )
-
-    await update.message.reply_text(
-        "⚾ 야구(MLB · KBO · NPB) 내일 경기 분석 크롤링 명령을 모두 실행했습니다."
-    )
-
-# 🔹 NBA + 국내 농구/배구 (내일 경기) 크롤링
-async def bvcrawl_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    mazgtv 농구/배구 분석:
-    - NBA 분석:    https://mazgtv1.com/analyze/nba
-    - 국내 농구/배구: https://mazgtv1.com/analyze/volleyball
-    두 곳에서 '내일 경기' 분석글을 크롤링해서 tomorrow 시트에 저장한다.
-    """
-
-    # 1) NBA (해외 농구)
-    await crawl_maz_analysis_common(
-        update,
-        context,
-        base_url="https://mazgtv1.com/analyze/nba",
-        sport_label="농구",          # 시트에는 NBA/KBL/WKBL 등으로 나뉨
-        league_default="NBA",
-        day_key="tomorrow",
-        max_pages=5,
-        board_type=2,                # ⚠️ 실제 boardType 값으로 수정 필요
-        category=5,                  # ⚠️ 실제 category 값으로 수정 필요
-        # target_ymd=None → 자동으로 '내일' 날짜 사용
-        export_site=True,
-    )
-
-    # 2) 국내 농구 + 배구 (KBL / WKBL / V리그 등)
-    await crawl_maz_analysis_common(
-        update,
-        context,
-        base_url="https://mazgtv1.com/analyze/volleyball",
-        sport_label="농구/배구",     # 분류 함수에서 KBL/WKBL/V리그/배구 등으로 세분화
-        league_default="국내농구/배구",
-        day_key="tomorrow",
-        max_pages=5,
-        board_type=2,                # ⚠️ 실제 boardType 값으로 수정 필요
-        category=7,                  # ⚠️ 실제 category 값으로 수정 필요
-        export_site=True,
-    )
-
-    await update.message.reply_text(
-        "NBA + 국내 농구/배구(내일 경기) 분석 크롤링을 모두 실행했습니다.\n"
-        "/syncsheet 로 텔레그램 메뉴 데이터를 갱신할 수 있습니다."
-    )
-
-async def crawlmazsoccer_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    mazgtv 해외축구 + K리그/J리그 분석 중
-    '오늘 날짜' 경기를 크롤링해서 today 시트에 저장.
-    """
-
-    # 1) 해외축구 탭
-    await crawl_maz_analysis_common(
-        update,
-        context,
-        base_url="https://mazgtv1.com/analyze/overseas",
-        sport_label="축구",          # 안에서 '해외축구/K리그/J리그'로 다시 분류됨
-        league_default="해외축구",
-        day_key="today",            # ✅ today
-        max_pages=5,
-        board_type=2,
-        category=1,                 # 해외축구
-        export_site=True,
-    )
-
-    # 2) K리그 / J리그 탭
-    await crawl_maz_analysis_common(
-        update,
-        context,
-        base_url="https://mazgtv1.com/analyze/asia",
-        sport_label="축구",
-        league_default="K리그/J리그",
-        day_key="today",            # ✅ today
-        max_pages=5,
-        board_type=2,
-        category=2,                 # K리그/J리그
-        export_site=True,
-    )
-
-    await update.message.reply_text(
-        "⚽ 해외축구 + K리그/J리그 오늘 경기 분석 크롤링을 모두 실행했습니다."
-    )
-
-async def crawlmazbaseball_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    mazgtv 야구 분석(MLB + KBO + NPB) 중
-    '오늘 날짜' 경기를 크롤링해서 today 시트에 저장.
-    """
-
-    # 1) 해외야구 (MLB)
-    await crawl_maz_analysis_common(
-        update,
-        context,
-        base_url="https://mazgtv1.com/analyze/mlb",
-        sport_label="야구",          # 시트에서는 해외야구/KBO/NPB로 분리됨
-        league_default="해외야구",
-        day_key="today",            # 🔴 오늘
-        max_pages=5,
-        board_type=2,               # 기존 /crawlmazbaseball_tomorrow 와 동일
-        category=3,                 # MLB 쪽 category 값 (지금 쓰는 값 그대로)
-        export_site=True,
-    )
-
-    # 2) KBO + NPB
-    await crawl_maz_analysis_common(
-        update,
-        context,
-        base_url="https://mazgtv1.com/analyze/baseball",
-        sport_label="야구",
-        league_default="KBO/NPB",
-        day_key="today",            # 🔴 오늘
-        max_pages=5,
-        board_type=2,               # 동일 boardType
-        category=4,                 # KBO/NPB 쪽 category 값 (지금 쓰는 값 그대로)
-        export_site=True,
-    )
-
-    await update.message.reply_text(
-        "⚾ mazgtv 야구(MLB · KBO · NPB) '오늘 경기' 분석 크롤링을 완료했습니다.\n"
-        "today 시트에서 내용을 확인할 수 있습니다."
-    )
-
-# 🔹 NBA + 국내 농구/배구 (오늘 경기) 크롤링
-async def bvcrawl_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    mazgtv 농구/배구 분석:
-    - NBA 분석:    https://mazgtv1.com/analyze/nba
-    - 국내 농구/배구: https://mazgtv1.com/analyze/volleyball
-    두 곳에서 '오늘 경기' 분석글을 크롤링해서 today 시트에 저장한다.
-    """
-
-    # 1) NBA (해외 농구)
-    await crawl_maz_analysis_common(
-        update,
-        context,
-        base_url="https://mazgtv1.com/analyze/nba",
-        sport_label="농구",
-        league_default="NBA",
-        day_key="today",             # ✅ 오늘
-        max_pages=5,
-        board_type=2,                # 👉 tomorrow와 동일 값 유지
-        category=5,
-        export_site=True,
-    )
-
-    # 2) 국내 농구 + 배구 (KBL / WKBL / V리그 등)
-    await crawl_maz_analysis_common(
-        update,
-        context,
-        base_url="https://mazgtv1.com/analyze/volleyball",
-        sport_label="농구/배구",
-        league_default="국내농구/배구",
-        day_key="today",             # ✅ 오늘
-        max_pages=5,
-        board_type=2,                # 👉 tomorrow와 동일 값 유지
-        category=7,
-        export_site=True,
-    )
-
-    await update.message.reply_text(
-        "NBA + 국내 농구/배구(오늘 경기) 분석 크롤링을 모두 실행했습니다.\n"
-        "today 시트에서 내용을 확인할 수 있습니다."
-    )
-
-
-# ───────────────── 실행부 ─────────────────
-
-async def export_rollover(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """export_tomorrow → export_today 롤오버 (덮어쓰기).
-    - export_today 기존 데이터는 모두 비우고(헤더 재설정) export_tomorrow 데이터를 그대로 복사
-    - 이후 export_tomorrow는 헤더만 남김
-    """
-    if not is_admin(update):
-        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
-        return
-
-    today_ws = get_export_ws(EXPORT_TODAY_SHEET_NAME)
-    tomo_ws = get_export_ws(EXPORT_TOMORROW_SHEET_NAME)
-    if not today_ws or not tomo_ws:
-        await update.message.reply_text("export 시트 준비에 실패했습니다. 구글시트 설정을 확인하세요.")
-        return
-
-    try:
-        tomo_vals = tomo_ws.get_all_values()
-        if not tomo_vals or len(tomo_vals) <= 1:
-            await update.message.reply_text("export_tomorrow에 옮길 데이터가 없습니다.")
-            return
-
-        # 옮길 데이터(헤더 제외). src_id가 비어있는 행은 제외.
-        header = [c.strip() for c in (tomo_vals[0] if tomo_vals else EXPORT_HEADER)]
-        src_idx = header.index("src_id") if "src_id" in header else 2
-
-        to_move = []
-        for r in tomo_vals[1:]:
-            sid = r[src_idx].strip() if len(r) > src_idx else ""
-            if not sid:
-                continue
-            to_move.append(r)
-
-        # export_today는 덮어쓰기: 전체 비우고 헤더 재설정 후, 내일 데이터를 그대로 넣는다.
-        try:
-            today_ws.clear()
-        except Exception:
-            try:
-                today_ws.batch_clear(["A2:Z"])
-            except Exception:
-                pass
-
-        try:
-            today_ws.update("A1", [EXPORT_HEADER])
-        except Exception:
-            today_ws.update(values=[EXPORT_HEADER], range_name="A1")
-
-        if to_move:
-            today_ws.append_rows(to_move, value_input_option="RAW", table_range="A1")
-
-        # export_tomorrow 초기화(헤더만)
-        tomo_ws.clear()
-        tomo_ws.update("A1", [EXPORT_HEADER])
-
-        await update.message.reply_text(
-            f"롤오버 완료(덮어쓰기): export_today에 {len(to_move)}건 반영, export_tomorrow 초기화 완료."
-        )
-
-    except Exception as e:
-        await update.message.reply_text(f"롤오버 중 오류: {e}")
-        return
+        if not tag.startswith("#"):
+            tag = "#" + tag
+        if tag not in tags:
+            tags.append(tag)
+
+    # 기본
+    _add("스포츠분석")
+    _add("해외스포츠" if ("해외" in sp or "축구" in sp) else "스포츠")
+
+    # 종목
+    if "축구" in sp or "soccer" in sp.lower():
+        _add("축구분석")
+        _add("해외축구" if "해외" in sp else "축구")
+    elif "야구" in sp or "baseball" in sp.lower():
+        _add("야구분석")
+    elif "농구" in sp or "basket" in sp.lower():
+        _add("농구분석")
+    elif "배구" in sp or "volley" in sp.lower():
+        _add("배구분석")
+
+    if lg:
+        _add(re.sub(r"\s+", "", lg))
+
+    # 팀명 태그
+    if h:
+        _add(re.sub(r"\s+", "", h))
+    if a:
+        _add(re.sub(r"\s+", "", a))
+
+    # body에서 자주 쓰는 키워드(고정 사전 기반)
+    kw_bank = [
+        "세트피스","역습","압박","중원","점유","전환","측면","크로스","라인","수비","공격","부상","결장","로테이션",
+        "템포","파포스트","제공권","박스","빌드업","하프스페이스","오버","언더",
+    ]
+    plain_b = b
+    plain_b = plain_b.replace("\r\n", "\n").replace("\r", "\n")
+    plain_b = re.sub(r"<br\s*/?>", "\n", plain_b, flags=re.I)
+    plain_b = re.sub(r"</(p|div|li)>", "\n", plain_b, flags=re.I)
+    plain_b = re.sub(r"<[^>]+>", "", plain_b)
+    plain_b = plain_b.replace("&nbsp;", " ")
+    for kw in kw_bank:
+        if kw in plain_b:
+            _add(kw)
+
+    # 너무 길어지면 컷
+    tags = tags[:12]
+    tags_line = " ".join(tags)
+
+    # --- assemble ---
+    out_lines = []
+    out_lines.append(intro)
+    out_lines.append("")
+    out_lines.append(summary_line)
+    out_lines.append("")
+    out_lines.append(mid)
+    if pick_block:
+        out_lines.append("")
+        out_lines.append(pick_block)
+    out_lines.append("")
+    out_lines.append(outro)
+    out_lines.append("")
+    out_lines.append("")
+    out_lines.append(title_phrase)
+    out_lines.append(tags_line)
+
+    # 정리
+    out = "\n".join([l.rstrip() for l in out_lines]).strip()
+    # 불필요한 과도한 공백 줄 정리
+    out = re.sub(r"\n{4,}", "\n\n\n", out).strip()
+    return out
 
 def main():
     reload_analysis_from_sheet()
