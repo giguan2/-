@@ -668,29 +668,29 @@ def _naver_refresh_access_token() -> str:
         print(f"[NAVER] token refresh exception: {e}")
         return ""
 
-from urllib.parse import quote_plus
-
 def _naver_clean_text(s: str) -> str:
-    # Normalize and remove problematic control/zero-width chars
-    import unicodedata, re
-    s = unicodedata.normalize("NFC", s or "")
+    s = (s or "")
     s = s.replace("\r\n", "\n").replace("\r", "\n")
-    s = re.sub(r"[\u200B-\u200D\uFEFF]", "", s)  # zero-width
-    s = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", s)  # control
+    # 네이버 카페 에디터가 싫어하는 제어문자 제거
+    s = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", s)
     return s.strip()
 
-def _naver_double_urlencode(s: str) -> str:
-    """Match Naver cafe API examples: urlencode(urlencode(text,'UTF-8'),'MS949')."""
+def _naver_quote_double(s: str) -> str:
+    """네이버 카페 글쓰기 API에서 한글 깨짐 방지를 위한 이중 URL 인코딩."""
     s = _naver_clean_text(s)
     first = quote_plus(s, safe="", encoding="utf-8", errors="strict")
-    # second pass escapes %,+ etc. (MS949 bytes are ASCII for first-pass output)
-    second = quote_plus(first, safe="", encoding="cp949", errors="strict")
+    second = quote_plus(first, safe="", encoding="ms949", errors="ignore")
     return second
+
+def _naver_quote_once(s: str) -> str:
+    s = _naver_clean_text(s)
+    return quote_plus(s, safe="", encoding="utf-8", errors="strict")
 
 def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tuple[bool, str]:
     """네이버 카페에 글쓰기. (success, articleId_or_error)
 
-    인코딩/줄바꿈 깨짐 방지를 위해 form-urlencoded + (UTF-8 → MS949) 이중 URL 인코딩을 사용한다.
+    - application/x-www-form-urlencoded 로 전송
+    - subject/content 를 URL 인코딩(기본: UTF-8→MS949 이중 인코딩)해서 한글 깨짐 방지
     """
     token = _naver_refresh_access_token()
     if not token:
@@ -702,8 +702,14 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
     if len(subject_raw) > 80:
         subject_raw = subject_raw[:80]
 
-    # NOTE: content는 HTML 포함 가능(센터/줄바꿈 포맷)
     content_raw = content or ""
+
+    use_double = str(os.getenv("NAVER_CAFE_DOUBLE_ENCODE", "1")).strip() not in ("0", "false", "False", "no", "NO")
+
+    enc_subject = _naver_quote_double(subject_raw) if use_double else _naver_quote_once(subject_raw)
+    enc_content  = _naver_quote_double(content_raw) if use_double else _naver_quote_once(content_raw)
+
+    body = f"subject={enc_subject}&content={enc_content}"
 
     url = f"https://openapi.naver.com/v1/cafe/{clubid}/menu/{menuid}/articles"
     headers = {
@@ -711,30 +717,34 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
     }
 
-    body = (
-        f"subject={_naver_double_urlencode(subject_raw)}"
-        f"&content={_naver_double_urlencode(content_raw)}"
-    )
-
     try:
         resp = requests.post(url, headers=headers, data=body.encode("utf-8"), timeout=30)
 
         if resp.status_code != 200:
-            txt = (resp.text or "")
-            return False, f"HTTP_{resp.status_code}:{txt[:800]}"
+            txt = (resp.text or "")[:800]
+            try:
+                j = resp.json()
+                code = j.get("message", {}).get("error", {}).get("code")
+                msg = j.get("message", {}).get("error", {}).get("msg")
+                if code or msg:
+                    return False, f"HTTP_{resp.status_code}:{code}:{msg}"
+            except Exception:
+                pass
+            return False, f"HTTP_{resp.status_code}:{txt}"
 
         article_id = ""
         try:
             j = resp.json()
-            article_id = (
-                j.get("message", {}).get("result", {}).get("articleId")
-                or j.get("result", {}).get("articleId")
-                or ""
-            )
+            if isinstance(j, dict):
+                article_id = (
+                    j.get("message", {}).get("result", {}).get("articleId")
+                    or j.get("result", {}).get("articleId")
+                    or ""
+                )
         except Exception:
             pass
 
-        return True, str(article_id or "OK")
+        return True, (str(article_id) if article_id else "OK")
 
     except Exception as e:
         return False, f"EXC:{e}"
@@ -952,14 +962,10 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
             continue
 
         # HTML 안전 처리 + 줄바꿈 정규화
-        safe_simple = html.escape(simple_txt).replace("
-", "
-").replace("", "
-").strip()
+        safe_simple = html.escape(simple_txt).replace("\r\n", "\n").replace("\r", "\n").strip()
 
-        # 가운데 정렬 + 줄바꿈 유지 (따옴표/스타일 속성 필터링을 피하려고 <center> + <br> 사용)
-        content_html = "<center>" + safe_simple.replace("
-", "<br>") + "</center>"
+        # 가운데 정렬 + 줄바꿈 유지
+        content_html = f'<div style="text-align:center; white-space:pre-wrap;">{safe_simple}</div>'
         content_plain = safe_simple  # fallback
 
         subject = (titlev or "").strip() or f"{sportv} 분석"
@@ -975,7 +981,7 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
             if success:
                 ok_cnt += 1
                 ws_log.append_row(
-                    [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, info, now_kst().isoformat(), ("OK_PLAIN" if tried_plain else "OK_HTML_CENTER_TAG")],
+                    [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, info, now_kst().isoformat(), "OK"],
                     value_input_option="RAW",
                     table_range="A1",
                 )
@@ -1072,7 +1078,7 @@ async def _maz_warmup(client: httpx.AsyncClient) -> None:
 
 import math
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
+from urllib.parse import urljoin, quote_plus
 from openai import OpenAI
 
 from telegram import (
