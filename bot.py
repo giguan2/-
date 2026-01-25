@@ -3750,6 +3750,71 @@ def build_dynamic_cafe_simple(
     out = re.sub(r"\n{4,}", "\n\n\n", out).strip()
     return out
 
+
+# ───────────────── 실행부 ─────────────────
+
+
+async def export_rollover(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """export_tomorrow → export_today 롤오버 (덮어쓰기).
+    - export_today 기존 데이터는 모두 비우고(헤더 재설정) export_tomorrow 데이터를 그대로 복사
+    - 이후 export_tomorrow는 헤더만 남김
+    """
+    if not is_admin(update):
+        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+
+    today_ws = get_export_ws(EXPORT_TODAY_SHEET_NAME)
+    tomo_ws = get_export_ws(EXPORT_TOMORROW_SHEET_NAME)
+    if not today_ws or not tomo_ws:
+        await update.message.reply_text("export 시트 준비에 실패했습니다. 구글시트 설정을 확인하세요.")
+        return
+
+    try:
+        tomo_vals = tomo_ws.get_all_values()
+        if not tomo_vals or len(tomo_vals) <= 1:
+            await update.message.reply_text("export_tomorrow에 옮길 데이터가 없습니다.")
+            return
+
+        # 옮길 데이터(헤더 제외). src_id가 비어있는 행은 제외.
+        header = [c.strip() for c in (tomo_vals[0] if tomo_vals else EXPORT_HEADER)]
+        src_idx = header.index("src_id") if "src_id" in header else 2
+
+        to_move = []
+        for r in tomo_vals[1:]:
+            sid = r[src_idx].strip() if len(r) > src_idx else ""
+            if not sid:
+                continue
+            to_move.append(r)
+
+        # export_today는 덮어쓰기: 전체 비우고 헤더 재설정 후, 내일 데이터를 그대로 넣는다.
+        try:
+            today_ws.clear()
+        except Exception:
+            try:
+                today_ws.batch_clear(["A2:Z"])
+            except Exception:
+                pass
+
+        try:
+            today_ws.update("A1", [EXPORT_HEADER])
+        except Exception:
+            today_ws.update(values=[EXPORT_HEADER], range_name="A1")
+
+        if to_move:
+            today_ws.append_rows(to_move, value_input_option="RAW", table_range="A1")
+
+        # export_tomorrow 초기화(헤더만)
+        tomo_ws.clear()
+        tomo_ws.update("A1", [EXPORT_HEADER])
+
+        await update.message.reply_text(
+            f"롤오버 완료(덮어쓰기): export_today에 {len(to_move)}건 반영, export_tomorrow 초기화 완료."
+        )
+
+    except Exception as e:
+        await update.message.reply_text(f"롤오버 중 오류: {e}")
+        return
+
 def main():
     reload_analysis_from_sheet()
     reload_news_from_sheet()
