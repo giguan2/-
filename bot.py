@@ -405,25 +405,26 @@ def _naver_clean_text(s: str) -> str:
 def _naver_quote(s: str, *, double: bool = True) -> str:
     """네이버 카페 API subject/content 인코딩.
 
-    공식 문서(Java 예제) 및 포럼 답변 기준:
-    - 1차: UTF-8로 URL 인코딩
-    - 2차: 1차 결과를 다시 MS949로 URL 인코딩(퍼센트(%)가 %25로 한 번 더 인코딩됨)
+    공식 문서(Java 예제) 및 여러 구현 사례 기준으로,
+    subject/content는 URL 인코딩을 2번(UTF-8 → MS949/CP949) 적용할 때
+    한글 깨짐이 가장 안정적으로 방지되는 편입니다.
 
-    참고:
-    - Java URLEncoder 동작과 최대한 맞추기 위해 quote_plus 사용(공백은 +)
+    구현 메모:
+    - quote()를 사용해 공백을 %20으로 인코딩(+) 의존을 제거합니다.
+      (서버측 2차 디코딩 로직이 '+'를 공백으로 처리하지 않는 케이스 대비)
     """
     base = _naver_clean_text(s)
-    q1 = quote_plus(base, safe="", encoding="utf-8")
+    q1 = quote(base, safe="", encoding="utf-8")
 
     if not double:
         return q1
 
-    # 입력은 ASCII(%,0-9,A-F,+ 등) 위주라 실제 핵심은 'double encode'이며
-    # encoding은 문서 표기(MS949)에 맞춰 ms949 우선 적용
     try:
-        return quote_plus(q1, safe="", encoding="ms949")
+        return quote(q1, safe="", encoding="ms949")
     except LookupError:
-        return quote_plus(q1, safe="", encoding="cp949")
+        return quote(q1, safe="", encoding="cp949")
+
+
 
 
 
@@ -619,15 +620,15 @@ def _cafe_sport_match(sport_value: str, sport_filter: str) -> bool:
     return sv in allowed
 
 
-
-
 def _cafe_format_text(text: str) -> str:
     """네이버 카페 업로드용 본문 포맷 정리.
 
     - 줄바꿈 정규화(\r\n/\r → \n)
     - '[최종 픽]' 섹션을 본문과 분리(앞에 2줄 띄우기)
-    - '- 항목' 줄 정리
+    - '승패/핸디/언오버' 라인 불릿(- ) 고정
     - 과도한 빈 줄(3줄 이상)은 2줄로 축소
+
+    NOTE: 입력은 'simple' 컬럼(요약) 기준.
     """
     t = (text or "")
     t = t.replace("\r\n", "\n").replace("\r", "\n")
@@ -671,34 +672,38 @@ def _cafe_format_text(text: str) -> str:
     return t.strip()
 
 
-def _cafe_text_to_center_html(text: str) -> str:
-    """텍스트를 네이버 카페 업로드용 HTML로 변환.
+def _cafe_text_to_html_variants(text: str) -> list[tuple[str, str]]:
+    """텍스트를 네이버 카페 업로드용 HTML로 변환(여러 변형을 제공).
 
     목표:
-    - 줄바꿈/빈줄이 실제로 '줄'로 보이도록 강제
-      (일부 카페가 <br> 태그를 제거/무시하는 케이스가 있어서 <p> 블록 기반으로 변환)
-    - 가운데 정렬은 align + style을 같이 사용(살아남는 쪽으로)
+    - 줄바꿈이 실제로 보이도록 <br> 기반으로 변환
+    - 가운데 정렬은 가능한 단순 태그로 시도 (따옴표 없는 속성/태그 우선)
 
-    NOTE:
-    - 카페 API 명세에 따르면 content는 HTML 태그 사용 가능하며 줄바꿈은 <br> 사용을 권장합니다.
-      (<br/> 또는 style 속성이 필터링되는 카페가 있어, <br> + <p align> 조합으로 단순화)
-    - 사용자가 입력한 HTML은 허용하지 않음(escape)
+    배경:
+    - 카페 API에 HTML 태그를 넣을 때, 쌍따옴표가 포함된 속성(예: color="red")이 있으면
+      오류(403/999)가 나는 사례가 있습니다. (따옴표 제거 권장)
     """
     t = (text or "").replace("\r\n", "\n").replace("\r", "\n")
     lines = t.split("\n")
 
-    # HTML 태그는 최소화: <p align="center"> ... <br> ... </p>
-    # - <br> (슬래시 없는 형태)만 사용
-    # - 빈 줄은 &nbsp;를 한 줄로 넣어 <br> 사이 공백 줄이 보이게 함
     esc_lines: list[str] = []
     for ln in lines:
         if not (ln or "").strip():
+            # 빈 줄 유지
             esc_lines.append("&nbsp;")
         else:
             esc_lines.append(html.escape(ln))
 
     inner = "<br>".join(esc_lines)
-    return f'<p align="center">{inner}</p>'
+
+    # 우선순위대로 시도
+    return [
+        ("HTML_CENTER_TAG", f"<center>{inner}</center>"),
+        ("HTML_DIV_CENTER", f"<div align=center>{inner}</div>"),
+        ("HTML_BR", inner),
+    ]
+
+
 async def _cafe_parse_which_arg(context: ContextTypes.DEFAULT_TYPE) -> str:
     which = "today"
     args = getattr(context, "args", None) or []
@@ -805,10 +810,11 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
 
     def _is_rate_limited(err: str) -> bool:
         e = (err or "")
+        # 연속 등록 제한(표현은 케이스별로 다를 수 있음)
         if "연속" in e and "등록" in e:
             return True
-        # 403 + 내부 500/999 케이스도 너무 빠를 때 뜨는 경우가 많아서 백오프 대상으로 본다
-        if "HTTP_403" in e and _naver_is_code_999(e):
+        # 명시적 429(Too Many Requests)류가 들어오는 경우
+        if "HTTP_429" in e or "status=429" in e or "429" in e and "Too Many" in e:
             return True
         return False
 
@@ -837,52 +843,78 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
         # ✅ 카페 본문 포맷(줄바꿈/섹션/불릿) 정리
         formatted_txt = _cafe_format_text(simple_txt)
 
-        # ✅ HTML 변환: 줄바꿈/빈줄 유지 + 가운데 정렬
-        # - 일부 카페에서 <br> 계열이 필터링되어 줄바꿈이 사라질 수 있어,
-        #   줄 단위로 <p> 블록을 만들어 '블록 요소'로 줄바꿈을 강제한다.
-        content_html = _cafe_text_to_center_html(formatted_txt)
+        # ✅ HTML 변환(줄바꿈 + 가운데정렬)
+        # - 카페 API에서 HTML 태그는 허용되지만, 쌍따옴표가 포함된 속성/스타일에서
+        #   오류(403/999)가 나는 사례가 있어, 최대한 '따옴표 없는' 단순 태그 조합을 우선 시도한다.
+        candidates: list[tuple[str, str]] = _cafe_text_to_html_variants(formatted_txt)
 
-        # fallback(태그 없이)도 CRLF로 보내서 줄바꿈 변환 가능성을 높인다.
-        content_plain = formatted_txt.replace("\n", "\r\n")
+        # 최후 폴백: 태그 없이 (HTML에서는 줄바꿈이 무시될 수 있음)
+        candidates.append(("PLAIN", formatted_txt.replace("\n", "\r\n")))
+
         subject = (titlev or "").strip() or f"{sportv} 분석"
         if len(subject) > 80:
             subject = subject[:80]
 
         attempt = 0
-        tried_plain = False
         while True:
-            success, info = _naver_cafe_post(subject=subject, content=(content_plain if tried_plain else content_html),
-                                            clubid=NAVER_CAFE_CLUBID, menuid=menuid)
+            used_mode = ""
+            article_id = ""
+            last_err = ""
+            code999_403_cnt = 0
+            rate_limited = False
 
-            if success:
+            for mode, payload in candidates:
+                success, info = _naver_cafe_post(
+                    subject=subject,
+                    content=payload,
+                    clubid=NAVER_CAFE_CLUBID,
+                    menuid=menuid,
+                )
+
+                if success:
+                    used_mode = mode
+                    article_id = info
+                    break
+
+                last_err = info
+
+                if ("HTTP_403" in (info or "")) and _naver_is_code_999(info):
+                    code999_403_cnt += 1
+
+                if _is_rate_limited(info):
+                    rate_limited = True
+                    break
+
+            if used_mode:
                 ok_cnt += 1
                 ws_log.append_row(
-                    [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, info, now_kst().isoformat(), "OK"],
+                    [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, article_id, now_kst().isoformat(), f"OK_{used_mode}"],
                     value_input_option="RAW",
                     table_range="A1",
                 )
                 break
 
-            # 999 내부 오류가 HTML 파싱/필터링 문제일 수도 있어서 plain 텍스트로 1회 폴백
-            if (not tried_plain) and ("HTTP_403" in (info or "")) and _naver_is_code_999(info):
-                tried_plain = True
+            # 후보 전부가 403/999면, 내용 필터/연속등록 제한일 가능성이 높음 → 백오프 후 재시도
+            if (code999_403_cnt >= len(candidates)) and attempt < retries:
+                attempt += 1
+                await asyncio.sleep(backoff_sec)
                 continue
 
-            # 연속등록/레이트리밋은 백오프 후 재시도
-            if _is_rate_limited(info) and attempt < retries:
+            if rate_limited and attempt < retries:
                 attempt += 1
                 await asyncio.sleep(backoff_sec)
                 continue
 
             fail_cnt += 1
             ws_log.append_row(
-                [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), info],
+                [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), last_err or "FAILED"],
                 value_input_option="RAW",
                 table_range="A1",
             )
             break
 
         await asyncio.sleep(delay_sec)
+
 
     await update.message.reply_text(f"카페 업로드 완료: 성공 {ok_cnt} / 실패 {fail_cnt} (중복 src_id는 제외됨)")
 
