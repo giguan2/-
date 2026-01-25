@@ -1770,14 +1770,30 @@ def append_site_export_rows(rows: list[list[str]]) -> bool:
             if not r:
                 continue
             rr = list(r)
-            if len(rr) == 6:
-                rr.append(extract_simple_from_body(rr[4] if len(rr) > 4 else ""))
-            elif len(rr) >= 7:
+
+            # rows 기본 포맷: [day, sport, src_id, title, body, createdAt] (6) 또는 simple 포함 (7)
+            # 1) 최소 6컬럼 확보
+            while len(rr) < 6:
+                rr.append("")
+
+            # 2) export body(심층분석용) 가공: '고트티비' → '스포츠분석 커뮤니티 오분' + 섹션 키워드 삽입 + 해시태그
+            try:
+                rr[4] = transform_export_body_for_deep_analysis(
+                    rr[3] if len(rr) > 3 else "",
+                    rr[4] if len(rr) > 4 else "",
+                    sport=rr[1] if len(rr) > 1 else ""
+                )
+            except Exception:
+                pass
+
+            # 3) simple 컬럼은 가공된 body 기준으로 항상 재생성(중복/구버전 방지)
+            if len(rr) >= 7:
                 rr = rr[:7]
+                rr[6] = extract_simple_from_body(rr[4] if len(rr) > 4 else "")
             else:
-                while len(rr) < 6:
-                    rr.append("")
+                rr = rr[:6]
                 rr.append(extract_simple_from_body(rr[4] if len(rr) > 4 else ""))
+
             fixed_rows.append(rr)
         rows = fixed_rows
         ws.append_rows(rows, value_input_option="RAW", table_range="A1")
