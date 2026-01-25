@@ -619,6 +619,29 @@ def _cafe_sport_match(sport_value: str, sport_filter: str) -> bool:
     return sv in allowed
 
 
+
+
+def _cafe_format_text(text: str) -> str:
+    """네이버 카페 업로드용 본문 포맷 정리.
+
+    - 줄바꿈 정규화(\r\n/\r → \n)
+    - '[최종 픽]' 섹션을 본문과 분리(앞에 2줄 띄우기)
+    - '- 항목' 줄 정리
+    - 과도한 빈 줄(3줄 이상)은 2줄로 축소
+    """
+    t = (text or "")
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+
+    # '[최종 픽]' 표기 통일 + 섹션 분리
+    t = re.sub(r"\s*\[\s*최종\s*픽\s*\]\s*", "\n\n[최종 픽]\n", t)
+
+    # 리스트 항목 형태 통일
+    t = re.sub(r"\n\s*-\s*", "\n- ", t)
+
+    # 빈 줄 과다 방지
+    t = re.sub(r"\n{3,}", "\n\n", t)
+
+    return t.strip()
 async def _cafe_parse_which_arg(context: ContextTypes.DEFAULT_TYPE) -> str:
     which = "today"
     args = getattr(context, "args", None) or []
@@ -754,13 +777,17 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
             )
             continue
 
-        # HTML 안전 처리 + 줄바꿈 정규화
-        safe_simple = html.escape(simple_txt).replace("\r\n", "\n").replace("\r", "\n").strip()
+        # ✅ 카페 본문 포맷(줄바꿈/섹션/불릿) 정리
+        formatted_txt = _cafe_format_text(simple_txt)
 
-        # 가운데 정렬 + 줄바꿈 유지
-        content_html = f'<div style="text-align:center; white-space:pre-wrap;">{safe_simple}</div>'
-        content_plain = safe_simple  # fallback
+        # HTML 안전 처리(텍스트만 escape) + 줄바꿈은 <br/>로 변환
+        safe_html = html.escape(formatted_txt)
+        safe_html = safe_html.replace("\n", "<br/>")
 
+        # ✅ 가운데 정렬 + 줄바꿈 확실히 적용
+        # - style이 필터링되는 경우가 있어 align/center 태그도 함께 사용(살아남는 쪽으로)
+        content_html = f'<div align="center" style="text-align:center;"><center>{safe_html}</center></div>'
+        content_plain = formatted_txt  # 최후 fallback(태그 없이)
         subject = (titlev or "").strip() or f"{sportv} 분석"
         if len(subject) > 80:
             subject = subject[:80]
