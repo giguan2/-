@@ -140,7 +140,11 @@ import hashlib as _hashlib
 import random as _random
 
 _KEYWORD_TAGS = [
-    ("세트피스", "#세트피스"),
+    ("토토", "#토토"),
+    ("프로토", "#프로토"),
+    ("스포츠토토", "#스포츠토토"),
+    ("토토분석", "#토토분석"),
+("세트피스", "#세트피스"),
     ("역습", "#역습"),
     ("압박", "#압박"),
     ("측면", "#측면"),
@@ -183,110 +187,183 @@ def _extract_matchup(title: str) -> tuple[str, str, str]:
 
 def _slug_tag(s: str) -> str:
     s = re.sub(r"[\[\]\(\)<>\"'`]", "", s or "")
+    s = re.sub(r"스포츠분석", "", s)
+    s = s.replace("vs", " ").replace("VS", " ")
     s = re.sub(r"\s+", "", s)
+    # 날짜/숫자 제거(1월25일 같은 초장문 태그 방지)
+    s = re.sub(r"[0-9]+", "", s)
+    s = s.replace("월", "").replace("일", "")
     s = re.sub(r"[^\w가-힣]+", "", s)
-    return s[:20]
-
+    # 너무 긴 경우 잘라내기
+    return s[:15]
 def build_dynamic_cafe_simple(title: str, body: str, *, sport: str = "", seed: str = "") -> str:
-    """
-    export_* 시트 G열(simple) 용:
-    - 본문 전체 복사 금지
-    - [핵심 포인트 요약]을 1문장으로 요약
-    - 도입/중간/마무리에 제목(또는 매치업) 자연스럽게 1회씩 삽입
-    - [최종 픽] 블록 포함
-    - 마지막에 줄바꿈 3번 + 제목 + 해시태그 자동 생성
+    """export_* 시트 G열(simple) 생성(요약형)
+    목표:
+    - body 전체 복사 금지
+    - [핵심 포인트 요약]이 있으면 1문장 요약, 없으면 본문에서 1~2문장 요약
+    - 제목(또는 매치업)은 도입/결론에서만 자연스럽게 사용(과도 반복 금지)
+    - [최종 픽]은 1회만 포함
+    - 하단: 해시태그(토토/프로토/스포츠토토/토토분석 포함 가능)
     """
     title = (title or "").strip()
     body = (body or "").strip()
 
     league = _extract_league_bracket(title)
     home, away, matchup = _extract_matchup(title)
-    matchup = matchup or (f"{home} vs {away}" if home and away else "")
 
-    core_one = (extract_simple_from_body(body) or "").strip()
-    pick_block = (extract_final_pick_from_body(body) or "").strip()
+    # fallback matchup (날짜/리그/스포츠분석 제거)
+    if not matchup:
+        t = re.sub(r"^\d+월\s*\d+일\s*", "", title)
+        t = re.sub(r"^\[[^\]]+\]\s*", "", t)
+        t = t.replace("스포츠분석", "").strip()
+        matchup = t
+
+    # 본문에서 최종 픽 섹션 제거한 텍스트로 요약/키워드 추출(픽 중복 방지)
+    def _remove_pick_section(txt: str) -> str:
+        if not txt:
+            return ""
+        x = txt
+        x = x.replace("\r\n", "\n").replace("\r", "\n")
+        x = re.sub(r"<br\s*/?>", "\n", x, flags=re.I)
+        x = re.sub(r"</(p|div|li)>", "\n", x, flags=re.I)
+        x = re.sub(r"<[^>]+>", "", x)
+        x = x.replace("&nbsp;", " ")
+        # [최종 픽] 이후 끝까지 제거
+        x = re.sub(r"\[\s*최종\s*픽\s*\][\s\S]*$", "", x, flags=re.I)
+        x = re.sub(r"최종\s*픽\s*[:：]?[\s\S]*$", "", x, flags=re.I)
+        return x.strip()
+
+    body_nopick = _remove_pick_section(body)
 
     rng = _stable_rng(seed or title or matchup or "seed")
 
-    # theme keyword pick
+    # theme: 본문에서 키워드 탐색, 없으면 후보에서 선택
     theme = ""
     for k, _tg in _KEYWORD_TAGS:
-        if k in body:
+        if k and k in body_nopick:
             theme = k
             break
-    theme = theme or "핵심"
+    if not theme:
+        theme = rng.choice(["세트피스", "압박", "전환", "수비", "역습", "피지컬"])
+
+    # 요약: 핵심포인트 1문장(없으면 본문 첫 문장들)
+    core_one = (extract_simple_from_body(body_nopick) or "").strip()
+
+    # 요약에 픽 관련 라인 들어가면 제거
+    if core_one:
+        lines = []
+        for ln in core_one.split("\n"):
+            t = ln.strip()
+            if not t:
+                continue
+            if any(x in t for x in ["승패", "핸디", "언오버", "최종 픽"]):
+                continue
+            lines.append(t)
+        core_one = " ".join(lines).strip()
+
+    if not core_one:
+        # 본문에서 첫 문단(헤더/구분선 제외) 1~2문장 추출
+        paras = []
+        for block in re.split(r"\n\s*\n+", body_nopick):
+            b = block.strip()
+            if not b:
+                continue
+            if re.match(r"^[─\-]{5,}$", b):
+                continue
+            if re.match(r"^\[.*?\]$", b):
+                continue
+            if b.startswith("[") and b.endswith("]") and len(b) <= 30:
+                continue
+            paras.append(b)
+        base = paras[0] if paras else body_nopick
+        base = re.sub(r"\s+", " ", base).strip()
+        # 문장 1~2개
+        sents = re.split(r"(?<=[\.\!\?다])\s+", base)
+        core_one = " ".join([x.strip() for x in sents[:2] if x.strip()])[:320].strip()
+
+    # 픽 블록(1회)
+    pick_block = (extract_final_pick_from_body(body) or "").strip()
 
     intro_pool = [
-        "{title}은 흐름과 상성에서 승부가 갈릴 수 있다.",
-        "{title}은 {theme} 구간에서 차이가 날 수 있다.",
-        "{title}은 전술 매치업이 먼저 눈에 들어온다.",
         "{title}은 초반 주도권 싸움이 포인트다.",
-        "{title}은 변수가 적고 기본기 싸움에 가깝다.",
-    ]
-    mid_pool = [
-        "경기 흐름이 길어질수록 {matchup}은 {theme}에서 먼저 흔들릴 수 있다.",
-        "{matchup}은 전개보다 {theme} 대응이 먼저 시험대에 오른다.",
-        "{matchup}은 한 번의 전환에서 균열이 날 수 있다.",
-        "결국 {matchup}은 실점 관리가 승부를 가를 수 있다.",
-        "{matchup}은 후반으로 갈수록 운영 차이가 벌어질 수 있다.",
+        "{title}은 전술 상성에서 승부가 갈릴 수 있다.",
+        "{title}은 {theme} 대응이 결과를 좌우할 수 있다.",
+        "{title}은 운영 안정감이 먼저 중요한 경기다.",
+        "{title}은 흐름 싸움에서 우위가 갈릴 수 있다.",
+        "{title}은 한두 장면의 완성도가 관건이다.",
     ]
     outro_pool = [
-        "종합하면 {matchup}은 {theme} 쪽이 결과를 좌우할 가능성이 크다.",
-        "정리하면 {matchup}은 운영 안정감이 승부를 가를 수 있다.",
-        "마무리 관점에서 {matchup}은 세부 전술에서 우위가 갈릴 수 있다.",
-        "결국 {matchup}은 결정적 한두 장면이 승부를 만든다.",
-        "{matchup}은 세트피스/전환에서 우위가 갈릴 수 있다.",
+        "결국 {matchup} 경기는 {theme}에서 우위가 갈릴 수 있다.",
+        "결국 {matchup} 경기는 실점 관리가 승부를 가를 수 있다.",
+        "정리하면 {matchup} 경기는 세트피스/전환에서 흐름이 갈릴 수 있다.",
+        "마무리 관점에서 {matchup} 경기는 운영 디테일이 중요하다.",
     ]
 
     def _fill(tpl: str) -> str:
-        return tpl.format(
-            title=title,
-            matchup=matchup or title,
-            theme=theme,
-        )
+        return tpl.format(title=title, matchup=matchup, theme=theme)
 
-    intro = _fill(rng.choice(intro_pool))
-    mid = _fill(rng.choice(mid_pool))
-    outro = _fill(rng.choice(outro_pool))
+    intro = _fill(rng.choice(intro_pool)).strip()
+    outro = _fill(rng.choice(outro_pool)).strip()
 
-    if core_one and not core_one.endswith((".", "!", "?", "다", "요")):
-        core_one += "."
-
-    # hashtags
+    # 해시태그(짧고 자연스럽게)
     tags = ["#스포츠분석"]
+
+    # 토토/프로토 계열은 과도 반복 피하고 1~2개만 선택(안정적으로)
+    betting_pool = ["#토토", "#프로토", "#스포츠토토", "#토토분석"]
+    rng.shuffle(betting_pool)
+    tags += betting_pool[:2]
+
     tags += _SPORT_TAGS.get(sport, ["#해외스포츠"])
+
     if league:
-        tags.append("#" + _slug_tag(league))
-    if home:
-        tags.append("#" + _slug_tag(home))
-    if away:
-        tags.append("#" + _slug_tag(away))
+        tg = "#" + _slug_tag(league)
+        if len(tg) >= 2:
+            tags.append(tg)
+
+    # 팀 태그는 실패 추출로 초장문이 나오면 제외
+    def _safe_team_tag(name: str):
+        if not name:
+            return None
+        n = name.strip()
+        if any(x in n for x in ["월", "일", "[", "]", "스포츠분석", "vs", "VS"]):
+            return None
+        if len(n) > 18:
+            return None
+        slug = _slug_tag(n)
+        if not slug or len(slug) < 2:
+            return None
+        return "#" + slug
+
+    ht = _safe_team_tag(home)
+    at = _safe_team_tag(away)
+    if ht: tags.append(ht)
+    if at: tags.append(at)
+
+    # 본문 키워드 기반 태그(최대 12개)
     for k, tg in _KEYWORD_TAGS:
-        if k in body and tg not in tags:
+        if k in body_nopick and tg not in tags:
             tags.append(tg)
         if len(tags) >= 12:
             break
 
     # dedupe keep order
-    seen=set()
-    tags2=[]
+    seen = set()
+    tags2 = []
     for t in tags:
         if t and t not in seen:
             tags2.append(t); seen.add(t)
     hashtags = " ".join(tags2)
 
-    chunks = [intro]
+    parts = [intro]
     if core_one:
-        chunks.append(core_one)
-    chunks.append(mid)
+        parts.append(core_one)
+    parts.append(outro)
     if pick_block:
-        chunks.append(pick_block)
-    chunks.append(outro)
+        parts.append(pick_block)
+    parts.append(hashtags)
 
-    text = "\n\n".join(chunks).strip()
-    # 하단: 줄바꿈 3번 + 제목 + 해시태그
-    text = text + "\n\n\n" + title + "\n" + hashtags
-    return text
+    return "\n\n".join([p for p in parts if p]).strip()
+
 
 
 def extract_final_pick_from_body(body: str) -> str:
