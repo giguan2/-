@@ -291,6 +291,8 @@ import asyncio
 import re
 import requests
 import httpx
+import unicodedata
+from urllib.parse import quote
 
 import traceback
 # ───────────────── 네이버 카페 자동 글쓰기 (추후: '네이버 카페 자동 글쓰기') ─────────────────
@@ -381,11 +383,86 @@ def _naver_refresh_access_token() -> str:
         print(f"[NAVER] token refresh exception: {e}")
         return ""
 
+# --- Naver Cafe posting helpers (encoding/normalization) ---
+_NAVER_RE_CTRL = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
+_NAVER_RE_ZW = re.compile(r"[\u200B-\u200D\uFEFF]")  # zero-width chars
+
+
+def _naver_clean_text(s: str) -> str:
+    """Normalize/sanitize text before sending to Naver Cafe API.
+
+    - NFC normalize (한글 조합 안정화)
+    - CRLF -> LF
+    - remove zero-width / control chars that can break uploads
+    """
+    s2 = unicodedata.normalize("NFC", str(s or ""))
+    s2 = s2.replace("\r\n", "\n").replace("\r", "\n")
+    s2 = _NAVER_RE_ZW.sub("", s2)
+    s2 = _NAVER_RE_CTRL.sub("", s2)
+    return s2.strip()
+
+
+def _naver_quote(s: str, *, double: bool = False) -> str:
+    """URL-encode a field for application/x-www-form-urlencoded.
+
+    - default: single UTF-8 quote
+    - double=True: quote twice (utf-8 -> cp949) as a fallback for some legacy behaviors
+    """
+    base = _naver_clean_text(s)
+    q1 = quote(base, safe="", encoding="utf-8")
+    if not double:
+        return q1
+
+    # 2차 인코딩(문서 일부 예시의 MS949 단계 대응용)
+    try:
+        return quote(q1, safe="", encoding="cp949")
+    except Exception:
+        return quote(q1, safe="", encoding="utf-8")
+
+
+def _naver_is_code_999(err: str) -> bool:
+    e = (err or "")
+    return ("code=999" in e) or ('"code":"999"' in e) or ("error" in e and "999" in e)
+
+
+def _naver_extract_err(resp) -> str:
+    """Best-effort error string extraction from Naver Cafe API responses."""
+    raw = (resp.text or "")[:800]
+    code = ""
+    msg = ""
+    inner_status = ""
+    try:
+        j = resp.json()
+        if isinstance(j, dict):
+            m = j.get("message") or {}
+            if isinstance(m, dict):
+                inner_status = str(m.get("status") or "").strip()
+                e = m.get("error") or {}
+                if isinstance(e, dict):
+                    code = str(e.get("code") or "").strip()
+                    msg = str(e.get("msg") or "").strip()
+    except Exception:
+        pass
+
+    parts = [f"HTTP_{getattr(resp, 'status_code', '')}"]
+    if inner_status:
+        parts.append(f"status={inner_status}")
+    if code:
+        parts.append(f"code={code}")
+    if msg:
+        parts.append(f"msg={msg}")
+    if raw:
+        parts.append(raw)
+    return ":".join([p for p in parts if p])
+
+
 def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tuple[bool, str]:
     """네이버 카페에 글쓰기. (success, articleId_or_error)
 
-    ⚠️ form-urlencoded(data=dict)로 보내면 한글/HTML이 깨지거나 HTTP_403 + 내부 500/999가 반복되는 케이스가 있어
-    multipart/form-data로 전송한다.
+    핵심:
+    - Content-Type: application/x-www-form-urlencoded
+    - subject/content를 URL 인코딩(quote, UTF-8)해서 전송 (한글/HTML 깨짐 방지)
+    - 403 + code=999 케이스는 'double encode' 1회 폴백
     """
     token = _naver_refresh_access_token()
     if not token:
@@ -394,26 +471,38 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
     if not clubid or not menuid:
         return False, "NO_CLUBID_OR_MENUID"
 
-    subject = (subject or "").strip() or "스포츠 분석"
-    if len(subject) > 80:
-        subject = subject[:80]
+    subject_raw = _naver_clean_text(subject) or "스포츠 분석"
+    # 제목은 줄바꿈 제거 + 공백 정리
+    subject_raw = re.sub(r"\s+", " ", subject_raw).strip()
+    if len(subject_raw) > 80:
+        subject_raw = subject_raw[:80]
+
+    content_raw = _naver_clean_text(content or "")
 
     url = f"https://openapi.naver.com/v1/cafe/{clubid}/menu/{menuid}/articles"
-    headers = {"Authorization": f"Bearer {token}"}
-
-    # requests multipart: (filename, content, mimetype) 대신 (None, value) 사용 → 일반 폼 필드
-    files = {
-        "subject": (None, subject),
-        "content": (None, content or ""),
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
     }
 
+    def _do_post(double: bool = False):
+        body = f"subject={_naver_quote(subject_raw, double=double)}&content={_naver_quote(content_raw, double=double)}"
+        return requests.post(url, headers=headers, data=body.encode("utf-8"), timeout=30)
+
     try:
-        resp = requests.post(url, headers=headers, files=files, timeout=30)
+        resp = _do_post(double=False)
 
         if resp.status_code != 200:
-            # 최대한 원인 확인 가능하도록 본문 일부 남김
-            txt = (resp.text or "")
-            return False, f"HTTP_{resp.status_code}:{txt[:800]}"
+            err1 = _naver_extract_err(resp)
+
+            # 403 + 999류는 1회 double-encode 폴백
+            if _naver_is_code_999(err1):
+                resp2 = _do_post(double=True)
+                if resp2.status_code != 200:
+                    return False, _naver_extract_err(resp2)
+                resp = resp2  # 성공하면 아래 파싱으로 진행
+            else:
+                return False, err1
 
         # 응답 포맷이 고정되어 있지 않아서 안전 파싱
         article_id = ""
@@ -623,16 +712,16 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("업로드할 새 글이 없어(이미 올린 src_id는 제외됨).")
         return
 
-    delay_sec = float(os.getenv("CAFE_POST_DELAY_SEC", "7"))
-    backoff_sec = float(os.getenv("CAFE_RATE_LIMIT_BACKOFF_SEC", "60"))
-    retries = int(os.getenv("CAFE_RATE_LIMIT_RETRIES", "1"))
+    delay_sec = float(os.getenv("CAFE_POST_DELAY_SEC", "15"))
+    backoff_sec = float(os.getenv("CAFE_RATE_LIMIT_BACKOFF_SEC", "180"))
+    retries = int(os.getenv("CAFE_RATE_LIMIT_RETRIES", "3"))
 
     def _is_rate_limited(err: str) -> bool:
         e = (err or "")
         if "연속" in e and "등록" in e:
             return True
         # 403 + 내부 500/999 케이스도 너무 빠를 때 뜨는 경우가 많아서 백오프 대상으로 본다
-        if "HTTP_403" in e and '"code":"999"' in e:
+        if "HTTP_403" in e and _naver_is_code_999(e):
             return True
         return False
 
@@ -685,7 +774,7 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
                 break
 
             # 999 내부 오류가 HTML 파싱/필터링 문제일 수도 있어서 plain 텍스트로 1회 폴백
-            if (not tried_plain) and ("HTTP_403" in (info or "")) and ('"code":"999"' in (info or "")):
+            if (not tried_plain) and ("HTTP_403" in (info or "")) and _naver_is_code_999(info):
                 tried_plain = True
                 continue
 
