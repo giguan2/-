@@ -6,6 +6,7 @@ from telegram.error import BadRequest
 
 # --- Time helpers ---
 from datetime import datetime, timedelta, timezone
+import html
 
 KST = timezone(timedelta(hours=9))
 
