@@ -420,6 +420,124 @@ def build_dynamic_cafe_simple(title: str, body: str, *, sport: str = "", seed: s
     return "\n\n".join([p for p in parts if p]).strip()
 
 
+def build_deep_body_hashtags(title: str, body: str, sport: str = "") -> str:
+    """심층분석(body) 하단에 붙일 해시태그 생성.
+    - 고정 태그 + 리그 + 팀명 + 본문 키워드 기반 태그
+    - 지나치게 긴 태그/문장형 태그는 배제
+    """
+    t = (title or "").strip()
+    b = (body or "").strip()
+
+    # 기본 태그(요청: 토토/프로토/스포츠토토/토토분석 등 포함 가능)
+    tags = ["#스포츠분석", "#토토", "#토토분석", "#스포츠토토", "#프로토"]
+
+    league = _extract_league_bracket(t)
+    if league:
+        lg = "#" + re.sub(r"\s+", "", league)
+        if len(lg) <= 16 and lg not in tags:
+            tags.append(lg)
+
+    home, away, _ = _extract_matchup(t)
+    ht = _safe_team_tag(home)
+    at = _safe_team_tag(away)
+    if ht and ht not in tags:
+        tags.append(ht)
+    if at and at not in tags:
+        tags.append(at)
+
+    # 본문에서 [최종 픽] 아래는 제외하고 키워드 스캔
+    body_nopick = re.split(r"\[\s*최종\s*픽\s*\]", b, maxsplit=1)[0]
+
+    for k, tg in _KEYWORD_TAGS:
+        if k in body_nopick and tg not in tags:
+            tags.append(tg)
+        if len(tags) >= 14:
+            break
+
+    # 너무 긴 태그(팀명 붙임 등) 제거
+    clean = []
+    seen = set()
+    for t in tags:
+        if not t:
+            continue
+        if len(t) > 22:
+            continue
+        if t in seen:
+            continue
+        clean.append(t)
+        seen.add(t)
+
+    return " ".join(clean).strip()
+
+
+def transform_export_body_for_deep_analysis(title: str, body: str, sport: str = "") -> str:
+    """export 탭에 저장할 심층분석 body를 가공.
+    - '고트티비' → '스포츠분석 커뮤니티 오분' 치환
+    - [팀 분석] / [경기 흐름 전망] 섹션에 '팀1 vs 팀2 경기분석' 키워드 자연 삽입
+    - 하단에 줄바꿈 3번 후 해시태그 추가
+    """
+    t = (title or "").strip()
+    b = (body or "").strip()
+
+    # 1) 고트티비 문구 치환
+    b = b.replace("고트티비", "스포츠분석 커뮤니티 오분")
+
+    home, away, matchup = _extract_matchup(t)
+    keyword = ""
+    if home and away:
+        keyword = f"{home} vs {away} 경기분석"
+    elif matchup:
+        keyword = f"{matchup} 경기분석"
+
+    if keyword:
+        rng = _seeded_rng(t + "|" + (home or "") + "|" + (away or ""))
+
+        def _ins_line_for_team(team: str) -> str:
+            pool = [
+                f"{keyword} 관점에서 {team}의 전술 포인트를 먼저 짚는다.",
+                f"{keyword}에서 {team} 쪽 핵심은 라인 운용과 전환 대응이다.",
+                f"{keyword} 기준으로 {team}은 어떤 패턴으로 우위를 만들 수 있는지 본다.",
+            ]
+            return rng.choice(pool)
+
+        def _ins_line_for_flow() -> str:
+            pool = [
+                f"{keyword}의 흐름은 초반 주도권과 세트피스 변수가 좌우할 수 있다.",
+                f"{keyword}에서는 압박 강도와 전환 속도가 경기의 결을 만든다.",
+                f"{keyword}의 승부처는 측면/중앙 공간 싸움에서 먼저 드러날 가능성이 있다.",
+            ]
+            return rng.choice(pool)
+
+        lines = b.splitlines()
+        out = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            out.append(line)
+            # 팀 분석 섹션: [OOO 분석]
+            m = re.match(r"^\[([^\]]+?)\s*분석\]\s*$", line.strip())
+            if m:
+                team = m.group(1).strip()
+                # 다음 3줄 안에 keyword가 이미 있으면 삽입하지 않음
+                nxt = "\n".join(lines[i+1:i+4])
+                if keyword not in nxt and "경기분석" not in nxt:
+                    out.append(_ins_line_for_team(team))
+            # 경기 흐름 전망 섹션
+            if line.strip() == "[경기 흐름 전망]":
+                nxt = "\n".join(lines[i+1:i+4])
+                if keyword not in nxt and "경기분석" not in nxt:
+                    out.append(_ins_line_for_flow())
+            i += 1
+        b = "\n".join(out).strip()
+
+    # 3) 해시태그 붙이기(이미 해시태그가 있으면 중복 방지)
+    if "#" not in b:
+        hashtags = build_deep_body_hashtags(t, b, sport=sport)
+        if hashtags:
+            b = b.rstrip() + "\n\n\n" + hashtags
+
+    return b.strip()
+
 
 def extract_final_pick_from_body(body: str) -> str:
     """body에서 [최종 픽] 섹션 중 '픽 라인'만 줄바꿈 그대로 추출해 반환.
@@ -3762,6 +3880,14 @@ async def crawl_maz_analysis_common(
                                     _dp2 = f"{target_date.month}월 {target_date.day}일 "
                                     if not str(site_title).startswith(_dp2):
                                         site_title = _dp2 + str(site_title).strip()
+
+                                # ✅ 심층분석(body) 가공: '오분' 문구/키워드 삽입/해시태그
+                                try:
+                                    site_body = transform_export_body_for_deep_analysis(
+                                        site_title, site_body, sport=row_sport
+                                    )
+                                except Exception:
+                                    pass
 
                                 # ✅ export 시트 G열(simple)용: 본문 전체 복사 금지 + 핵심요약/해시태그/제목 자연삽입
                                 try:
