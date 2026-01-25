@@ -642,6 +642,31 @@ def _cafe_format_text(text: str) -> str:
     t = re.sub(r"\n{3,}", "\n\n", t)
 
     return t.strip()
+
+
+def _cafe_text_to_center_html(text: str) -> str:
+    """텍스트를 네이버 카페 업로드용 HTML로 변환.
+
+    목표:
+    - 줄바꿈/빈줄이 실제로 '줄'로 보이도록 강제
+      (일부 카페가 <br> 태그를 제거/무시하는 케이스가 있어서 <p> 블록 기반으로 변환)
+    - 가운데 정렬은 align + style을 같이 사용(살아남는 쪽으로)
+
+    NOTE:
+    - 여기서는 사용자가 입력한 HTML을 허용하지 않고(escape),
+      오직 우리가 만든 <p> 태그만 사용한다.
+    """
+    t = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = t.split("\n")
+    parts: list[str] = []
+    for ln in lines:
+        esc = html.escape(ln)
+        if not esc.strip():
+            # 빈 줄은 &nbsp;로 유지(빈 p는 렌더링 시 높이가 0이 될 수 있음)
+            parts.append('<p align="center" style="text-align:center;">&nbsp;</p>')
+        else:
+            parts.append(f'<p align="center" style="text-align:center;">{esc}</p>')
+    return "\r\n".join(parts)
 async def _cafe_parse_which_arg(context: ContextTypes.DEFAULT_TYPE) -> str:
     which = "today"
     args = getattr(context, "args", None) or []
@@ -780,14 +805,13 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
         # ✅ 카페 본문 포맷(줄바꿈/섹션/불릿) 정리
         formatted_txt = _cafe_format_text(simple_txt)
 
-        # HTML 안전 처리(텍스트만 escape) + 줄바꿈은 <br/>로 변환
-        safe_html = html.escape(formatted_txt)
-        safe_html = safe_html.replace("\n", "<br/>")
+        # ✅ HTML 변환: 줄바꿈/빈줄 유지 + 가운데 정렬
+        # - 일부 카페에서 <br> 계열이 필터링되어 줄바꿈이 사라질 수 있어,
+        #   줄 단위로 <p> 블록을 만들어 '블록 요소'로 줄바꿈을 강제한다.
+        content_html = _cafe_text_to_center_html(formatted_txt)
 
-        # ✅ 가운데 정렬 + 줄바꿈 확실히 적용
-        # - style이 필터링되는 경우가 있어 align/center 태그도 함께 사용(살아남는 쪽으로)
-        content_html = f'<div align="center" style="text-align:center;"><center>{safe_html}</center></div>'
-        content_plain = formatted_txt  # 최후 fallback(태그 없이)
+        # fallback(태그 없이)도 CRLF로 보내서 줄바꿈 변환 가능성을 높인다.
+        content_plain = formatted_txt.replace("\n", "\r\n")
         subject = (titlev or "").strip() or f"{sportv} 분석"
         if len(subject) > 80:
             subject = subject[:80]
