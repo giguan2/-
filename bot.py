@@ -668,70 +668,76 @@ def _naver_refresh_access_token() -> str:
         print(f"[NAVER] token refresh exception: {e}")
         return ""
 
+from urllib.parse import quote_plus
+
+def _naver_clean_text(s: str) -> str:
+    # Normalize and remove problematic control/zero-width chars
+    import unicodedata, re
+    s = unicodedata.normalize("NFC", s or "")
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = re.sub(r"[\u200B-\u200D\uFEFF]", "", s)  # zero-width
+    s = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", s)  # control
+    return s.strip()
+
+def _naver_double_urlencode(s: str) -> str:
+    """Match Naver cafe API examples: urlencode(urlencode(text,'UTF-8'),'MS949')."""
+    s = _naver_clean_text(s)
+    first = quote_plus(s, safe="", encoding="utf-8", errors="strict")
+    # second pass escapes %,+ etc. (MS949 bytes are ASCII for first-pass output)
+    second = quote_plus(first, safe="", encoding="cp949", errors="strict")
+    return second
+
 def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tuple[bool, str]:
     """네이버 카페에 글쓰기. (success, articleId_or_error)
 
-    ⚠️ form-urlencoded(data=dict)로 보내면 한글/HTML이 깨지거나 HTTP_403 + 내부 500/999가 반복되는 케이스가 있어
-    multipart/form-data로 전송한다.
+    인코딩/줄바꿈 깨짐 방지를 위해 form-urlencoded + (UTF-8 → MS949) 이중 URL 인코딩을 사용한다.
     """
     token = _naver_refresh_access_token()
     if not token:
         return False, "NO_ACCESS_TOKEN"
-
     if not clubid or not menuid:
         return False, "NO_CLUBID_OR_MENUID"
 
-    subject = (subject or "").strip() or "스포츠 분석"
-    if len(subject) > 80:
-        subject = subject[:80]
+    subject_raw = (subject or "").strip() or "스포츠 분석"
+    if len(subject_raw) > 80:
+        subject_raw = subject_raw[:80]
+
+    # NOTE: content는 HTML 포함 가능(센터/줄바꿈 포맷)
+    content_raw = content or ""
 
     url = f"https://openapi.naver.com/v1/cafe/{clubid}/menu/{menuid}/articles"
-    headers = {"Authorization": f"Bearer {token}"}
-
-    # requests multipart: (filename, content, mimetype) 대신 (None, value) 사용 → 일반 폼 필드
-    files = {
-        "subject": (None, subject),
-        "content": (None, content or ""),
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
     }
 
+    body = (
+        f"subject={_naver_double_urlencode(subject_raw)}"
+        f"&content={_naver_double_urlencode(content_raw)}"
+    )
+
     try:
-        resp = requests.post(url, headers=headers, files=files, timeout=30)
+        resp = requests.post(url, headers=headers, data=body.encode("utf-8"), timeout=30)
 
         if resp.status_code != 200:
-            # 최대한 원인 확인 가능하도록 본문 일부 남김
             txt = (resp.text or "")
             return False, f"HTTP_{resp.status_code}:{txt[:800]}"
 
-        # 응답 포맷이 고정되어 있지 않아서 안전 파싱
         article_id = ""
         try:
             j = resp.json()
-            if isinstance(j, dict):
-                for key_path in [
-                    ("result", "articleId"),
-                    ("result", "articleid"),
-                    ("message", "result", "articleId"),
-                    ("message", "result", "articleid"),
-                ]:
-                    cur = j
-                    ok = True
-                    for k in key_path:
-                        if isinstance(cur, dict) and k in cur:
-                            cur = cur[k]
-                        else:
-                            ok = False
-                            break
-                    if ok and cur:
-                        article_id = str(cur)
-                        break
+            article_id = (
+                j.get("message", {}).get("result", {}).get("articleId")
+                or j.get("result", {}).get("articleId")
+                or ""
+            )
         except Exception:
             pass
 
-        return True, (article_id or "OK")
+        return True, str(article_id or "OK")
 
     except Exception as e:
         return False, f"EXC:{e}"
-
 def get_cafe_log_ws():
     """cafe_log 워크시트 반환(없으면 생성 + 헤더 세팅)."""
     client_gs = get_gs_client()
@@ -946,10 +952,14 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
             continue
 
         # HTML 안전 처리 + 줄바꿈 정규화
-        safe_simple = html.escape(simple_txt).replace("\r\n", "\n").replace("\r", "\n").strip()
+        safe_simple = html.escape(simple_txt).replace("
+", "
+").replace("", "
+").strip()
 
-        # 가운데 정렬 + 줄바꿈 유지
-        content_html = f'<div style="text-align:center; white-space:pre-wrap;">{safe_simple}</div>'
+        # 가운데 정렬 + 줄바꿈 유지 (따옴표/스타일 속성 필터링을 피하려고 <center> + <br> 사용)
+        content_html = "<center>" + safe_simple.replace("
+", "<br>") + "</center>"
         content_plain = safe_simple  # fallback
 
         subject = (titlev or "").strip() or f"{sportv} 분석"
@@ -965,7 +975,7 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
             if success:
                 ok_cnt += 1
                 ws_log.append_row(
-                    [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, info, now_kst().isoformat(), "OK"],
+                    [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, info, now_kst().isoformat(), ("OK_PLAIN" if tried_plain else "OK_HTML_CENTER_TAG")],
                     value_input_option="RAW",
                     table_range="A1",
                 )
