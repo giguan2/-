@@ -1851,39 +1851,78 @@ def get_existing_export_src_ids(sheet_name: str) -> set[str]:
 
 
 def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
-    """지정 export 시트에 rows를 append."""
+    """지정 export_today / export_tomorrow 시트에 rows를 append.
+
+    rows: [ [day, sport, src_id, title, body, createdAt] , ... ] 또는 7컬럼(마지막 simple 포함)
+    - body(E열)는 심층분석 업로드용으로 transform_export_body_for_deep_analysis()를 항상 적용(백스톱)
+    - simple(G열)는 가공된 body 기준으로 재생성(구버전/본문복사 방지)
+    """
     if not rows:
         return True
 
     ws = get_export_ws(sheet_name)
     if not ws:
         return False
-    # rows는 6컬럼([day,sport,src_id,title,body,createdAt]) 또는 7컬럼일 수 있음. simple 자동 생성.
-    fixed_rows = []
+
+    fixed_rows: list[list[str]] = []
     for r in rows:
         if not r:
             continue
+
         rr = list(r)
-        if len(rr) == 6:
-            rr.append(extract_simple_from_body(rr[4] if len(rr) > 4 else ""))
-        elif len(rr) >= 7:
-            rr = rr[:7]
-            if not str(rr[6]).strip():
-                rr[6] = extract_simple_from_body(rr[4] if len(rr) > 4 else "")
-        else:
+
+        # 최소 6컬럼 보장
+        if len(rr) < 6:
             while len(rr) < 6:
                 rr.append("")
-            rr.append(extract_simple_from_body(rr[4] if len(rr) > 4 else ""))
+
+        # 7컬럼 보장(마지막 simple)
+        if len(rr) == 6:
+            rr.append("")
+        elif len(rr) > 7:
+            rr = rr[:7]
+
+        day = str(rr[0] or "").strip()
+        sport = str(rr[1] or "").strip()
+        src_id = str(rr[2] or "").strip()
+        title = str(rr[3] or "").strip()
+        body = str(rr[4] or "")
+        created_at = str(rr[5] or "").strip()
+
+        # ✅ export body는 항상 심층분석 가공 적용(호출부 누락/구버전 방지)
+        try:
+            body = transform_export_body_for_deep_analysis(title, body, sport=sport)
+        except Exception as e:
+            print(f"[GSHEET][EXPORT] body transform 실패({sheet_name}) id={src_id}: {e}")
+
+        rr[0] = day
+        rr[1] = sport
+        rr[2] = src_id
+        rr[3] = title
+        rr[4] = body
+        rr[5] = created_at
+
+        # ✅ simple은 가공된 body 기준으로 항상 재생성
+        try:
+            if "build_dynamic_cafe_simple" in globals() and callable(globals().get("build_dynamic_cafe_simple")):
+                rr[6] = build_dynamic_cafe_simple(title, body, sport=sport, seed=src_id or title)
+            else:
+                rr[6] = extract_simple_from_body(body)
+        except Exception as e:
+            print(f"[GSHEET][EXPORT] simple 생성 실패({sheet_name}) id={src_id}: {e}")
+            rr[6] = extract_simple_from_body(body)
+
         fixed_rows.append(rr)
-    rows = fixed_rows
+
+    if not fixed_rows:
+        return True
 
     try:
-        ws.append_rows(rows, value_input_option="RAW", table_range="A1")
+        ws.append_rows(fixed_rows, value_input_option="RAW", table_range="A1")
         return True
     except Exception as e:
         print(f"[GSHEET][EXPORT] append 실패({sheet_name}): {e}")
         return False
-
 
 
 
