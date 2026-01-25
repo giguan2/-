@@ -182,6 +182,14 @@ def _extract_matchup(title: str) -> tuple[str, str, str]:
         return ("", "", "")
     home = m.group(1).strip()
     away = m.group(2).strip()
+
+    # home 쪽에 날짜/리그가 같이 들어오는 케이스 정리
+    home = re.sub(r"^\d+월\s*\d+일\s*", "", home)
+    home = re.sub(r"^\[[^\]]+\]\s*", "", home)
+    home = home.replace("스포츠분석", "").strip()
+
+    away = away.replace("스포츠분석", "").strip()
+
     matchup = f"{home} vs {away}"
     return (home, away, matchup)
 
