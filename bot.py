@@ -134,411 +134,6 @@ def extract_simple_from_body(body: str) -> str:
     return one
 
 
-# --- Dynamic cafe simple builder (for export sheet G column) ---
-import re
-import hashlib as _hashlib
-import random as _random
-
-_KEYWORD_TAGS = [
-    ("토토", "#토토"),
-    ("프로토", "#프로토"),
-    ("스포츠토토", "#스포츠토토"),
-    ("토토분석", "#토토분석"),
-("세트피스", "#세트피스"),
-    ("역습", "#역습"),
-    ("압박", "#압박"),
-    ("측면", "#측면"),
-    ("수비", "#수비"),
-    ("공격", "#공격"),
-    ("제공권", "#제공권"),
-    ("전환", "#전환"),
-    ("점유", "#점유"),
-    ("피지컬", "#피지컬"),
-    ("범실", "#범실"),
-    ("블로킹", "#블로킹"),
-]
-
-_SPORT_TAGS = {
-    "축구": ["#축구분석", "#해외축구"],
-    "K리그": ["#축구분석", "#K리그"],
-    "J리그": ["#축구분석", "#J리그"],
-    "야구": ["#야구분석", "#해외야구"],
-    "농구": ["#농구분석", "#해외농구"],
-    "배구": ["#배구분석", "#V리그"],
-}
-
-def _stable_rng(seed: str) -> _random.Random:
-    h = _hashlib.md5((seed or "seed").encode("utf-8")).hexdigest()
-    return _random.Random(int(h[:8], 16))
-
-def _extract_league_bracket(title: str) -> str:
-    m = re.search(r"\[([^\]]{2,30})\]", title or "")
-    return m.group(1).strip() if m else ""
-
-def _extract_matchup(title: str) -> tuple[str, str, str]:
-    t = (title or "").replace("\u200b", "").strip()
-    # capture full away team (including spaces) until "스포츠분석" or end
-    m = re.search(r"(.+?)\s+vs\s+(.+?)(?:\s+스포츠분석\b|$)", t)
-    if not m:
-        return ("", "", "")
-    home = m.group(1).strip()
-    away = m.group(2).strip()
-
-    # home 쪽에 날짜/리그가 같이 들어오는 케이스 정리
-    home = re.sub(r"^\d+월\s*\d+일\s*", "", home)
-    home = re.sub(r"^\[[^\]]+\]\s*", "", home)
-    home = home.replace("스포츠분석", "").strip()
-
-    away = away.replace("스포츠분석", "").strip()
-
-    matchup = f"{home} vs {away}"
-    return (home, away, matchup)
-
-def _slug_tag(s: str) -> str:
-    s = re.sub(r"[\[\]\(\)<>\"'`]", "", s or "")
-    s = re.sub(r"스포츠분석", "", s)
-    s = s.replace("vs", " ").replace("VS", " ")
-    s = re.sub(r"\s+", "", s)
-    # 날짜/숫자 제거(1월25일 같은 초장문 태그 방지)
-    s = re.sub(r"[0-9]+", "", s)
-    s = s.replace("월", "").replace("일", "")
-    s = re.sub(r"[^\w가-힣]+", "", s)
-    # 너무 긴 경우 잘라내기
-    return s[:15]
-def build_dynamic_cafe_simple(title: str, body: str, *, sport: str = "", seed: str = "") -> str:
-    """export_* 시트 G열(simple) 생성(요약형)
-    목표:
-    - body 전체 복사 금지
-    - [핵심 포인트 요약]이 있으면 1문장 요약, 없으면 본문에서 1~2문장 요약
-    - 제목(또는 매치업)은 도입/결론에서만 자연스럽게 사용(과도 반복 금지)
-    - [최종 픽]은 1회만 포함
-    - 하단: 해시태그(토토/프로토/스포츠토토/토토분석 포함 가능)
-    """
-    title = (title or "").strip()
-    body = (body or "").strip()
-
-    league = _extract_league_bracket(title)
-    home, away, matchup = _extract_matchup(title)
-
-    # fallback matchup (날짜/리그/스포츠분석 제거)
-    if not matchup:
-        t = re.sub(r"^\d+월\s*\d+일\s*", "", title)
-        t = re.sub(r"^\[[^\]]+\]\s*", "", t)
-        t = t.replace("스포츠분석", "").strip()
-        matchup = t
-
-    # 본문에서 최종 픽 섹션 제거한 텍스트로 요약/키워드 추출(픽 중복 방지)
-    def _remove_pick_section(txt: str) -> str:
-        if not txt:
-            return ""
-        x = txt
-        x = x.replace("\r\n", "\n").replace("\r", "\n")
-        x = re.sub(r"<br\s*/?>", "\n", x, flags=re.I)
-        x = re.sub(r"</(p|div|li)>", "\n", x, flags=re.I)
-        x = re.sub(r"<[^>]+>", "", x)
-        x = x.replace("&nbsp;", " ")
-        # [최종 픽] 이후 끝까지 제거
-        x = re.sub(r"\[\s*최종\s*픽\s*\][\s\S]*$", "", x, flags=re.I)
-        x = re.sub(r"최종\s*픽\s*[:：]?[\s\S]*$", "", x, flags=re.I)
-        return x.strip()
-
-    body_nopick = _remove_pick_section(body)
-
-    rng = _stable_rng(seed or (title + "|" + matchup + "|" + body_nopick[:80]))
-
-    # theme: 본문에서 키워드 탐색, 없으면 후보에서 선택
-    theme = ""
-    for k, _tg in _KEYWORD_TAGS:
-        if k and k in body_nopick:
-            theme = k
-            break
-    if not theme:
-        theme = rng.choice(["세트피스", "압박", "전환", "수비", "역습", "피지컬"])
-
-    # 요약: 핵심포인트 1문장(없으면 본문 첫 문장들)
-    core_one = (extract_simple_from_body(body_nopick) or "").strip()
-
-    # 요약에 픽 관련 라인 들어가면 제거
-    if core_one:
-        lines = []
-        for ln in core_one.split("\n"):
-            t = ln.strip()
-            if not t:
-                continue
-            if any(x in t for x in ["승패", "핸디", "언오버", "최종 픽"]):
-                continue
-            lines.append(t)
-        core_one = " ".join(lines).strip()
-
-    if not core_one:
-        # 본문에서 첫 문단(헤더/구분선 제외) 1~2문장 추출
-        paras = []
-        for block in re.split(r"\n\s*\n+", body_nopick):
-            b = block.strip()
-            if not b:
-                continue
-            if re.match(r"^[─\-]{5,}$", b):
-                continue
-            if re.match(r"^\[.*?\]$", b):
-                continue
-            if b.startswith("[") and b.endswith("]") and len(b) <= 30:
-                continue
-            paras.append(b)
-        base = paras[0] if paras else body_nopick
-        base = re.sub(r"\s+", " ", base).strip()
-        # 문장 1~2개
-        sents = re.split(r"(?<=[\.\!\?다])\s+", base)
-        core_one = " ".join([x.strip() for x in sents[:2] if x.strip()])[:320].strip()
-
-    # 픽 블록(1회)
-    pick_block = (extract_final_pick_from_body(body) or "").strip()
-
-    intro_pool = [
-        "{title}은 초반 주도권 싸움이 포인트다.",
-        "{title}은 전술 상성에서 승부가 갈릴 수 있다.",
-        "{title}은 {theme} 대응이 결과를 좌우할 수 있다.",
-        "{title}은 운영 안정감이 먼저 중요한 경기다.",
-        "{title}은 흐름 싸움에서 우위가 갈릴 수 있다.",
-        "{title}은 한두 장면의 완성도가 관건이다.",
-    ]
-    outro_pool_by_theme = {
-        "세트피스": [
-            "정리하면 {matchup} 경기는 세트피스 한두 장면이 승부처가 될 수 있다.",
-            "끝으로 {matchup} 경기는 세트피스 수비/공격 완성도가 결과를 가를 가능성이 크다.",
-            "결국 {matchup} 경기는 세트피스에서 기회를 더 많이 쌓는 쪽이 유리하다.",
-            "{matchup} 경기는 코너킥·프리킥 한 번의 디테일이 점수로 이어질 수 있다.",
-        ],
-        "압박": [
-            "요약하면 {matchup} 경기는 압박 타이밍과 라인 간격이 포인트다.",
-            "결국 {matchup} 경기는 중원 압박이 먼저 먹히는 쪽이 흐름을 잡을 수 있다.",
-            "마지막으로 {matchup} 경기는 압박 회피와 전진 패스의 정확도가 관건이다.",
-            "{matchup} 경기는 강하게 눌렀을 때의 세컨볼 대응이 승부를 가를 수 있다.",
-        ],
-        "전환": [
-            "정리하면 {matchup} 경기는 공수 전환 속도에서 차이가 날 수 있다.",
-            "결국 {matchup} 경기는 전환 한 번에 수비 라인이 무너질 수 있어 실점 관리가 중요하다.",
-            "끝으로 {matchup} 경기는 전환 상황에서 뒷공간 대응이 승부처다.",
-            "{matchup} 경기는 전환 국면에서 실수를 줄이는 쪽이 유리하다.",
-        ],
-        "수비": [
-            "마무리로 {matchup} 경기는 실점 관리와 박스 안 대응이 핵심이다.",
-            "결국 {matchup} 경기는 수비 조직력 유지가 먼저 시험대에 오른다.",
-            "정리하면 {matchup} 경기는 라인 컨트롤과 커버 타이밍이 승부처가 될 수 있다.",
-            "{matchup} 경기는 수비 실수 한 번이 그대로 점수로 이어질 수 있다.",
-        ],
-        "역습": [
-            "정리하면 {matchup} 경기는 역습 한 방의 완성도가 승부를 가를 수 있다.",
-            "끝으로 {matchup} 경기는 역습 전개 속도와 마무리의 정확도가 관건이다.",
-            "결국 {matchup} 경기는 역습 찬스를 더 효율적으로 살리는 쪽이 유리하다.",
-            "{matchup} 경기는 역습 상황에서 첫 패스 선택이 승부처가 될 수 있다.",
-        ],
-        "피지컬": [
-            "마지막으로 {matchup} 경기는 피지컬 경합과 세컨볼 싸움에서 흐름이 갈릴 수 있다.",
-            "정리하면 {matchup} 경기는 제공권·경합에서 우위가 승부를 가를 가능성이 크다.",
-            "결국 {matchup} 경기는 강도 높은 몸싸움에서 버티는 쪽이 유리하다.",
-            "{matchup} 경기는 후반 체력 싸움에서 격차가 벌어질 수 있다.",
-        ],
-    }
-
-    outro_pool_generic = [
-        "정리하면 {matchup} 경기는 운영 디테일에서 승부가 갈릴 수 있다.",
-        "결국 {matchup} 경기는 한두 장면의 완성도가 결과를 좌우할 수 있다.",
-        "마무리로 {matchup} 경기는 실수 관리가 중요하다.",
-        "{matchup} 경기는 후반 운영에서 차이가 날 수 있다.",
-        "{matchup} 경기는 흐름을 먼저 잡는 팀이 유리하다.",
-        "끝으로 {matchup} 경기는 결정력과 실점 관리가 함께 중요하다.",
-    ]
-
-    def _choose_outro() -> str:
-        pool = outro_pool_by_theme.get(theme, []) + outro_pool_generic
-        return rng.choice(pool)
-
-
-    def _fill(tpl: str) -> str:
-        return tpl.format(title=title, matchup=matchup, theme=theme)
-
-    intro = _fill(rng.choice(intro_pool)).strip()
-    outro = _fill(_choose_outro()).strip()
-
-    # 해시태그(짧고 자연스럽게)
-    tags = ["#스포츠분석"]
-
-    # 토토/프로토 계열은 과도 반복 피하고 1~2개만 선택(안정적으로)
-    betting_pool = ["#토토", "#프로토", "#스포츠토토", "#토토분석"]
-    rng.shuffle(betting_pool)
-    tags += betting_pool[:2]
-
-    tags += _SPORT_TAGS.get(sport, ["#해외스포츠"])
-
-    if league:
-        tg = "#" + _slug_tag(league)
-        if len(tg) >= 2:
-            tags.append(tg)
-
-    # 팀 태그는 실패 추출로 초장문이 나오면 제외
-    def _safe_team_tag(name: str):
-        if not name:
-            return None
-        n = name.strip()
-        if any(x in n for x in ["월", "일", "[", "]", "스포츠분석", "vs", "VS"]):
-            return None
-        if len(n) > 18:
-            return None
-        slug = _slug_tag(n)
-        if not slug or len(slug) < 2:
-            return None
-        return "#" + slug
-
-    ht = _safe_team_tag(home)
-    at = _safe_team_tag(away)
-    if ht: tags.append(ht)
-    if at: tags.append(at)
-
-    # 본문 키워드 기반 태그(최대 12개)
-    for k, tg in _KEYWORD_TAGS:
-        if k in body_nopick and tg not in tags:
-            tags.append(tg)
-        if len(tags) >= 12:
-            break
-
-    # dedupe keep order
-    seen = set()
-    tags2 = []
-    for t in tags:
-        if t and t not in seen:
-            tags2.append(t); seen.add(t)
-    hashtags = " ".join(tags2)
-
-    parts = [intro]
-    if core_one:
-        parts.append(core_one)
-    parts.append(outro)
-    if pick_block:
-        parts.append(pick_block)
-    parts.append(hashtags)
-
-    return "\n\n".join([p for p in parts if p]).strip()
-
-
-def build_deep_body_hashtags(title: str, body: str, sport: str = "") -> str:
-    """심층분석(body) 하단에 붙일 해시태그 생성.
-    - 고정 태그 + 리그 + 팀명 + 본문 키워드 기반 태그
-    - 지나치게 긴 태그/문장형 태그는 배제
-    """
-    t = (title or "").strip()
-    b = (body or "").strip()
-
-    # 기본 태그(요청: 토토/프로토/스포츠토토/토토분석 등 포함 가능)
-    tags = ["#스포츠분석", "#토토", "#토토분석", "#스포츠토토", "#프로토"]
-
-    league = _extract_league_bracket(t)
-    if league:
-        lg = "#" + re.sub(r"\s+", "", league)
-        if len(lg) <= 16 and lg not in tags:
-            tags.append(lg)
-
-    home, away, _ = _extract_matchup(t)
-    ht = _safe_team_tag(home)
-    at = _safe_team_tag(away)
-    if ht and ht not in tags:
-        tags.append(ht)
-    if at and at not in tags:
-        tags.append(at)
-
-    # 본문에서 [최종 픽] 아래는 제외하고 키워드 스캔
-    body_nopick = re.split(r"\[\s*최종\s*픽\s*\]", b, maxsplit=1)[0]
-
-    for k, tg in _KEYWORD_TAGS:
-        if k in body_nopick and tg not in tags:
-            tags.append(tg)
-        if len(tags) >= 14:
-            break
-
-    # 너무 긴 태그(팀명 붙임 등) 제거
-    clean = []
-    seen = set()
-    for t in tags:
-        if not t:
-            continue
-        if len(t) > 22:
-            continue
-        if t in seen:
-            continue
-        clean.append(t)
-        seen.add(t)
-
-    return " ".join(clean).strip()
-
-
-def transform_export_body_for_deep_analysis(title: str, body: str, sport: str = "") -> str:
-    """export 탭에 저장할 심층분석 body를 가공.
-    - '고트티비' → '스포츠분석 커뮤니티 오분' 치환
-    - [팀 분석] / [경기 흐름 전망] 섹션에 '팀1 vs 팀2 경기분석' 키워드 자연 삽입
-    - 하단에 줄바꿈 3번 후 해시태그 추가
-    """
-    t = (title or "").strip()
-    b = (body or "").strip()
-
-    # 1) 고트티비 문구 치환
-    b = b.replace("고트티비", "스포츠분석 커뮤니티 오분")
-
-    home, away, matchup = _extract_matchup(t)
-    keyword = ""
-    if home and away:
-        keyword = f"{home} vs {away} 경기분석"
-    elif matchup:
-        keyword = f"{matchup} 경기분석"
-
-    if keyword:
-        rng = _seeded_rng(t + "|" + (home or "") + "|" + (away or ""))
-
-        def _ins_line_for_team(team: str) -> str:
-            pool = [
-                f"{keyword} 관점에서 {team}의 전술 포인트를 먼저 짚는다.",
-                f"{keyword}에서 {team} 쪽 핵심은 라인 운용과 전환 대응이다.",
-                f"{keyword} 기준으로 {team}은 어떤 패턴으로 우위를 만들 수 있는지 본다.",
-            ]
-            return rng.choice(pool)
-
-        def _ins_line_for_flow() -> str:
-            pool = [
-                f"{keyword}의 흐름은 초반 주도권과 세트피스 변수가 좌우할 수 있다.",
-                f"{keyword}에서는 압박 강도와 전환 속도가 경기의 결을 만든다.",
-                f"{keyword}의 승부처는 측면/중앙 공간 싸움에서 먼저 드러날 가능성이 있다.",
-            ]
-            return rng.choice(pool)
-
-        lines = b.splitlines()
-        out = []
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            out.append(line)
-            # 팀 분석 섹션: [OOO 분석]
-            m = re.match(r"^\[([^\]]+?)\s*분석\]\s*$", line.strip())
-            if m:
-                team = m.group(1).strip()
-                # 다음 3줄 안에 keyword가 이미 있으면 삽입하지 않음
-                nxt = "\n".join(lines[i+1:i+4])
-                if keyword not in nxt and "경기분석" not in nxt:
-                    out.append(_ins_line_for_team(team))
-            # 경기 흐름 전망 섹션
-            if line.strip() == "[경기 흐름 전망]":
-                nxt = "\n".join(lines[i+1:i+4])
-                if keyword not in nxt and "경기분석" not in nxt:
-                    out.append(_ins_line_for_flow())
-            i += 1
-        b = "\n".join(out).strip()
-
-    # 3) 해시태그 붙이기(이미 해시태그가 있으면 중복 방지)
-    if "#" not in b:
-        hashtags = build_deep_body_hashtags(t, b, sport=sport)
-        if hashtags:
-            b = b.rstrip() + "\n\n\n" + hashtags
-
-    return b.strip()
-
-
 def extract_final_pick_from_body(body: str) -> str:
     """body에서 [최종 픽] 섹션 중 '픽 라인'만 줄바꿈 그대로 추출해 반환.
     - [최종 픽] 이후 불릿(-,•,*) 또는 '승패/핸디/언오버' 라인만 연속으로 가져오고,
@@ -786,86 +381,70 @@ def _naver_refresh_access_token() -> str:
         print(f"[NAVER] token refresh exception: {e}")
         return ""
 
-def _naver_clean_text(s: str) -> str:
-    s = (s or "")
-    s = s.replace("\r\n", "\n").replace("\r", "\n")
-    # 네이버 카페 에디터가 싫어하는 제어문자 제거
-    s = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", s)
-    return s.strip()
-
-def _naver_quote_double(s: str) -> str:
-    """네이버 카페 글쓰기 API에서 한글 깨짐 방지를 위한 이중 URL 인코딩."""
-    s = _naver_clean_text(s)
-    first = quote_plus(s, safe="", encoding="utf-8", errors="strict")
-    second = quote_plus(first, safe="", encoding="ms949", errors="ignore")
-    return second
-
-def _naver_quote_once(s: str) -> str:
-    s = _naver_clean_text(s)
-    return quote_plus(s, safe="", encoding="utf-8", errors="strict")
-
 def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tuple[bool, str]:
     """네이버 카페에 글쓰기. (success, articleId_or_error)
 
-    - application/x-www-form-urlencoded 로 전송
-    - subject/content 를 URL 인코딩(기본: UTF-8→MS949 이중 인코딩)해서 한글 깨짐 방지
+    ⚠️ form-urlencoded(data=dict)로 보내면 한글/HTML이 깨지거나 HTTP_403 + 내부 500/999가 반복되는 케이스가 있어
+    multipart/form-data로 전송한다.
     """
     token = _naver_refresh_access_token()
     if not token:
         return False, "NO_ACCESS_TOKEN"
+
     if not clubid or not menuid:
         return False, "NO_CLUBID_OR_MENUID"
 
-    subject_raw = (subject or "").strip() or "스포츠 분석"
-    if len(subject_raw) > 80:
-        subject_raw = subject_raw[:80]
-
-    content_raw = content or ""
-
-    use_double = str(os.getenv("NAVER_CAFE_DOUBLE_ENCODE", "1")).strip() not in ("0", "false", "False", "no", "NO")
-
-    enc_subject = _naver_quote_double(subject_raw) if use_double else _naver_quote_once(subject_raw)
-    enc_content  = _naver_quote_double(content_raw) if use_double else _naver_quote_once(content_raw)
-
-    body = f"subject={enc_subject}&content={enc_content}"
+    subject = (subject or "").strip() or "스포츠 분석"
+    if len(subject) > 80:
+        subject = subject[:80]
 
     url = f"https://openapi.naver.com/v1/cafe/{clubid}/menu/{menuid}/articles"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # requests multipart: (filename, content, mimetype) 대신 (None, value) 사용 → 일반 폼 필드
+    files = {
+        "subject": (None, subject),
+        "content": (None, content or ""),
     }
 
     try:
-        resp = requests.post(url, headers=headers, data=body.encode("utf-8"), timeout=30)
+        resp = requests.post(url, headers=headers, files=files, timeout=30)
 
         if resp.status_code != 200:
-            txt = (resp.text or "")[:800]
-            try:
-                j = resp.json()
-                code = j.get("message", {}).get("error", {}).get("code")
-                msg = j.get("message", {}).get("error", {}).get("msg")
-                if code or msg:
-                    return False, f"HTTP_{resp.status_code}:{code}:{msg}"
-            except Exception:
-                pass
-            return False, f"HTTP_{resp.status_code}:{txt}"
+            # 최대한 원인 확인 가능하도록 본문 일부 남김
+            txt = (resp.text or "")
+            return False, f"HTTP_{resp.status_code}:{txt[:800]}"
 
+        # 응답 포맷이 고정되어 있지 않아서 안전 파싱
         article_id = ""
         try:
             j = resp.json()
             if isinstance(j, dict):
-                article_id = (
-                    j.get("message", {}).get("result", {}).get("articleId")
-                    or j.get("result", {}).get("articleId")
-                    or ""
-                )
+                for key_path in [
+                    ("result", "articleId"),
+                    ("result", "articleid"),
+                    ("message", "result", "articleId"),
+                    ("message", "result", "articleid"),
+                ]:
+                    cur = j
+                    ok = True
+                    for k in key_path:
+                        if isinstance(cur, dict) and k in cur:
+                            cur = cur[k]
+                        else:
+                            ok = False
+                            break
+                    if ok and cur:
+                        article_id = str(cur)
+                        break
         except Exception:
             pass
 
-        return True, (str(article_id) if article_id else "OK")
+        return True, (article_id or "OK")
 
     except Exception as e:
         return False, f"EXC:{e}"
+
 def get_cafe_log_ws():
     """cafe_log 워크시트 반환(없으면 생성 + 헤더 세팅)."""
     client_gs = get_gs_client()
@@ -1082,10 +661,8 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
         # HTML 안전 처리 + 줄바꿈 정규화
         safe_simple = html.escape(simple_txt).replace("\r\n", "\n").replace("\r", "\n").strip()
 
-        # 네이버 카페 필터링을 피하기 위해 따옴표/스타일 속성 없이 center + <br>만 사용
-        _lines = safe_simple.split("\n") if safe_simple else [""]
-        _html_lines = [ln if ln.strip() else "&nbsp;" for ln in _lines]
-        content_html = "<center>" + "<br>".join(_html_lines) + "</center>"
+        # 가운데 정렬 + 줄바꿈 유지
+        content_html = f'<div style="text-align:center; white-space:pre-wrap;">{safe_simple}</div>'
         content_plain = safe_simple  # fallback
 
         subject = (titlev or "").strip() or f"{sportv} 분석"
@@ -1198,7 +775,7 @@ async def _maz_warmup(client: httpx.AsyncClient) -> None:
 
 import math
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, quote_plus
+from urllib.parse import urljoin
 from openai import OpenAI
 
 from telegram import (
@@ -1770,30 +1347,14 @@ def append_site_export_rows(rows: list[list[str]]) -> bool:
             if not r:
                 continue
             rr = list(r)
-
-            # rows 기본 포맷: [day, sport, src_id, title, body, createdAt] (6) 또는 simple 포함 (7)
-            # 1) 최소 6컬럼 확보
-            while len(rr) < 6:
-                rr.append("")
-
-            # 2) export body(심층분석용) 가공: '고트티비' → '스포츠분석 커뮤니티 오분' + 섹션 키워드 삽입 + 해시태그
-            try:
-                rr[4] = transform_export_body_for_deep_analysis(
-                    rr[3] if len(rr) > 3 else "",
-                    rr[4] if len(rr) > 4 else "",
-                    sport=rr[1] if len(rr) > 1 else ""
-                )
-            except Exception:
-                pass
-
-            # 3) simple 컬럼은 가공된 body 기준으로 항상 재생성(중복/구버전 방지)
-            if len(rr) >= 7:
-                rr = rr[:7]
-                rr[6] = extract_simple_from_body(rr[4] if len(rr) > 4 else "")
-            else:
-                rr = rr[:6]
+            if len(rr) == 6:
                 rr.append(extract_simple_from_body(rr[4] if len(rr) > 4 else ""))
-
+            elif len(rr) >= 7:
+                rr = rr[:7]
+            else:
+                while len(rr) < 6:
+                    rr.append("")
+                rr.append(extract_simple_from_body(rr[4] if len(rr) > 4 else ""))
             fixed_rows.append(rr)
         rows = fixed_rows
         ws.append_rows(rows, value_input_option="RAW", table_range="A1")
@@ -1864,17 +1425,16 @@ def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
         if not r:
             continue
         rr = list(r)
-        # --- export body deep-transform (deep analysis posting) ---
+        # export_today/export_tomorrow E열(body) 심층분석용 가공(치환/키워드 삽입/해시태그)
         try:
-            if len(rr) > 4 and isinstance(rr[4], str):
+            if sheet_name and str(sheet_name).lower().startswith("export") and len(rr) > 4:
                 rr[4] = transform_export_body_for_deep_analysis(
                     rr[3] if len(rr) > 3 else "",
-                    rr[4],
-                    sport=rr[1] if len(rr) > 1 else "",
+                    rr[4] if rr[4] is not None else "",
+                    sport=str(rr[1]) if len(rr) > 1 else "",
                 )
         except Exception as _e:
-            print(f"[GSHEET][EXPORT] body transform skipped: {_e}")
-
+            print(f"[GSHEET][EXPORT] body 가공 실패: {_e}")
         if len(rr) == 6:
             rr.append(extract_simple_from_body(rr[4] if len(rr) > 4 else ""))
         elif len(rr) >= 7:
@@ -3854,12 +3414,6 @@ async def crawl_maz_analysis_common(
                     else:
                         new_title, new_body = "", ""
 
-                    # ✅ today/tomorrow 크롤링 제목 앞에 날짜 프리픽스 추가 (중복 방지)
-                    if new_title and day_key in ("today", "tomorrow"):
-                        _dp = f"{target_date.month}월 {target_date.day}일 "
-                        if not str(new_title).startswith(_dp):
-                            new_title = _dp + str(new_title).strip()
-
                     # ✅ sport 세부 분류
                     row_sport = sport_label
 
@@ -3902,31 +3456,6 @@ async def crawl_maz_analysis_common(
                             except Exception as e:
                                 print(f"[SITE_EXPORT][ERR] id={board_id}: {e}")
                             else:
-                                # ✅ today/tomorrow 크롤링 제목 앞에 날짜 프리픽스 추가 (중복 방지)
-                                if site_title and day_key in ("today", "tomorrow"):
-                                    _dp2 = f"{target_date.month}월 {target_date.day}일 "
-                                    if not str(site_title).startswith(_dp2):
-                                        site_title = _dp2 + str(site_title).strip()
-
-                                # ✅ 심층분석(body) 가공: '오분' 문구/키워드 삽입/해시태그
-                                try:
-                                    site_body = transform_export_body_for_deep_analysis(
-                                        site_title, site_body, sport=row_sport
-                                    )
-                                except Exception:
-                                    pass
-
-                                # ✅ export 시트 G열(simple)용: 본문 전체 복사 금지 + 핵심요약/해시태그/제목 자연삽입
-                                try:
-                                    site_simple = build_dynamic_cafe_simple(
-                                        site_title,
-                                        site_body,
-                                        sport=row_sport,
-                                        seed=str(row_id),
-                                    )
-                                except Exception:
-                                    site_simple = ""
-
                                 site_rows_to_append.append([
                                     day_key,
                                     row_sport,
@@ -3934,7 +3463,6 @@ async def crawl_maz_analysis_common(
                                     site_title,
                                     site_body,
                                     get_kst_now().strftime("%Y-%m-%d %H:%M:%S"),
-                                    site_simple,
                                 ])
                                 existing_export_src_ids.add(row_id)
 
@@ -4600,6 +4128,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
