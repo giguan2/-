@@ -471,41 +471,39 @@ def build_deep_body_hashtags(title: str, body: str, sport: str = "") -> str:
 
 
 def transform_export_body_for_deep_analysis(title: str, body: str, sport: str = "") -> str:
-    """export 탭에 저장할 심층분석 body를 가공.
+    """export_today/export_tomorrow 탭의 E열(body)에 저장할 '심층분석용' 본문을 가공.
 
-    목표(크롤링 시점에 export_today/export_tomorrow E열 body에 반영):
-    - 본문 전체에서 '고트티비' 및 '스포츠분석과 고트티비...' 류 문구를 '스포츠분석 커뮤니티 오분'으로 자연스럽게 치환
-    - [팀명 분석] / [경기 흐름 전망] 섹션 본문 첫 문장에 '팀1 vs 팀2 경기분석' 키워드를 자연스럽게 녹여 넣기
-      (새 줄로 끼워 넣지 않고, 다음 문장과 이어지도록 prefix 형태로 삽입)
-    - 글 하단에 줄바꿈 3번 후 키워드 기반 해시태그 추가
+    요구사항
+    - 본문 내 '고트티비' 및 '스포츠분석과 고트티비...' 표현을 모두 '스포츠분석 커뮤니티 오분' 기준으로 정리
+    - [팀명 분석], [경기 흐름 전망] 섹션의 '첫 문장'에 '팀1 vs 팀2 경기분석' 키워드를 자연스럽게 포함(문장 이어지게)
+    - 본문 맨 아래에 키워드 기반 해시태그 추가
     """
     t = (title or "").strip()
     b = (body or "").strip()
     if not b:
-        return ""
+        return b
 
-    # --- 1) 고트티비/스포츠분석과 고트티비... 문구 치환(조사까지 최대한 자연스럽게) ---
-    # 1) 결합 문구(스포츠분석과 고트티비X)를 먼저 처리
-    b = re.sub(r"스포츠분석\s*(?:과|및)\s*고트티비(?:를|을)", "스포츠분석 커뮤니티 오분을", b)
-    b = re.sub(r"스포츠분석\s*(?:과|및)\s*고트티비(?:가|이)", "스포츠분석 커뮤니티 오분이", b)
-    b = re.sub(r"스포츠분석\s*(?:과|및)\s*고트티비(?:는|은)", "스포츠분석 커뮤니티 오분은", b)
-    b = re.sub(r"스포츠분석\s*(?:과|및)\s*고트티비의", "스포츠분석 커뮤니티 오분의", b)
-    b = re.sub(r"스포츠분석\s*(?:과|및)\s*고트티비(?:와|과)", "스포츠분석 커뮤니티 오분과", b)
-    b = re.sub(r"스포츠분석\s*(?:과|및)\s*고트티비", "스포츠분석 커뮤니티 오분", b)
+    # normalize newlines
+    b = b.replace("\r\n", "\n").replace("\r", "\n")
 
-    # 2) '스포츠분석 전문 ... 고트티비' 류도 자연스럽게 정리
-    b = re.sub(r"스포츠분석\s*(?:전문\s*)?(?:사이트|콘텐츠|채널|자료)\s*고트티비", "스포츠분석 커뮤니티 오분", b)
+    # ── 1) '고트티비' 관련 문구를 '스포츠분석 커뮤니티 오분'으로 통일 ──
+    # (조사 때문에 어색해지는 케이스를 최소화하기 위해 일부 패턴은 먼저 처리)
+    # "스포츠분석과 고트티비" 계열
+    b = re.sub(r"스포츠분석\s*과\s*고트티비를", "스포츠분석 커뮤니티 오분을", b)
+    b = re.sub(r"스포츠분석\s*과\s*고트티비와", "스포츠분석 커뮤니티 오분과", b)
+    b = re.sub(r"스포츠분석\s*과\s*고트티비는", "스포츠분석 커뮤니티 오분은", b)
+    b = re.sub(r"스포츠분석\s*과\s*고트티비가", "스포츠분석 커뮤니티 오분이", b)
+    b = re.sub(r"스포츠분석\s*과\s*고트티비", "스포츠분석 커뮤니티 오분", b)
 
-    # 3) 단독 '고트티비' + 조사 처리
-    b = re.sub(r"고트티비(?:를|을)", "스포츠분석 커뮤니티 오분을", b)
-    b = re.sub(r"고트티비(?:가|이)", "스포츠분석 커뮤니티 오분이", b)
-    b = re.sub(r"고트티비(?:는|은)", "스포츠분석 커뮤니티 오분은", b)
-    b = re.sub(r"고트티비의", "스포츠분석 커뮤니티 오분의", b)
-    b = re.sub(r"고트티비(?:와|과)", "스포츠분석 커뮤니티 오분과", b)
-    b = re.sub(r"고트티비에서", "스포츠분석 커뮤니티 오분에서", b)
+    # 단독 "고트티비" + 조사 보정
+    b = b.replace("고트티비를", "스포츠분석 커뮤니티 오분을")
+    b = b.replace("고트티비와", "스포츠분석 커뮤니티 오분과")
+    b = b.replace("고트티비는", "스포츠분석 커뮤니티 오분은")
+    b = b.replace("고트티비가", "스포츠분석 커뮤니티 오분이")
+    b = b.replace("고트티비로", "스포츠분석 커뮤니티 오분으로")
     b = b.replace("고트티비", "스포츠분석 커뮤니티 오분")
 
-    # --- 2) 섹션에 '팀1 vs 팀2 경기분석' 키워드 자연 삽입 ---
+    # ── 2) 섹션 첫 문장에 '팀1 vs 팀2 경기분석' 키워드 자연 삽입 ──
     home, away, matchup = _extract_matchup(t)
     keyword = ""
     if home and away:
@@ -514,60 +512,62 @@ def transform_export_body_for_deep_analysis(title: str, body: str, sport: str = 
         keyword = f"{matchup} 경기분석"
 
     if keyword:
-        rng = _seeded_rng(t + "|" + (home or "") + "|" + (away or ""))
-
-        def _is_sep(line: str) -> bool:
-            s = (line or "").strip()
-            return bool(re.match(r"^[─\-]{5,}\s*$", s))
+        rng = _stable_rng(t + "|" + (home or "") + "|" + (away or ""))
 
         team_prefix_pool = [
-            f"{keyword} 관점에서 보면, ",
-            f"{keyword} 기준으로 보면, ",
-            f"{keyword} 핵심부터 정리하면, ",
+            f"{keyword}에서 ",
+            f"{keyword} 관점에서 ",
+            f"{keyword} 기준으로 ",
         ]
         flow_prefix_pool = [
-            f"{keyword} 흐름을 기준으로 보면, ",
-            f"{keyword} 관점에서 경기 흐름을 보면, ",
-            f"{keyword}의 승부처를 염두에 두면, ",
+            f"{keyword}에서 경기 흐름을 보면, ",
+            f"{keyword} 관점에서 경기 흐름을 정리하면, ",
+            f"{keyword} 기준으로 흐름을 보면, ",
         ]
 
-        lines = b.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        lines = b.splitlines()
+
+        def _is_separator(s: str) -> bool:
+            s2 = (s or "").strip()
+            return bool(s2) and all(ch in "─-" for ch in s2) and len(s2) >= 5
+
+        def _prefix_first_content(after_idx: int, prefix: str) -> None:
+            """after_idx 다음의 '첫 내용 줄'을 찾아 prefix를 붙인다."""
+            j = after_idx + 1
+            # skip empties / separators
+            while j < len(lines) and (not lines[j].strip() or _is_separator(lines[j])):
+                j += 1
+            if j >= len(lines):
+                return
+            # 이미 근처에 경기분석 키워드가 있으면 중복 삽입하지 않음
+            look = "\n".join(lines[j:j+3])
+            if "경기분석" in look:
+                return
+            lines[j] = (prefix + lines[j].lstrip()).rstrip()
 
         for i, line in enumerate(lines):
-            stripped = (line or "").strip()
-
-            # [OOO 분석] 섹션
-            m = re.match(r"^\[([^\]]+?)\s*분석\]\s*$", stripped)
+            s = (line or "").strip()
+            m = re.match(r"^\[([^\]]+?)\s*분석\]\s*$", s)
             if m:
-                # 다음 본문 첫 줄에 prefix를 붙여 문장 이어지게
-                j = i + 1
-                while j < len(lines) and ((lines[j] or "").strip() == "" or _is_sep(lines[j])):
-                    j += 1
-                if j < len(lines):
-                    if keyword not in lines[j] and "경기분석" not in lines[j]:
-                        prefix = rng.choice(team_prefix_pool)
-                        lines[j] = prefix + (lines[j] or "").lstrip()
+                # 팀 분석 섹션: 다음 첫 문장에 키워드 삽입(문장 이어짐)
+                pref = rng.choice(team_prefix_pool)
+                _prefix_first_content(i, pref)
+                continue
 
-            # [경기 흐름 전망] 섹션
-            if stripped == "[경기 흐름 전망]":
-                j = i + 1
-                while j < len(lines) and ((lines[j] or "").strip() == "" or _is_sep(lines[j])):
-                    j += 1
-                if j < len(lines):
-                    if keyword not in lines[j] and "경기분석" not in lines[j]:
-                        prefix = rng.choice(flow_prefix_pool)
-                        lines[j] = prefix + (lines[j] or "").lstrip()
+            if s == "[경기 흐름 전망]":
+                pref = rng.choice(flow_prefix_pool)
+                _prefix_first_content(i, pref)
+                continue
 
         b = "\n".join(lines).strip()
 
-    # --- 3) 해시태그 붙이기(이미 해시태그가 있으면 중복 방지) ---
+    # ── 3) 해시태그 추가(이미 있으면 중복 방지) ──
     if "#" not in b:
-        hashtags = build_deep_body_hashtags(t, b, sport=sport)
-        if hashtags:
-            b = b.rstrip() + "\n\n\n" + hashtags
+        tags = build_deep_body_hashtags(t, b, sport=sport)
+        if tags:
+            b = b.rstrip() + "\n\n\n" + tags
 
     return b.strip()
-
 def extract_final_pick_from_body(body: str) -> str:
     """body에서 [최종 픽] 섹션 중 '픽 라인'만 줄바꿈 그대로 추출해 반환.
     - [최종 픽] 이후 불릿(-,•,*) 또는 '승패/핸디/언오버' 라인만 연속으로 가져오고,
@@ -1880,12 +1880,9 @@ def get_existing_export_src_ids(sheet_name: str) -> set[str]:
 
 
 def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
-    """지정 export 시트에 rows를 append.
-
-    ✅ 중요: export_today/export_tomorrow(E열 body)에 들어가기 전에 body를 심층분석용으로 가공한다.
-    - 고트티비/스포츠분석+고트티비 문구 치환
-    - [팀 분석]/[경기 흐름 전망] 섹션에 '팀1 vs 팀2 경기분석' 키워드 자연삽입
-    - 하단 해시태그 추가
+    """export_today / export_tomorrow 시트에 rows를 append.
+    - body(E열)는 심층분석용으로 transform_export_body_for_deep_analysis()를 '항상' 적용
+    - simple(G열)는 가공된 body 기준으로 재생성
     """
     if not rows:
         return True
@@ -1894,44 +1891,43 @@ def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
     if not ws:
         return False
 
-    # rows는 6컬럼([day,sport,src_id,title,body,createdAt]) 또는 7컬럼([..., simple])일 수 있음.
-    fixed_rows = []
+    fixed_rows: list[list[str]] = []
     for r in rows:
         if not r:
             continue
         rr = list(r)
 
-        # 최소 길이 보정
+        # 최소 6컬럼([day, sport, src_id, title, body, createdAt]) 확보
         while len(rr) < 6:
             rr.append("")
 
-        # ✅ body(E열) 가공 (반드시 적용)
+        # ✅ body(심층분석) 가공 (실패 시 원문 유지)
         try:
-            rr_title = rr[3] if len(rr) > 3 else ""
-            rr_body = rr[4] if len(rr) > 4 else ""
-            rr_sport = rr[1] if len(rr) > 1 else ""
-            rr[4] = transform_export_body_for_deep_analysis(rr_title, rr_body, sport=rr_sport)
-        except Exception:
-            # 변환 실패 시 원문 유지(append 자체는 계속)
-            pass
+            rr[4] = transform_export_body_for_deep_analysis(
+                rr[3] if len(rr) > 3 else "",
+                rr[4] if len(rr) > 4 else "",
+                sport=rr[1] if len(rr) > 1 else "",
+            )
+        except Exception as e:
+            print(f"[GSHEET][EXPORT] body transform 실패({sheet_name}): {e}")
 
-        # simple 컬럼 처리
-        if len(rr) == 6:
-            rr.append(extract_simple_from_body(rr[4] if len(rr) > 4 else ""))
-        elif len(rr) >= 7:
+        # ✅ simple 컬럼은 가공된 body 기준으로 항상 재생성
+        if len(rr) >= 7:
             rr = rr[:7]
-            if not str(rr[6]).strip():
-                rr[6] = extract_simple_from_body(rr[4] if len(rr) > 4 else "")
+            rr[6] = extract_simple_from_body(rr[4] if len(rr) > 4 else "")
+        else:
+            rr = rr[:6]
+            rr.append(extract_simple_from_body(rr[4] if len(rr) > 4 else ""))
+
         fixed_rows.append(rr)
 
-    rows = fixed_rows
-
     try:
-        ws.append_rows(rows, value_input_option="RAW", table_range="A1")
+        ws.append_rows(fixed_rows, value_input_option="RAW", table_range="A1")
         return True
     except Exception as e:
         print(f"[GSHEET][EXPORT] append 실패({sheet_name}): {e}")
         return False
+
 
 def get_existing_site_src_ids(day_str: str) -> set[str]:
     """site_export 탭에서 day가 같은 행들의 src_id를 set으로 가져와 중복 저장 방지."""
