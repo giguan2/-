@@ -402,10 +402,17 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
     url = f"https://openapi.naver.com/v1/cafe/{clubid}/menu/{menuid}/articles"
     headers = {"Authorization": f"Bearer {token}"}
 
-    # requests multipart: (filename, content, mimetype) 대신 (None, value) 사용 → 일반 폼 필드
+    # ✅ NAVER Cafe OpenAPI는 (특히 한글/HTML) subject/content 값을 URL-encode 한 문자열로 받는 케이스가 많다.
+    #    공식 가이드의 multipart 예제도 UTF-8로 URL-encode(퍼센트 인코딩)해서 전송한다. (글자 깨짐 방지)
+    from urllib.parse import quote
+
+    subject_enc = quote(subject)
+    content_enc = quote(content or "")
+
+    # requests multipart: (None, value, content_type) → 일반 폼 필드
     files = {
-        "subject": (None, subject),
-        "content": (None, content or ""),
+        "subject": (None, subject_enc, "text/plain; charset=UTF-8"),
+        "content": (None, content_enc, "text/plain; charset=UTF-8"),
     }
 
     try:
