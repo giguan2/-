@@ -311,6 +311,82 @@ def build_export_title(target_date, league: str, home_raw: str, away_raw: str, s
         return f"{mm}월 {dd}일 [{lg}] {matchup} 스포츠분석".strip()
     return f"{mm}월 {dd}일 {matchup} 스포츠분석".strip()
 
+
+
+# =====================================================
+# Korean particle(josa) fixer (SAFE)
+# - 팀명 접미어(로켓츠/그리즐리즈 등)를 제거한 뒤 "휴스턴는/휴스턴가"처럼
+#   조사가 어색해지는 문제를 자동 보정합니다.
+# - 크롤링/업로드 로직은 건드리지 않고, '텍스트 출력'만 수정합니다.
+# =====================================================
+
+_JOSA_GROUP = {
+    "은": "topic", "는": "topic",
+    "이": "subject", "가": "subject",
+    "을": "object", "를": "object",
+    "과": "and", "와": "and",
+}
+
+def _has_batchim(ch: str) -> bool:
+    """한글 음절의 받침 유무(True=받침 있음)."""
+    if not ch:
+        return False
+    c = ord(ch)
+    if 0xAC00 <= c <= 0xD7A3:
+        return (c - 0xAC00) % 28 != 0
+    return False
+
+def _last_hangul_char(s: str) -> str | None:
+    """문자열의 마지막 한글 음절을 찾음(없으면 None)."""
+    if not s:
+        return None
+    for ch in reversed(s):
+        o = ord(ch)
+        if 0xAC00 <= o <= 0xD7A3:
+            return ch
+    return None
+
+# 단어+조사 패턴 (문장부호/공백/끝에서만 매치)
+_JOSA_RE = re.compile(r"([가-힣A-Za-z0-9]+)(은|는|이|가|을|를|과|와)(?=[^가-힣A-Za-z0-9]|$)")
+
+def _fix_korean_josa(text: str) -> str:
+    """텍스트 내 조사(은/는, 이/가, 을/를, 과/와)를 받침 규칙에 맞게 자동 교정."""
+    if not text:
+        return ""
+
+    def _fix_line(line: str) -> str:
+        # 해시태그 라인은 건드리지 않음(태그 훼손 방지)
+        if line.lstrip().startswith("#"):
+            return line
+
+        def repl(m: re.Match) -> str:
+            word = m.group(1)
+            josa = m.group(2)
+
+            last = _last_hangul_char(word)
+            if not last:
+                return m.group(0)
+
+            has_b = _has_batchim(last)
+            grp = _JOSA_GROUP.get(josa)
+
+            if grp == "topic":
+                want = "은" if has_b else "는"
+            elif grp == "subject":
+                want = "이" if has_b else "가"
+            elif grp == "object":
+                want = "을" if has_b else "를"
+            elif grp == "and":
+                want = "과" if has_b else "와"
+            else:
+                return m.group(0)
+
+            return word + want
+
+        return _JOSA_RE.sub(repl, line)
+
+    return "\n".join(_fix_line(ln) for ln in str(text).splitlines())
+
 def _postprocess_site_body_text(text: str, *, footer_line: str = "") -> str:
     """
     사이트용 body(E열) 최종 후처리(⚠️ 안전장치):
@@ -358,6 +434,9 @@ def _postprocess_site_body_text(text: str, *, footer_line: str = "") -> str:
         line = re.sub(r"^[\-─]{5,}$", "───────────────", line).rstrip()
         lines.append(line)
     out = "\n".join(lines).strip()
+
+    # 3-b) 팀명 치환 후 '휴스턴는/휴스턴가' 같은 조사 어색함 자동 보정
+    out = _fix_korean_josa(out)
 
     # 4) footer 삽입(원하면)
     footer_line = (footer_line or "").strip()
