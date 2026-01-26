@@ -669,8 +669,11 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
         # HTML 안전 처리 + 줄바꿈 정규화
         safe_simple = html.escape(simple_txt).replace("\r\n", "\n").replace("\r", "\n").strip()
 
-        # 가운데 정렬 + 줄바꿈 유지
-        content_html = f'<div style="text-align:center; white-space:pre-wrap;">{safe_simple}</div>'
+        # 네이버 카페는 style 속성을 잘라내는 경우가 많아서(가운데정렬/줄바꿈 깨짐)
+        # 따옴표/스타일 없이 <center> + <br> 방식으로 포맷을 고정한다.
+        _lines = safe_simple.split("\n") if safe_simple else [""]
+        _html_lines = [ln if ln.strip() else "&nbsp;" for ln in _lines]
+        content_html = "<center>" + "<br>".join(_html_lines) + "</center>"
         content_plain = safe_simple  # fallback
 
         subject = (titlev or "").strip() or f"{sportv} 분석"
@@ -4482,7 +4485,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 
