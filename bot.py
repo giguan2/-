@@ -606,7 +606,10 @@ NAVER_CAFE_MENU_ID_DEEP_BASEBALL = (os.getenv("NAVER_CAFE_MENU_ID_DEEP_BASEBALL"
 NAVER_CAFE_MENU_ID_DEEP_VOLLEYBALL = (os.getenv("NAVER_CAFE_MENU_ID_DEEP_VOLLEYBALL") or "48").strip()
 
 # 예: {"soccer":"10","baseball":"20","basketball":"30","volleyball":"40"}
-NAVER_CAFE_MENU_MAP_RAW = (os.getenv("NAVER_CAFE_MENU_MAP") or "").strip()()
+NAVER_CAFE_MENU_MAP_RAW = (os.getenv("NAVER_CAFE_MENU_MAP") or "").strip()
+
+# 예: {"soccer":"45","baseball":"47","basketball":"46","volleyball":"48"}
+NAVER_CAFE_MENU_MAP_DEEP_RAW = (os.getenv("NAVER_CAFE_MENU_MAP_DEEP") or "").strip()
 
 CAFE_LOG_SHEET_NAME = (os.getenv("CAFE_LOG_SHEET_NAME") or "cafe_log").strip()
 CAFE_LOG_HEADER = ["src_id", "day", "sport", "clubid", "menuid", "articleId", "postedAt", "status"]
@@ -643,6 +646,18 @@ def _naver_menu_id_for_sport(sport: str) -> str:
 def _naver_menu_id_for_sport_deep(sport: str) -> str:
     """심층 분석 게시판(menuid) 반환."""
     sport_key = (sport or "").strip().lower()
+
+    # 1) JSON 맵(환경변수) 우선: NAVER_CAFE_MENU_MAP_DEEP = {"soccer":"45", ...}
+    if NAVER_CAFE_MENU_MAP_DEEP_RAW:
+        try:
+            mp = json.loads(NAVER_CAFE_MENU_MAP_DEEP_RAW)
+            v = mp.get(sport_key, "")
+            if v:
+                return str(v).strip()
+        except Exception:
+            pass
+
+    # 2) 종목별 환경변수 폴백
     if sport_key == "soccer":
         return NAVER_CAFE_MENU_ID_DEEP_SOCCER
     if sport_key == "basketball":
@@ -4553,7 +4568,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 
