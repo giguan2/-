@@ -283,6 +283,85 @@ def build_export_title(target_date, league: str, home_raw: str, away_raw: str, s
         return f"{mm}월 {dd}일 [{lg}] {matchup} 스포츠분석".strip()
     return f"{mm}월 {dd}일 {matchup} 스포츠분석".strip()
 
+def _postprocess_site_body_text(text: str, *, footer_line: str = "") -> str:
+    """
+    사이트용 body(E열) 최종 후처리(⚠️ 안전장치):
+    - '고트티비/GOATTV/goat-tv' 등 브랜드/사이트명 언급 제거(띄어쓰기/하이픈/대소문자 변형 포함)
+    - 매치업 구분자(vs/VS/v.s./대) 제거 → 공백으로 연결
+    - 개행 구조는 유지하면서 불필요한 공백만 정리
+    - (선택) footer_line을 해시태그 블록 앞(있으면) 또는 끝에 1회 삽입
+
+    ✅ 목적:
+    OpenAI 리라이팅/원문 내에 브랜드명이 섞여 들어와도 export 시트(E열)와 업로드 본문에서
+    절대 노출되지 않도록 '마지막 단계'에서 한번 더 걸러준다.
+    """
+    if not text:
+        out = ""
+    else:
+        out = str(text)
+
+    # 1) 브랜드/사이트명 제거(한글/영문/하이픈/띄어쓰기 변형 포함)
+    #   - "고트티비", "고트 티비", "고트-티비", "고트TV" 등
+    out = re.sub(
+        r"(고트\s*[-_]?\s*티비|고트티비|고트\s*TV)\s*(?:\.com)?\s*"
+        r"(?:의|에서도|에서|도|을|를|은|는|이|가|에|와|과)?",
+        "",
+        out,
+        flags=re.I,
+    )
+    #   - "GOATTV", "GOAT TV", "goat-tv.com" 등
+    out = re.sub(r"(GOAT\s*TV|GOATTV|GOAT[-_\s]*TV|goat[-_\s]*tv(?:\.com)?)", "", out, flags=re.I)
+
+    # 1-b) 브랜드 제거 후 어색한 접속/조사 흔적 최소 보정(과도한 문장 변형은 피함)
+    out = out.replace("스포츠분석과 정보를", "스포츠분석 정보를")
+    out = out.replace("스포츠분석과 자료를", "스포츠분석 자료를")
+    out = out.replace("스포츠분석과 자료", "스포츠분석 자료")
+
+    # 2) 매치업 구분자 제거: ' A vs B ' / 'AvsB' 모두 대응(개행은 건드리지 않음)
+    out = re.sub(r"(?i)\s+(?:vs\.?|v\.s\.|V\.S\.)\s+", " ", out)
+    out = re.sub(r"(?i)(?<=\S)(?:vs\.?|v\.s\.|V\.S\.)(?=\S)", " ", out)
+    out = re.sub(r"\s+대\s+", " ", out)
+
+    # 3) 라인별 공백 정리(개행 유지)
+    lines = []
+    for line in out.splitlines():
+        line = re.sub(r"[ \t]{2,}", " ", line).rstrip()
+        # 라인 전체가 불필요한 구두점/구분선만 남는 경우 최소 정리
+        line = re.sub(r"^[\-─]{5,}$", "───────────────", line).rstrip()
+        lines.append(line)
+    out = "\n".join(lines).strip()
+
+    # 4) footer 삽입(원하면)
+    footer_line = (footer_line or "").strip()
+    if footer_line and footer_line not in out:
+        lines = out.splitlines()
+
+        # trailing empty lines cut
+        i = len(lines)
+        while i > 0 and lines[i - 1].strip() == "":
+            i -= 1
+
+        # trailing hashtag block
+        j = i
+        while j > 0 and lines[j - 1].lstrip().startswith("#"):
+            j -= 1
+
+        if j < i:
+            # insert footer before hashtags
+            head = lines[:j]
+            tail = lines[j:]
+            while head and head[-1].strip() == "":
+                head.pop()
+            if head:
+                head.append("")
+            head.append(footer_line)
+            head.append("")
+            out = "\n".join(head + tail).strip()
+        else:
+            out = (out.rstrip() + "\n\n" + footer_line).strip()
+
+    return out
+
 def normalize_text_teamnames(text: str, *, sport_key: str, home_raw: str, away_raw: str) -> str:
     """본문(body)에서 팀명/구분자 표기를 표시용으로 정리.
     - raw 팀명 → 정규화된 팀명
@@ -312,7 +391,7 @@ def normalize_text_teamnames(text: str, *, sport_key: str, home_raw: str, away_r
     except Exception:
         pass
 
-    return out
+    return _postprocess_site_body_text(out)
 
 def _stable_rng(seed: str) -> _random.Random:
     h = _hashlib.md5((seed or "seed").encode("utf-8")).hexdigest()
@@ -1179,6 +1258,9 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             contentv = r[i_simple] if len(r) > i_simple else ""
 
+
+        # ✅ 마지막 안전 처리: 브랜드/구분자 제거(시트에 남아있어도 업로드 전에 정리)
+        contentv = _postprocess_site_body_text(contentv)
         to_post.append((sid, dayv, sportv, titlev, contentv, createdv, menuid))
 
     if not to_post:
@@ -3189,9 +3271,14 @@ def rewrite_for_site_openai(
 ) -> tuple[str, str]:
     """
     사이트 게시용: '원문 기반 재작성' 전용.
+
+    ✅ 목표
     - 원문을 그대로 복붙하지 않고, 구조화된 서술형(팀 분석/경기 흐름/핵심 포인트/최종 픽)으로 재작성
-    - 원문에 있는 정보/방향성에서 크게 벗어나지 않도록 제한
-    - '스포츠분석', '고트티비' 키워드를 자연스럽게 1~2회 포함
+    - 원문 사실(부상/전술/기록/선수 등)에서 벗어나는 임의 생성 금지
+    - 매치업 표기에서 'vs/VS/대' 같은 구분자 사용 금지(팀명 공백 연결)
+
+    ⚠️ 금지
+    - '고트티비', 'GOATTV', 'goat-tv' 등 특정 사이트/브랜드명 언급 금지
     """
     client_oa = get_openai_client()
 
@@ -3203,21 +3290,33 @@ def rewrite_for_site_openai(
     if len(full_text_clean) > 9000:
         full_text_clean = full_text_clean[:9000]
 
-    # 제목 기본값
+    # 제목 기본값(표시용: 구분자 없이 팀명 공백 연결)
     _league = (league or "").strip() or "경기"
     if home_team and away_team:
-        base_title = f"[{_league}] {home_team} vs {away_team} 스포츠분석"
+        base_title = f"[{_league}] {home_team} {away_team} 스포츠분석"
     else:
         base_title = f"[{_league}] 스포츠분석"
 
     # OpenAI 키 없으면 최소 폴백(=원문 기반 요약)만 반환
     if not client_oa:
         body_fb = simple_summarize(full_text_clean, max_chars=max_chars)
+        # 안전장치: 브랜드/구분자 제거
+        body_fb = _postprocess_site_body_text(body_fb)
         return (base_title, body_fb)
 
-    
-    home_label = (home_team or '').strip() or '홈팀'
-    away_label = (away_team or '').strip() or '원정팀'
+    home_label = (home_team or "").strip() or "홈팀"
+    away_label = (away_team or "").strip() or "원정팀"
+
+    # (선택) 하단 고정 문구: 필요하면 Render/GitHub 환경변수로 교체 가능
+    # 예: SITE_FOOTER_LINE="이번 경기는 스포츠분석 커뮤니티 오분을 통해 보다 정확한 정보를 참고하면 도움이 될 것이다."
+    footer_line_env = (os.getenv("SITE_FOOTER_LINE") or "").strip()
+    if footer_line_env.lower() in ("0", "off", "false", "none", "no"):
+        footer_line = ""
+    elif footer_line_env:
+        footer_line = footer_line_env
+    else:
+        footer_line = "이번 경기는 스포츠분석 커뮤니티 오분을 통해 보다 정확한 정보를 참고하면 도움이 될 것이다."
+
     prompt = f"""아래는 스포츠 경기 분석 원문이다.
 원문 내용을 바탕으로 **사이트 게시용 서술형 분석글**로 재작성하라.
 
@@ -3226,7 +3325,10 @@ def rewrite_for_site_openai(
 - 원문 내용과 어긋나는 '사실'을 만들지 말 것 (선수/전술/부상/기록 등 임의 생성 금지)
 - 문장 흐름은 자연스럽게, 단락을 명확히 분리
 - 아래 섹션 구성은 유지하되, 원문에 없는 섹션 정보는 과장하지 말 것
-- '스포츠분석' 과 '고트티비' 키워드를 본문에 **각 1~2회** 자연스럽게 포함 (과도한 반복 금지)
+- '스포츠분석' 키워드를 본문에 **1~2회** 자연스럽게 포함 (과도한 반복 금지)
+- '고트티비/GOATTV/goat-tv' 등 특정 사이트/브랜드명은 **절대** 언급하지 말 것
+- 매치업 표기에서 'vs', 'VS', '대' 같은 구분자를 사용하지 말 것.
+  → 예: '{home_label} {away_label}' 처럼 **팀명을 공백으로만 연결**해 표기할 것
 - 섹션 제목에 '팀1/팀2'라는 표현을 절대 쓰지 말고, **반드시 팀명**을 넣어라
 - 결과는 **오직 본문만** 출력 (추가 안내/주석 금지)
 
@@ -3266,6 +3368,10 @@ def rewrite_for_site_openai(
 ===== 원문 =====
 {full_text_clean}""".strip()
 
+    # footer를 쓰는 경우에만, "마지막 줄"에 고정 문구를 넣도록 강제
+    if footer_line:
+        prompt += "\n\n마지막 줄에 다음 문장을 그대로 1회만 추가하라:\n" + footer_line.strip()
+
     try:
         resp = client_oa.chat.completions.create(
             model=os.getenv("OPENAI_MODEL_SITE", os.getenv("OPENAI_MODEL_ANALYSIS", "gpt-4.1-mini")),
@@ -3287,12 +3393,14 @@ def rewrite_for_site_openai(
         if not body:
             raise ValueError("empty response from OpenAI (site)")
 
-
         # 팀명 헤더 강제 치환(모델이 [팀1 분석]/[팀2 분석]로 출력하는 경우 대비)
         body = re.sub(r"\[\s*팀1\s*분석\s*\]", f"[{home_label} 분석]", body)
         body = re.sub(r"\[\s*팀2\s*분석\s*\]", f"[{away_label} 분석]", body)
         # 혹시 모델이 제목을 섞어 출력하면 제거
         body = re.sub(r"^제목\s*[:：].*\n+", "", body).strip()
+
+        # ✅ 마지막 안전 처리: 브랜드/구분자 제거 + footer 위치 정리
+        body = _postprocess_site_body_text(body, footer_line=footer_line)
 
         # 너무 길면 자르기
         if len(body) > max_chars:
@@ -3303,6 +3411,7 @@ def rewrite_for_site_openai(
     except Exception as e:
         print(f"[OPENAI][SITE] 재작성 실패 → simple_summarize 폴백: {e}")
         body_fb = simple_summarize(full_text_clean, max_chars=max_chars)
+        body_fb = _postprocess_site_body_text(body_fb, footer_line=footer_line)
         return (base_title, body_fb)
 
 
@@ -4032,6 +4141,7 @@ async def crawl_maz_analysis_common(
                             site_title = build_export_title(target_date, _league_for_title, home, away, _norm_key)
                             # body(E열)에도 팀명/구분자 표기를 정리(FC/CF/워리어스 등 제거 + vs/대 제거)
                             site_body = normalize_text_teamnames(site_body, sport_key=_norm_key, home_raw=home, away_raw=away)
+                            site_body = _postprocess_site_body_text(site_body)
                     
                             # ✅ export 시트 G열(simple) 생성: 팀 태그/해시태그 유지
                             try:
@@ -4046,6 +4156,15 @@ async def crawl_maz_analysis_common(
                                 )
                             except Exception:
                                 site_simple = ""
+
+                            # ✅ E열(body) 하단에 해시태그를 같이 붙이기(원하는 형식)
+                            #   - G열(simple) 마지막 줄은 해시태그 라인으로 생성됨
+                            try:
+                                _last_line = (site_simple or "").strip().splitlines()[-1].strip()
+                                if _last_line.startswith("#") and _last_line not in (site_body or ""):
+                                    site_body = (site_body or "").rstrip() + "\n\n" + _last_line
+                            except Exception:
+                                pass
                     
                             site_rows_to_append.append([
                                 day_key,
