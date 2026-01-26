@@ -1,6 +1,7 @@
 from __future__ import annotations
 from bs4 import BeautifulSoup
 import html
+import hashlib
 
 import re as _re_simple
 from telegram.error import BadRequest
@@ -1593,6 +1594,128 @@ def transform_export_body_for_deep(title: str, sport: str, body: str) -> str:
     return out.strip()
 
 
+def build_export_simple(title: str, sport: str, body: str, src_id: str = "") -> str:
+    """export 탭 G열(simple) 생성: (도입 1줄 + 요약 1~2문장 + 마무리 1줄 + 최종 픽 + 해시태그)
+    - E열(body)은 심층 분석용으로 길기 때문에, G열은 업로드용 요약본을 만든다.
+    - body 전체를 복사하지 않는다.
+    """
+    if not title and not body:
+        return ""
+
+    t = (title or "").strip()
+    b = (body or "").strip()
+
+    # 해시태그 라인은 요약에 영향 주지 않도록 제거
+    b_no_tags = re.sub(r"(?m)^#\S+.*$", "", b).strip()
+
+    league, home, away = _deep_parse_title(t)
+    matchup = f"{home} vs {away}".strip() if home and away else ""
+
+    # (1) 요약 문장: 핵심 포인트 요약 기반 1문장, 없으면 본문 앞부분 요약
+    summary = ""
+    try:
+        summary = extract_simple_from_body(b_no_tags) or ""
+        if "\n\n[최종 픽]" in summary:
+            summary = summary.split("\n\n[최종 픽]", 1)[0].strip()
+    except Exception:
+        summary = ""
+
+    if not summary:
+        summary = (simple_summarize(b_no_tags, max_chars=240) or "").strip()
+
+    # (2) 최종 픽 블록
+    try:
+        pick_block = extract_final_pick_from_body(b_no_tags) or ""
+    except Exception:
+        pick_block = ""
+
+    # (3) 템플릿 선택: src_id/제목 기반 안정 선택
+    seed = (src_id or "") + "|" + (t or "")
+
+    def _stable_choice(items: list[str]) -> str:
+        if not items:
+            return ""
+        h = hashlib.sha1(seed.encode("utf-8")).digest()
+        idx = int.from_bytes(h[:4], "big") % len(items)
+        return items[idx]
+
+    b_lc = b_no_tags
+
+    intro_pool_default = [
+        "흐름 싸움에서 우위가 갈릴 수 있다",
+        "전술 상성에서 승부가 갈릴 수 있다",
+        "초반 주도권 싸움이 포인트다",
+        "운영 안정감이 먼저 중요한 경기다",
+        "수비 조직력과 세트피스 대응이 변수다",
+    ]
+    intro_pool_setpiece = [
+        "세트피스 한두 장면이 승부처가 될 수 있다",
+        "세트피스 대응에서 차이가 날 수 있다",
+        "세트피스와 제공권 싸움이 핵심이다",
+    ]
+    intro_pool_press = [
+        "압박 타이밍과 라인 간격이 관건이다",
+        "중원 압박과 전환 속도가 포인트다",
+        "초반 압박 강도에 따라 흐름이 갈릴 수 있다",
+    ]
+
+    if "세트피스" in b_lc or "제공권" in b_lc:
+        intro_phrase = _stable_choice(intro_pool_setpiece + intro_pool_default)
+    elif "압박" in b_lc or "전방 압박" in b_lc:
+        intro_phrase = _stable_choice(intro_pool_press + intro_pool_default)
+    elif "역습" in b_lc or "전환" in b_lc:
+        intro_phrase = _stable_choice(["전환 속도와 역습 완성도가 승부처다"] + intro_pool_default)
+    else:
+        intro_phrase = _stable_choice(intro_pool_default)
+
+    if t:
+        intro_line = f"{t}은 {intro_phrase}."
+    elif matchup:
+        intro_line = f"{matchup} 경기분석은 {intro_phrase}."
+    else:
+        intro_line = intro_phrase + "."
+
+    topic = "운영 디테일"
+    if "세트피스" in b_lc or "제공권" in b_lc:
+        topic = "세트피스 한두 장면"
+    elif "전환" in b_lc or "역습" in b_lc:
+        topic = "전환과 역습"
+    elif "압박" in b_lc:
+        topic = "압박 타이밍"
+    elif "수비" in b_lc or "실점" in b_lc:
+        topic = "실점 관리"
+
+    outro_pool = [
+        f"정리하면 {{m}} 경기는 {topic}이 승부처가 될 수 있다.",
+        f"결국 {{m}} 경기는 {topic}에서 우위가 갈릴 수 있다.",
+        f"{{m}} 경기는 {topic} 대응이 결과를 가를 수 있다.",
+        f"{{m}} 경기는 {topic}에서 한두 장면이 승부를 가를 수 있다.",
+    ]
+    mtxt = matchup if matchup else t.replace(" 스포츠분석", "")
+    outro_line = _stable_choice(outro_pool).format(m=mtxt)
+
+    # 해시태그
+    try:
+        hashtags = _deep_build_hashtags(t, sport, b_no_tags)
+    except Exception:
+        hashtags = "#스포츠분석"
+
+    parts = [intro_line]
+    if summary:
+        parts.extend(["", summary.strip()])
+    if outro_line:
+        parts.extend(["", outro_line.strip()])
+    if pick_block:
+        parts.extend(["", pick_block.strip()])
+    if hashtags:
+        parts.extend(["", hashtags.strip()])
+
+    out = "\n".join(parts)
+    out = re.sub(r"\n{4,}", "\n\n\n", out).strip()
+    return out
+
+
+
 def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
     """지정 export 시트에 rows를 append.
     - export_today/export_tomorrow의 E열(body)은 저장 직전에 deep 가공을 적용한다.
@@ -1621,17 +1744,22 @@ def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
             # 가공 실패해도 원문 저장은 진행
             print(f"[GSHEET][EXPORT] body transform 실패: {e}")
 
-        # simple 컬럼(G) 자동 생성/보정
-        if len(rr) == 6:
-            rr.append(extract_simple_from_body(rr[4] if len(rr) > 4 else ""))
-        elif len(rr) >= 7:
-            rr = rr[:7]
-            if not str(rr[6]).strip():
-                rr[6] = extract_simple_from_body(rr[4] if len(rr) > 4 else "")
-        else:
-            while len(rr) < 6:
-                rr.append("")
-            rr.append(extract_simple_from_body(rr[4] if len(rr) > 4 else ""))
+        
+# simple 컬럼(G) 생성: 업로드용 요약본(도입/요약/마무리/픽/해시태그)
+        try:
+            simple_new = build_export_simple(
+                title=rr[3] if len(rr) > 3 else "",
+                sport=rr[1] if len(rr) > 1 else "",
+                body=rr[4] if len(rr) > 4 else "",
+                src_id=rr[2] if len(rr) > 2 else "",
+            )
+        except Exception as e:
+            print(f"[GSHEET][EXPORT] simple 생성 실패: {e}")
+            simple_new = extract_simple_from_body(rr[4] if len(rr) > 4 else "")
+
+        # export 시트는 7컬럼 고정 (A~G)
+        rr = rr[:6]
+        rr.append(simple_new)
 
         fixed_rows.append(rr)
 
