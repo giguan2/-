@@ -1728,7 +1728,7 @@ def _format_kr_md_from_date(d):
     return f"{d.month}월 {d.day}일"
 
 def _normalize_export_title(day_label: str, raw_title: str) -> str:
-    """export 시트 D열 title을 표준화: 'today 1월 26일 ...' / 'tomorrow 1월 27일 ...'"""
+    """export 시트 D열 title을 표준화: '1월 26일 ...' 형식 (day 컬럼에 today/tomorrow가 있으므로 title엔 날짜만)"""
     t = (raw_title or "").strip()
 
     # 중복 방지: 기존 접두어/날짜 제거
@@ -1738,7 +1738,7 @@ def _normalize_export_title(day_label: str, raw_title: str) -> str:
 
     d = _export_target_date_by_daylabel(day_label)
     kr_date = _format_kr_md_from_date(d)
-    return f"{(day_label or '').strip()} {kr_date} {t}".strip()
+    return f"{kr_date} {t}".strip()
 
 
 
