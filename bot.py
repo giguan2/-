@@ -1716,6 +1716,32 @@ def build_export_simple(title: str, sport: str, body: str, src_id: str = "") -> 
 
 
 
+# --- Export title normalize (day + 'M월 D일' prefix) ---
+def _export_target_date_by_daylabel(day_label: str):
+    """day_label(today/tomorrow)에 따라 KST 기준 타겟 날짜(date)를 계산."""
+    base = get_kst_now().date()
+    if (day_label or "").lower().strip() == "tomorrow":
+        return base + timedelta(days=1)
+    return base
+
+def _format_kr_md_from_date(d):
+    return f"{d.month}월 {d.day}일"
+
+def _normalize_export_title(day_label: str, raw_title: str) -> str:
+    """export 시트 D열 title을 표준화: 'today 1월 26일 ...' / 'tomorrow 1월 27일 ...'"""
+    t = (raw_title or "").strip()
+
+    # 중복 방지: 기존 접두어/날짜 제거
+    t = re.sub(r"^(today|tomorrow)\s+", "", t, flags=re.I).strip()
+    t = re.sub(r"^\d{1,2}\s*월\s*\d{1,2}\s*일\s+", "", t).strip()
+    t = re.sub(r"^\d{1,2}[./-]\d{1,2}\s+", "", t).strip()
+
+    d = _export_target_date_by_daylabel(day_label)
+    kr_date = _format_kr_md_from_date(d)
+    return f"{(day_label or '').strip()} {kr_date} {t}".strip()
+
+
+
 def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
     """지정 export 시트에 rows를 append.
     - export_today/export_tomorrow의 E열(body)은 저장 직전에 deep 가공을 적용한다.
@@ -1736,6 +1762,12 @@ def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
         # 최소 6컬럼 보장: [day, sport, src_id, title, body, createdAt]
         while len(rr) < 6:
             rr.append("")
+
+        # D열 title 표준화 (today/tomorrow + 'M월 D일' 접두어)
+        try:
+            rr[3] = _normalize_export_title(rr[0] if len(rr) > 0 else "", rr[3] if len(rr) > 3 else "")
+        except Exception as e:
+            print(f"[GSHEET][EXPORT] title normalize 실패: {e}")
 
         # 딥 바디 가공 (E열 body)
         try:
