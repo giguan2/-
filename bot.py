@@ -469,6 +469,96 @@ def _postprocess_site_body_text(text: str, *, footer_line: str = "") -> str:
 
     return out
 
+
+
+# =====================================================
+# Matchup keyword injection in body(E열) (SAFE)
+# - 목적: 본문에도 "팀1 팀2 경기분석/스포츠분석" 키워드가 자연스럽게 1회 녹아들도록 함
+# - ⚠️ 크롤링/업로드 로직은 건드리지 않고, body 텍스트 후처리만 수행
+# - 기본은 "경기분석" 사용. 필요하면 Render 환경변수로 변경 가능:
+#     BODY_MATCH_KEYWORD_WORD=스포츠분석   (또는 경기분석)
+#     BODY_MATCH_KEYWORD_WORD=OFF         (비활성화)
+# =====================================================
+
+_BODY_MATCH_HEADERS = {
+    "[경기 흐름 전망]", "[경기흐름 전망]",
+    "[경기 흐름전망]", "[경기흐름전망]",
+    "[경기 전망]", "[경기전망]",
+}
+
+def _get_body_match_keyword_word() -> str:
+    v = (os.getenv("BODY_MATCH_KEYWORD_WORD") or "").strip()
+    if not v:
+        return "경기분석"
+    if v.upper() in {"OFF", "0", "FALSE", "NO", "NONE"}:
+        return ""
+    return v
+
+def _inject_match_keyword(text: str, matchup: str, *, keyword_word: str) -> str:
+    """
+    본문 텍스트에 "이번 {팀1 팀2} {키워드}에서는 ..." 문구를 1회 자연스럽게 삽입/치환.
+    - 우선순위: [경기 흐름 전망] 섹션 첫 문장("이번 경기는 ...")을 치환
+    - 이미 '{팀1 팀2} (경기분석|스포츠분석)'이 존재하면 중복 삽입하지 않음
+    """
+    if not text:
+        return ""
+    if not matchup or not keyword_word:
+        return str(text)
+
+    out = str(text)
+
+    # 이미 키워드가 들어가 있으면 그대로
+    if re.search(rf"{re.escape(matchup)}\s*(?:경기분석|스포츠분석)", out):
+        return out
+
+    def _rewrite_first_sentence(line: str) -> str:
+        # "이번 경기는 ..." → "이번 팀1 팀2 경기분석에서는 ..."
+        new = re.sub(r"^이번\s*경기는\s*", f"이번 {matchup} {keyword_word}에서는 ", line)
+        if new != line:
+            return new
+        # "이번 경기에선/에서는 ..." 패턴
+        new = re.sub(r"^이번\s*경기(?:\s*분석)?(?:에선|에서는|에선)\s*", f"이번 {matchup} {keyword_word}에서는 ", line)
+        if new != line:
+            return new
+        # 그 외: 앞에 자연스럽게 프리픽스
+        return f"이번 {matchup} {keyword_word}에서는 {line.lstrip()}"
+
+    lines = out.splitlines()
+
+    # 1) [경기 흐름 전망] 섹션에서 삽입/치환
+    header_idx = None
+    for i, ln in enumerate(lines):
+        if ln.strip() in _BODY_MATCH_HEADERS:
+            header_idx = i
+            break
+
+    if header_idx is not None:
+        j = header_idx + 1
+        while j < len(lines) and lines[j].strip() == "":
+            j += 1
+        if j < len(lines) and lines[j].strip():
+            lines[j] = _rewrite_first_sentence(lines[j])
+            return "\n".join(lines)
+
+    # 2) 섹션이 없으면: 첫 "이번 경기는" 라인을 찾아 치환
+    for i, ln in enumerate(lines):
+        if re.match(r"^\s*이번\s*경기는\s*", ln):
+            lines[i] = _rewrite_first_sentence(ln.strip())
+            return "\n".join(lines)
+
+    # 3) 그래도 없으면: 첫 내용 라인(헤더 제외)에 1회 삽입
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if not s:
+            continue
+        if re.match(r"^\[[^\]]+\]$", s):
+            continue
+        lines[i] = _rewrite_first_sentence(ln)
+        return "\n".join(lines)
+
+    return out
+
+
 def normalize_text_teamnames(text: str, *, sport_key: str, home_raw: str, away_raw: str) -> str:
     """본문(body)에서 팀명/구분자 표기를 표시용으로 정리.
     - raw 팀명 → 정규화된 팀명
@@ -497,6 +587,10 @@ def normalize_text_teamnames(text: str, *, sport_key: str, home_raw: str, away_r
             out = pat2.sub(matchup, out)
     except Exception:
         pass
+
+    kw_word = _get_body_match_keyword_word()
+    if kw_word:
+        out = _inject_match_keyword(out, matchup, keyword_word=kw_word)
 
     return _postprocess_site_body_text(out)
 
