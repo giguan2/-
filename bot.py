@@ -167,6 +167,153 @@ _SPORT_TAGS = {
     "배구": ["#배구분석", "#V리그"],
 }
 
+# =====================================================
+# Team name display normalization (SAFE, editable)
+# - 목적: export_* 제목/키워드에서 'vs/대' 제거 + FC/CF/워리어스 같은 접미어 제거
+# - ⚠️ 크롤링/업로드(네이버 API) 로직은 건드리지 않고, '표시용 문자열'만 정리합니다.
+# - 나중에 빼야 할 단어가 더 생기면 아래 리스트에만 추가하면 됩니다.
+# =====================================================
+
+# --- Soccer (축구) ---
+TEAM_SUFFIX_SOCCER = [
+    # 유럽/남미 등 약어
+    " FC", " CF", " SC", " AFC", " FK", " SK", " AC", " CD",
+    # 필요하면 여기에 계속 추가
+]
+
+# --- Basketball (농구) ---
+TEAM_SUFFIX_BASKETBALL = [
+    # NBA/KBL 등에서 도시+마스코트 형태일 때, 마스코트(별칭) 제거용
+    " 울브스", " 워리어스", " 레이커스", " 셀틱스", " 히트", " 불스",
+    " 매버릭스", " 선즈", " 너기츠", " 재즈", " 클리퍼스", " 네츠",
+    " 페이서스", " 그리즐리스", " 킹스", " 스퍼스", " 피스톤스", " 매직",
+    " 위저즈", " 호크스", " 랩터스", " 캐벌리어스",
+    # 필요하면 여기에 계속 추가
+]
+
+# --- Baseball (야구) ---
+TEAM_SUFFIX_BASEBALL = [
+    # MLB 예시
+    " 다저스", " 양키스", " 레드삭스", " 화이트삭스", " 자이언츠", " 컵스",
+    " 파드리스", " 애스트로스", " 브레이브스", " 메츠", " 오리올스", " 레인저스",
+    " 블루제이스", " 로열스", " 말린스", " 필리스", " 내셔널스", " 트윈스", " 가디언스",
+    # KBO/NPB 등(필요시 추가)
+    " 이글스", " 타이거즈", " 라이온즈", " 베어스", " 히어로즈", " 랜더스", " 자이언츠",
+    # 필요하면 여기에 계속 추가
+]
+
+# --- Volleyball (배구) ---
+TEAM_SUFFIX_VOLLEYBALL = [
+    # 배구는 구단명이 곧 키워드인 경우가 많아 기본은 비워두고, 필요시만 추가 추천
+    # 예: " 스카이워커스", " 점보스" 등
+]
+
+def normalize_team_name_by_sport(name: str, sport_key: str) -> str:
+    """표시용 팀명 정규화(접미어 제거).
+    sport_key: soccer | basketball | baseball | volleyball
+    """
+    t = (name or "").strip()
+    if not t:
+        return ""
+
+    sk = (sport_key or "").strip().lower()
+    if sk == "soccer":
+        suffixes = TEAM_SUFFIX_SOCCER
+    elif sk == "basketball":
+        suffixes = TEAM_SUFFIX_BASKETBALL
+    elif sk == "baseball":
+        suffixes = TEAM_SUFFIX_BASEBALL
+    elif sk == "volleyball":
+        suffixes = TEAM_SUFFIX_VOLLEYBALL
+    else:
+        return t
+
+    for s in suffixes:
+        if s and t.endswith(s):
+            return t[: -len(s)].strip()
+
+    return t
+
+def infer_norm_sport_key(sport_label: str, row_sport: str, league: str = "") -> str:
+    """export row의 sport/league 정보를 보고 팀명 정규화에 쓸 sport_key를 추정."""
+    sl = (sport_label or "").strip()
+    rs = (row_sport or "").strip()
+    lg = (league or "").strip()
+
+    # 1) 상위 sport_label 우선
+    if "축구" in sl:
+        return "soccer"
+    if "야구" in sl:
+        return "baseball"
+    if "배구" in sl:
+        return "volleyball"
+    if "농구" in sl:
+        # 농구/배구 혼합 라우트일 때는 row_sport/league로 배구를 분리
+        if any(x in rs for x in ["V리그", "배구"]) or any(x in lg for x in ["V리그", "배구", "VOLLEY"]):
+            return "volleyball"
+        return "basketball"
+
+    # 2) row_sport 기반 폴백
+    if any(x in rs for x in ["축구", "K리그", "J리그", "해외축구"]):
+        return "soccer"
+    if any(x in rs for x in ["야구", "KBO", "NPB", "MLB", "해외야구"]):
+        return "baseball"
+    if any(x in rs for x in ["배구", "V리그"]):
+        return "volleyball"
+    if any(x in rs for x in ["농구", "NBA", "KBL", "WKBL", "WNBA"]):
+        return "basketball"
+
+    return ""
+
+def build_matchup_display(home_raw: str, away_raw: str, sport_key: str) -> tuple[str, str, str]:
+    """(home_disp, away_disp, matchup_display) 반환. matchup_display는 '팀1 팀2' 형태."""
+    home_disp = normalize_team_name_by_sport(home_raw, sport_key)
+    away_disp = normalize_team_name_by_sport(away_raw, sport_key)
+    matchup_display = " ".join([x for x in [home_disp, away_disp] if x]).strip()
+    return home_disp, away_disp, matchup_display
+
+def build_export_title(target_date, league: str, home_raw: str, away_raw: str, sport_key: str) -> str:
+    """export_* D열(title) 표준화: 'M월 D일 [리그] 홈 원정 스포츠분석'"""
+    mm = getattr(target_date, "month", "")
+    dd = getattr(target_date, "day", "")
+    home_disp, away_disp, matchup = build_matchup_display(home_raw, away_raw, sport_key)
+    lg = (league or "").strip()
+    # league가 비어있으면 대괄호는 생략
+    if lg:
+        return f"{mm}월 {dd}일 [{lg}] {matchup} 스포츠분석".strip()
+    return f"{mm}월 {dd}일 {matchup} 스포츠분석".strip()
+
+def normalize_text_teamnames(text: str, *, sport_key: str, home_raw: str, away_raw: str) -> str:
+    """본문(body)에서 팀명/구분자 표기를 표시용으로 정리.
+    - raw 팀명 → 정규화된 팀명
+    - '팀1 vs 팀2' / '팀1 대 팀2' 형태 → '팀1 팀2'
+    """
+    if not text:
+        return ""
+    out = str(text)
+
+    home_disp, away_disp, matchup = build_matchup_display(home_raw, away_raw, sport_key)
+
+    # 1) raw 팀명 치환(존재할 때만)
+    if home_raw and home_disp and home_raw != home_disp:
+        out = out.replace(home_raw, home_disp)
+    if away_raw and away_disp and away_raw != away_disp:
+        out = out.replace(away_raw, away_disp)
+
+    # 2) 구분자 제거(팀명 기준으로만 타겟팅)
+    #    - 팀명이 바뀐 후(out.replace)에도 남아있는 구분자 패턴을 정리
+    try:
+        if home_disp and away_disp:
+            pat = re.compile(rf"{re.escape(home_disp)}\s*(?:vs|VS|대|v\.s\.|V\.S\.|—|–|-)\s*{re.escape(away_disp)}")
+            out = pat.sub(matchup, out)
+        if home_raw and away_raw:
+            pat2 = re.compile(rf"{re.escape(home_raw)}\s*(?:vs|VS|대|v\.s\.|V\.S\.|—|–|-)\s*{re.escape(away_raw)}")
+            out = pat2.sub(matchup, out)
+    except Exception:
+        pass
+
+    return out
+
 def _stable_rng(seed: str) -> _random.Random:
     h = _hashlib.md5((seed or "seed").encode("utf-8")).hexdigest()
     return _random.Random(int(h[:8], 16))
@@ -205,7 +352,7 @@ def _slug_tag(s: str) -> str:
     s = re.sub(r"[^\w가-힣]+", "", s)
     # 너무 긴 경우 잘라내기
     return s[:15]
-def build_dynamic_cafe_simple(title: str, body: str, *, sport: str = "", seed: str = "") -> str:
+def build_dynamic_cafe_simple(title: str, body: str, *, sport: str = "", seed: str = "", home_team: str = "", away_team: str = "") -> str:
     """export_* 시트 G열(simple) 생성(요약형)
     목표:
     - body 전체 복사 금지
@@ -219,6 +366,14 @@ def build_dynamic_cafe_simple(title: str, body: str, *, sport: str = "", seed: s
 
     league = _extract_league_bracket(title)
     home, away, matchup = _extract_matchup(title)
+    # ✅ title에 'vs/대'가 없더라도 팀 태그/키워드를 유지하기 위해,
+    #    호출부에서 home_team/away_team(정규화된 표시용 팀명)을 넘겨주면 우선 사용한다.
+    ht_override = (home_team or "").strip()
+    at_override = (away_team or "").strip()
+    if ht_override and at_override:
+        home, away = ht_override, at_override
+        matchup = f"{home} {away}"
+
 
     # fallback matchup (날짜/리그/스포츠분석 제거)
     if not matchup:
@@ -3861,44 +4016,47 @@ async def crawl_maz_analysis_common(
                     # ✅ 사이트 업로드용(site_export)도 같이 저장
                     if export_site and needs_export:
                         # export 시트에만 백필/저장
-                        
+                        try:
+                            _tmp_title, site_body = rewrite_for_site_openai(
+                                full_text,
+                                league=league,
+                                home_team=home,
+                                away_team=away,
+                            )
+                        except Exception as e:
+                            print(f"[SITE_EXPORT][ERR] id={board_id}: {e}")
+                        else:
+                            # ✅ 팀명/구분자 정규화 (표시용 키워드: '팀1 팀2')
+                            _norm_key = infer_norm_sport_key(sport_label, row_sport, league or "")
+                            _league_for_title = (league or league_default or "").strip()
+                            site_title = build_export_title(target_date, _league_for_title, home, away, _norm_key)
+                            # body(E열)에도 팀명/구분자 표기를 정리(FC/CF/워리어스 등 제거 + vs/대 제거)
+                            site_body = normalize_text_teamnames(site_body, sport_key=_norm_key, home_raw=home, away_raw=away)
+                    
+                            # ✅ export 시트 G열(simple) 생성: 팀 태그/해시태그 유지
                             try:
-                                site_title, site_body = rewrite_for_site_openai(
-                                    full_text,
-                                    league=league,
-                                    home_team=home,
-                                    away_team=away,
-                                )
-                            except Exception as e:
-                                print(f"[SITE_EXPORT][ERR] id={board_id}: {e}")
-                            else:
-                                # ✅ today/tomorrow 크롤링 제목 앞에 날짜 프리픽스 추가 (중복 방지)
-                                if site_title and day_key in ("today", "tomorrow"):
-                                    _dp2 = f"{target_date.month}월 {target_date.day}일 "
-                                    if not str(site_title).startswith(_dp2):
-                                        site_title = _dp2 + str(site_title).strip()
-
-                                # ✅ export 시트 G열(simple)용: 본문 전체 복사 금지 + 핵심요약/해시태그/제목 자연삽입
-                                try:
-                                    site_simple = build_dynamic_cafe_simple(
-                                        site_title,
-                                        site_body,
-                                        sport=row_sport,
-                                        seed=str(row_id),
-                                    )
-                                except Exception:
-                                    site_simple = ""
-
-                                site_rows_to_append.append([
-                                    day_key,
-                                    row_sport,
-                                    row_id,
+                                _hd, _ad, _ = build_matchup_display(home, away, _norm_key)
+                                site_simple = build_dynamic_cafe_simple(
                                     site_title,
                                     site_body,
-                                    get_kst_now().strftime("%Y-%m-%d %H:%M:%S"),
-                                    site_simple,
-                                ])
-                                existing_export_src_ids.add(row_id)
+                                    sport=row_sport,
+                                    seed=str(row_id),
+                                    home_team=_hd,
+                                    away_team=_ad,
+                                )
+                            except Exception:
+                                site_simple = ""
+                    
+                            site_rows_to_append.append([
+                                day_key,
+                                row_sport,
+                                row_id,
+                                site_title,
+                                site_body,
+                                get_kst_now().strftime("%Y-%m-%d %H:%M:%S"),
+                                site_simple,
+                            ])
+                            existing_export_src_ids.add(row_id)
 
     except Exception as e:
         # ✅ 여기 except는 try와 같은 들여쓰기 레벨이어야 함
