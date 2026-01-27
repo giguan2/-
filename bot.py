@@ -1356,9 +1356,12 @@ def _naver_news_cafe_post_multipart(
     ⚠️ 이미지 업로드가 실패해도 글 업로드는 재시도할 수 있도록,
     이 함수는 'multipart 업로드 자체'의 성공/실패만 리턴한다.
 
-    구현 메모:
-    - 공식 문서/예제에 image[0] 형태와 0(숫자) 형태가 혼재하는 케이스가 있어
-      둘 다 시도한다. (실패 시 글만 업로드로 폴백하도록 상위 로직에서 처리)
+    🔥 중요(인코딩 이슈):
+    - multipart 요청에서 subject/content 를 URL 인코딩해서 보내면,
+      일부 케이스에서 네이버가 이를 디코딩하지 않고 그대로 저장하여
+      제목이 '%ED%...' 형태(퍼센트 인코딩 문자열)로 올라가는 문제가 발생할 수 있다.
+    - 따라서 **RAW(UTF-8 문자열) 전송을 1순위**로 시도하고,
+      서버가 이를 거부하는 경우에만 기존 URL 인코딩 방식(UTF-8→MS949 이중 인코딩)을 폴백으로 시도한다.
     """
     token = _naver_news_refresh_access_token()
     if not token:
@@ -1374,6 +1377,7 @@ def _naver_news_cafe_post_multipart(
 
     content_raw = content or ""
 
+    # (폴백용) 기존 URL 인코딩 방식도 준비
     use_double = str(os.getenv("NAVER_CAFE_DOUBLE_ENCODE", "1")).strip() not in ("0", "false", "False", "no", "NO")
     enc_subject = _naver_quote_double(subject_raw) if use_double else _naver_quote_once(subject_raw)
     enc_content = _naver_quote_double(content_raw) if use_double else _naver_quote_once(content_raw)
@@ -1381,47 +1385,51 @@ def _naver_news_cafe_post_multipart(
     url = f"https://openapi.naver.com/v1/cafe/{clubid}/menu/{menuid}/articles"
     headers = {"Authorization": f"Bearer {token}"}
 
-    # ※ Naver Cafe API는 multipart에서도 subject/content 를 URL 인코딩한 값을 받는 케이스가 많아
-    # 기존 글쓰기 방식과 동일하게 인코딩된 문자열을 넣는다.
-    data = {"subject": enc_subject, "content": enc_content}
+    # RAW → (실패 시) ENC 폴백
+    data_variants = [
+        ("RAW", {"subject": subject_raw, "content": content_raw}),
+        ("ENC", {"subject": enc_subject, "content": enc_content}),
+    ]
 
     last_err = ""
-    for field_name in ("image[0]", "0"):
-        files = {field_name: (filename, image_bytes, mime_type)}
-        try:
-            resp = requests.post(url, headers=headers, data=data, files=files, timeout=60)
+    # 공식 문서/예제에 image[0] 형태와 0(숫자) 형태가 혼재 → 둘 다 시도
+    for _dtype, data in data_variants:
+        for field_name in ("image[0]", "0"):
+            files = {field_name: (filename, image_bytes, mime_type)}
+            try:
+                resp = requests.post(url, headers=headers, data=data, files=files, timeout=60)
 
-            if resp.status_code != 200:
-                txt = (resp.text or "")[:800]
+                if resp.status_code != 200:
+                    txt = (resp.text or "")[:800]
+                    try:
+                        j = resp.json()
+                        code = j.get("message", {}).get("error", {}).get("code")
+                        msg = j.get("message", {}).get("error", {}).get("msg")
+                        if code or msg:
+                            last_err = f"HTTP_{resp.status_code}:{code}:{msg}"
+                            continue
+                    except Exception:
+                        pass
+                    last_err = f"HTTP_{resp.status_code}:{txt}"
+                    continue
+
+                article_id = ""
                 try:
                     j = resp.json()
-                    code = j.get("message", {}).get("error", {}).get("code")
-                    msg = j.get("message", {}).get("error", {}).get("msg")
-                    if code or msg:
-                        last_err = f"HTTP_{resp.status_code}:{code}:{msg}"
-                        continue
+                    if isinstance(j, dict):
+                        article_id = (
+                            j.get("message", {}).get("result", {}).get("articleId")
+                            or j.get("result", {}).get("articleId")
+                            or ""
+                        )
                 except Exception:
                     pass
-                last_err = f"HTTP_{resp.status_code}:{txt}"
+
+                return True, (str(article_id) if article_id else "OK")
+
+            except Exception as e:
+                last_err = f"EXC:{e}"
                 continue
-
-            article_id = ""
-            try:
-                j = resp.json()
-                if isinstance(j, dict):
-                    article_id = (
-                        j.get("message", {}).get("result", {}).get("articleId")
-                        or j.get("result", {}).get("articleId")
-                        or ""
-                    )
-            except Exception:
-                pass
-
-            return True, (str(article_id) if article_id else "OK")
-
-        except Exception as e:
-            last_err = f"EXC:{e}"
-            continue
 
     return False, (last_err or "UPLOAD_FAIL")
 
@@ -1978,7 +1986,7 @@ async def _maz_warmup(client: httpx.AsyncClient) -> None:
 
 import math
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, quote_plus
+from urllib.parse import urljoin, quote_plus, unquote_plus
 from openai import OpenAI
 
 from telegram import (
@@ -4948,90 +4956,395 @@ def _download_image_bytes(img_url: str) -> tuple[bytes, str, str]:
         return b"", "", ""
 
 
-def rewrite_news_full_with_openai(full_text: str, *, orig_title: str, sport_label: str) -> tuple[str, str]:
-    """원문 텍스트를 기반으로 '완전 재작성' 본문을 생성한다. (title, body_text)"""
+def _needs_url_decode(s: str) -> bool:
+    s = s or ""
+    # %HH 형태가 있으면 URL 인코딩 문자열일 가능성이 높다.
+    return bool(re.search(r"%[0-9A-Fa-f]{2}", s))
+
+
+def _safe_url_decode(s: str) -> str:
+    """퍼센트 인코딩된 문자열(예: %ED%92%80%EB%9F%BC...)을 사람이 읽을 수 있게 복원한다.
+    - 일반 문자열은 그대로 반환한다.
+    """
+    t = (s or "").strip()
+    if not t:
+        return ""
+    if _needs_url_decode(t):
+        try:
+            return (unquote_plus(t) or t).strip()
+        except Exception:
+            return t
+    return t
+
+
+def _seo_phrase_for_sport(sport_label: str) -> str:
+    """종목 문자열을 바탕으로 본문에 자연스럽게 넣을 '종목 키워드(SEO)' 문구를 만든다."""
+    s = (sport_label or "").strip()
+    if not s:
+        return "스포츠뉴스"
+
+    sl = s.lower()
+    # 축구
+    if ("축구" in s) or ("soccer" in sl):
+        if ("해외" in s) or ("epl" in sl) or ("laliga" in sl) or ("분데스" in s) or ("챔피언스" in s):
+            return "해외축구 뉴스"
+        if ("k리그" in sl) or ("k리그" in s) or ("k-league" in sl) or ("국내" in s):
+            return "국내축구 소식"
+        return "축구 뉴스"
+
+    # 야구
+    if ("야구" in s) or ("baseball" in sl):
+        if ("kbo" in sl) or ("프로" in s) or ("국내" in s):
+            return "프로야구 소식"
+        if ("mlb" in sl) or ("해외" in s):
+            return "해외야구 소식"
+        return "야구 소식"
+
+    # 농구
+    if ("농구" in s) or ("basket" in sl):
+        if ("nba" in sl):
+            return "NBA 소식"
+        if ("kbl" in sl) or ("프로" in s) or ("국내" in s):
+            return "프로농구 소식"
+        return "농구 뉴스"
+
+    # 배구
+    if ("배구" in s) or ("volley" in sl):
+        if ("v리그" in sl) or ("v리그" in s) or ("프로" in s) or ("국내" in s):
+            return "프로배구 소식"
+        return "배구 뉴스"
+
+    return "스포츠뉴스"
+
+
+def _clean_news_rewrite_text_keep_newlines(text: str) -> str:
+    """뉴스 재작성 본문용 클리너.
+    - 줄바꿈/문단 구조는 유지
+    - 과도한 공백만 정리
+    - 해시태그(#...)는 삭제하지 않는다
+    """
+    if not text:
+        return ""
+    t = str(text)
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+
+    # 제어문자 제거
+    t = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", t)
+
+    # 라인별 앞뒤 공백 정리 + 탭/연속 공백 축소
+    lines = []
+    for ln in t.split("\n"):
+        ln2 = re.sub(r"[ \t]+", " ", ln).strip()
+        lines.append(ln2)
+
+    t = "\n".join(lines)
+
+    # 너무 많은 연속 줄바꿈은 2개로 축소
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+    return t
+
+
+def _extract_hashtags_fallback(body: str, sport_label: str, max_tags: int = 10) -> list[str]:
+    """OpenAI 출력에 해시태그가 없을 때의 폴백 생성.
+    - 본문에서 자주 등장하는 고유명사/키워드를 단순 추출
+    - 너무 일반적인 단어는 제외
+    """
+    if max_tags < 6:
+        max_tags = 6
+    base = []
+
+    # 종목 기본 태그
+    base.append("스포츠뉴스")
+    phrase = _seo_phrase_for_sport(sport_label)
+    if phrase:
+        base.append(phrase.replace(" ", ""))
+
+    # 토큰 후보: 한글/영문/숫자 2~20자
+    tokens = re.findall(r"[가-힣A-Za-z0-9]{2,20}", body or "")
+    stop = {
+        "그리고","하지만","그러나","또한","이번","지난","오늘","내일","현재","이날","이후","관련","소식","뉴스","기사",
+        "경기","시즌","리그","구단","선수","감독","팀","상대","이적","전망","분석","스포츠","스포츠뉴스","해외축구","프로야구",
+        "등","것","수","때","더","중","대한","대한민국","한국","대한축구협회","프로야구소식","해외축구뉴스",
+    }
+
+    from collections import Counter
+    cnt = Counter()
+    for tok in tokens:
+        t = tok.strip()
+        if not t:
+            continue
+        if t in stop:
+            continue
+        if re.fullmatch(r"\d+", t):
+            continue
+        # 너무 짧은 영문 약어(예: 'vs') 제거
+        if t.lower() in {"vs","v","tv","go","or","an","as","to","in","on","at","of","is"}:
+            continue
+        cnt[t] += 1
+
+    # 빈도 상위 + 길이가 적당한 것 우선
+    extras = []
+    for w, _n in cnt.most_common(30):
+        # 너무 긴 토큰은 제외
+        if len(w) > 16:
+            continue
+        extras.append(w)
+        if len(extras) >= (max_tags - len(base)):
+            break
+
+    tags_raw = base + extras
+    # 중복 제거(순서 유지)
+    seen = set()
+    tags = []
+    for t in tags_raw:
+        k = t.strip()
+        if not k:
+            continue
+        if k in seen:
+            continue
+        seen.add(k)
+        tags.append(k)
+        if len(tags) >= max_tags:
+            break
+
+    # 최소 6개 보장
+    if len(tags) < 6:
+        for add in ["이적소식", "경기결과", "리그소식", "팀소식", "선수소식", "스포츠분석"]:
+            if add not in seen:
+                tags.append(add)
+                seen.add(add)
+            if len(tags) >= 6:
+                break
+
+    return tags[:max_tags]
+
+
+def _format_hashtags(tags: list[str], per_line: int = 4) -> str:
+    tags = [t for t in (tags or []) if (t or "").strip()]
+    if not tags:
+        return ""
+    per_line = max(3, int(per_line or 4))
+    lines = []
+    for i in range(0, len(tags), per_line):
+        chunk = tags[i:i+per_line]
+        lines.append(" ".join([f"#{t.replace(' ', '')}" for t in chunk]))
+    return "\n".join(lines).strip()
+
+
+def _has_enough_hashtags(body: str) -> bool:
+    # '#단어'가 6개 이상이면 OK로 본다.
+    tags = re.findall(r"#[^\s#]{2,}", body or "")
+    return len(tags) >= 6
+
+def _looks_too_similar_to_source(rewritten: str, source: str) -> bool:
+    """재작성 결과가 원문과 지나치게 유사한지(복붙 위험) 매우 단순하게 검사한다.
+    - 완전한 표절 판정은 아니며, '긴 구간이 그대로 남은' 케이스를 2차 방어하기 위한 휴리스틱.
+    """
+    try:
+        out = re.sub(r"\s+", " ", (rewritten or "")).strip()
+        src = re.sub(r"\s+", " ", (source or "")).strip()
+        if len(out) < 600 or len(src) < 600:
+            return False
+
+        # 해시태그 섹션은 비교에서 제외
+        if "[해시태그]" in out:
+            out = out.split("[해시태그]", 1)[0].strip()
+
+        win_len = 45
+        if len(out) <= win_len:
+            return False
+
+        step = max(40, len(out) // 8)
+        hits = 0
+        for pos in range(0, len(out) - win_len, step):
+            w = out[pos:pos + win_len]
+            if w and (w in src):
+                hits += 1
+                if hits >= 2:
+                    return True
+        return False
+    except Exception:
+        return False
+
+
+def rewrite_news_full_with_openai(
+    full_text: str,
+    *,
+    orig_title: str,
+    sport_label: str,
+    has_image: bool = False,
+) -> tuple[str, str]:
+    """원문 텍스트를 기반으로 '완전 재작성' 본문을 생성한다. (title, body_text)
+
+    목표(이미지 유무와 관계없이 공통):
+    - 문장/구조/흐름을 새로 쓰는 완전 재작성
+    - 최소 1,200자~2,500자 분량(이미지 없는 글은 더 충분히)
+    - 섹션 구조 + 키워드 자연 삽입 + 하단 해시태그 6~10개
+    """
     client_oa = get_openai_client()
     trimmed = (full_text or "").strip()
     if len(trimmed) > 9000:
         trimmed = trimmed[:9000]
 
-    # 키 없으면 폴백(길이는 짧아질 수 있음)
+    # 길이 가이드(이미지 없는 글은 더 길게 유도)
+    min_chars = 1200 if has_image else 1500
+    max_chars = 2500
+
+    # 키 없으면(극히 예외) 최소 폴백: 구조만이라도 잡되, 표절 위험이 있어 운영상 OpenAI 키 설정을 권장
     if not client_oa:
-        fb = trimmed
-        if len(fb) > 2000:
-            fb = fb[:2000]
-        return (orig_title or "스포츠 뉴스", fb)
-
-    prompt = (
-        "아래는 스포츠 뉴스 기사 원문이다. 원문을 그대로 베끼지 말고, 의미를 유지하되 문장/표현/구성을 "
-        "전부 새로 만들어 '완전 재작성' 기사로 써줘.\n\n"
-        "요구사항:\n"
-        "- 한국어로 작성\n"
-        "- 길이: 공백 포함 1200~2500자\n"
-        "- 구조: 요약 1문단 → 핵심 포인트 3~5개(불릿) → 내용 확장(배경/맥락) → 영향/전망 → 마무리\n"
-        "- '스포츠분석' 키워드를 자연스럽게 1~2회 포함\n"
-        "- 종목/리그/팀명은 자연스럽게 포함(원문에 나온 고유명사를 활용)\n"
-        "- 원문 문장을 길게 그대로 복사 금지(특히 문단 단위 복사 금지)\n"
-        "- 과장/추측은 최소화, 기사 원문에 근거해 서술\n\n"
-        "반드시 아래 형식으로만 출력:\n"
-        "제목: (새 제목 1개)\n"
-        "본문:\n"
-        "(여기에 본문)\n\n"
-        f"===== 종목 =====\n{sport_label}\n\n"
-        f"===== 기존 제목 =====\n{orig_title}\n\n"
-        f"===== 기사 원문 =====\n{trimmed}\n"
-    )
-
-    try:
-        resp = client_oa.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL_NEWS_LONG", os.getenv("OPENAI_MODEL_NEWS", "gpt-4.1-mini")),
-            messages=[
-                {
-                    "role": "system",
-                    "content": "너는 스포츠 전문 기자이자 에디터다. 표절 위험이 없도록 완전히 새로운 문장으로 재작성한다.",
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.7,
-            max_completion_tokens=1800,
+        core = simple_summarize(trimmed, max_chars=700)
+        sport_phrase = _seo_phrase_for_sport(sport_label)
+        body_fb = (
+            "[기사 요약]\n"
+            f"{core}\n\n"
+            "[핵심 포인트]\n"
+            "- 핵심 이슈가 부각됐다\n"
+            "- 관련 팀/선수의 선택이 변수로 떠올랐다\n"
+            "- 향후 일정과 성적에 영향이 예상된다\n\n"
+            "[상세 내용 및 배경]\n"
+            "원문에서 언급된 배경을 토대로, 현재 상황이 어떤 맥락에서 등장했는지 정리했다.\n\n"
+            "[현재 상황 분석]\n"
+            f"이번 {sport_phrase} 이슈는 팬 반응과 현장 평가가 엇갈릴 수 있다. 스포츠뉴스 흐름에서 중요한 변수들을 점검할 필요가 있다.\n\n"
+            "[전망 및 의미]\n"
+            "단기적으로는 경기 운영과 로테이션에, 중장기적으로는 스쿼드 구성과 전략에 영향을 줄 수 있다.\n\n"
+            "[해시태그]\n"
+            + _format_hashtags(_extract_hashtags_fallback(core, sport_label, max_tags=8))
         )
-        out = (resp.choices[0].message.content or "").strip()
-        if not out:
-            raise ValueError("empty response from OpenAI (news_long)")
+        title_fb = orig_title or "스포츠 뉴스"
+        return (_safe_url_decode(title_fb), _clean_news_rewrite_text_keep_newlines(body_fb))
 
-        new_title = ""
-        body_lines: list[str] = []
-        lines = out.splitlines()
+    sport_phrase = _seo_phrase_for_sport(sport_label)
 
-        body_started = False
-        for line in lines:
-            t = line.strip()
-            if t.startswith("제목:") and not new_title:
-                new_title = t[len("제목:"):].strip(" ：:")
+    def _make_prompt(strict: bool = False) -> str:
+        strict_line = (
+            "- 특히 원문 문장을 10어절 이상 연속으로 그대로 쓰면 안 된다(표절 위험).\n"
+            if strict else
+            "- 원문 문장을 길게 그대로 복사하지 말 것(문단 단위 복사 금지).\n"
+        )
+        return (
+            "아래는 스포츠 뉴스 기사 원문이다. 원문을 그대로 베끼지 말고, 의미만 참고해서 문장/표현/구성/흐름을 "
+            "전부 새로 만들어 '완전 재작성' 기사로 써줘.\n\n"
+            "필수 요구사항:\n"
+            "- 한국어로 작성\n"
+            f"- 길이: 공백 포함 약 {min_chars}~{max_chars}자(너무 짧게 끝내지 말 것)\n"
+            "- 아래 섹션 제목을 **그대로 사용**하고, 각 섹션은 충분한 분량으로 작성\n"
+            "- 키워드는 본문 문맥 속에서 자연스럽게 1~2회씩 포함: '스포츠뉴스', '" + sport_phrase + "', '스포츠분석'\n"
+            "- 원문에 나온 선수/팀/리그/감독 등 고유명사를 적절히 활용(단, 사실을 새로 만들지 말 것)\n"
+            "- 과장/추측 최소화(원문에 근거해 서술)\n"
+            + strict_line +
+            "\n"
+            "권장 구조(형식 가이드):\n"
+            "[기사 요약]\n"
+            "- 핵심을 2~3문단으로 자연스럽게 풀어 설명\n\n"
+            "[핵심 포인트]\n"
+            "- 3~5개 불릿(각 1문장)\n\n"
+            "[상세 내용 및 배경]\n"
+            "- 배경/맥락/과거 흐름/리그·팀 상황 등을 충분히\n\n"
+            "[현재 상황 분석]\n"
+            "- 현재 시점 의미, 변수, 반응 등을 분석적으로\n\n"
+            "[전망 및 의미]\n"
+            "- 향후 전개 가능성, 팀/리그에 미칠 영향\n\n"
+            "[해시태그]\n"
+            "- 본문 기반 핵심 키워드 6~10개를 해시태그(#)로만 출력\n\n"
+            "반드시 아래 형식으로만 출력:\n"
+            "제목: (새 제목 1개)\n"
+            "본문:\n"
+            "(여기에 본문)\n\n"
+            f"===== 종목 =====\n{sport_label}\n\n"
+            f"===== 기존 제목 =====\n{orig_title}\n\n"
+            f"===== 기사 원문 =====\n{trimmed}\n"
+        )
+
+    last_exc = None
+    for attempt in range(2):
+        prompt = _make_prompt(strict=(attempt == 1))
+        try:
+            resp = client_oa.chat.completions.create(
+                model=os.getenv("OPENAI_MODEL_NEWS_LONG", os.getenv("OPENAI_MODEL_NEWS", "gpt-4.1-mini")),
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "너는 스포츠 전문 기자이자 에디터다. "
+                            "표절 위험이 없도록 완전히 새로운 문장으로 재작성하며, 문단/소제목/불릿/해시태그 구조를 지킨다."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.65,
+                max_completion_tokens=2100,
+            )
+            out = (resp.choices[0].message.content or "").strip()
+            if not out:
+                raise ValueError("empty response from OpenAI (news_long)")
+
+            new_title = ""
+            body_lines: list[str] = []
+            lines = out.splitlines()
+
+            body_started = False
+            for line in lines:
+                t = line.strip()
+                if t.startswith("제목:") and not new_title:
+                    new_title = t[len("제목:"):].strip(" ：:")
+                    continue
+                if t.startswith("본문:") and not body_started:
+                    body_started = True
+                    rest = t[len("본문:"):].lstrip()
+                    if rest:
+                        body_lines.append(rest)
+                    continue
+                if body_started:
+                    body_lines.append(line)
+
+            body = "\n".join(body_lines).strip() if body_lines else out
+
+            # 제목/본문 후처리(줄바꿈 유지 + URL 인코딩 문자열 방지)
+            new_title = _safe_url_decode(new_title or orig_title or "스포츠 뉴스")
+            body = _clean_news_rewrite_text_keep_newlines(body)
+
+            # 해시태그 보강(없으면 폴백 생성해서 하단에 추가)
+            if not _has_enough_hashtags(body):
+                tags = _extract_hashtags_fallback(body, sport_label, max_tags=9)
+                # 기존 [해시태그] 섹션이 이미 있으면 제거 후 재삽입(중복 방지)
+                body_no_tags = body
+                if "[해시태그]" in body_no_tags:
+                    body_no_tags = body_no_tags.split("[해시태그]", 1)[0].rstrip()
+                body = body_no_tags.rstrip() + "\n\n[해시태그]\n" + _format_hashtags(tags, per_line=4)
+
+            # 품질 체크: 길이 / 섹션 / 불릿
+            need_sections = all(sec in body for sec in ["[기사 요약]", "[핵심 포인트]", "[상세 내용 및 배경]", "[현재 상황 분석]", "[전망 및 의미]"])
+            bullet_cnt = len([ln for ln in body.splitlines() if ln.strip().startswith("-")])
+            if _looks_too_similar_to_source(body, trimmed):
                 continue
-            if t.startswith("본문:") and not body_started:
-                body_started = True
-                rest = t[len("본문:"):].lstrip()
-                if rest:
-                    body_lines.append(rest)
-                continue
-            if body_started:
-                body_lines.append(line)
 
-        body = "\n".join(body_lines).strip() if body_lines else out
+            if (len(body) >= min_chars) and need_sections and (bullet_cnt >= 3):
+                return new_title, body
 
-        if not new_title:
-            new_title = orig_title or "스포츠 뉴스"
+        except Exception as e:
+            last_exc = e
+            continue
 
-        body = clean_maz_text(body)
-        return new_title, body
-
-    except Exception as e:
-        print(f"[OPENAI][NEWS_LONG] 재작성 실패 → 폴백: {e}")
-        fb = trimmed
-        if len(fb) > 2000:
-            fb = fb[:2000]
-        return (orig_title or "스포츠 뉴스", clean_maz_text(fb))
+    # 최종 폴백(여기까지 오면 OpenAI가 계속 실패한 케이스)
+    print(f"[OPENAI][NEWS_LONG] 재작성 실패(2회) → 폴백: {last_exc}")
+    core = simple_summarize(trimmed, max_chars=900)
+    body_fb = (
+        "[기사 요약]\n"
+        f"{core}\n\n"
+        "[핵심 포인트]\n"
+        "- 주요 이슈가 확인됐다\n"
+        "- 핵심 인물/팀의 선택이 관전 포인트다\n"
+        "- 일정/전력 변수에 따라 흐름이 달라질 수 있다\n\n"
+        "[상세 내용 및 배경]\n"
+        "원문에서 언급된 배경과 맥락을 바탕으로 사건의 흐름을 재구성했다.\n\n"
+        "[현재 상황 분석]\n"
+        f"이번 이슈는 {sport_phrase} 관점에서 해석 포인트가 있다. 스포츠뉴스 흐름 속에서 변수와 반응을 함께 봐야 한다.\n\n"
+        "[전망 및 의미]\n"
+        "향후 결과는 성적, 전력 구성, 여론에 영향을 줄 수 있다.\n\n"
+        "[해시태그]\n"
+        + _format_hashtags(_extract_hashtags_fallback(core, sport_label, max_tags=8))
+    )
+    return (_safe_url_decode(orig_title or "스포츠 뉴스"), _clean_news_rewrite_text_keep_newlines(body_fb))
 
 
 def _make_cafe_center_html(text_body: str) -> tuple[str, str]:
@@ -5206,6 +5519,7 @@ async def cafe_news_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text_body,
                 orig_title=orig_title or "스포츠 뉴스",
                 sport_label=sport or "",
+                has_image=bool(img_url),
             )
 
             # 3) 카페 업로드용 HTML(기존 방식 유지)
