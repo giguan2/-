@@ -1024,6 +1024,15 @@ NAVER_CLIENT_ID = (os.getenv("NAVER_CLIENT_ID") or "").strip()
 NAVER_CLIENT_SECRET = (os.getenv("NAVER_CLIENT_SECRET") or "").strip()
 NAVER_REFRESH_TOKEN = (os.getenv("NAVER_REFRESH_TOKEN") or "").strip()
 
+# ───────────────── 뉴스 전용 네이버 계정(토큰 분리) ─────────────────
+# 기존 분석글 업로드 토큰(NAVER_CLIENT_ID/SECRET/REFRESH_TOKEN)과 완전 분리
+NAVER_NEWS_CLIENT_ID = (os.getenv("NAVER_NEWS_CLIENT_ID") or "").strip()
+NAVER_NEWS_CLIENT_SECRET = (os.getenv("NAVER_NEWS_CLIENT_SECRET") or "").strip()
+NAVER_NEWS_REFRESH_TOKEN = (os.getenv("NAVER_NEWS_REFRESH_TOKEN") or "").strip()
+
+# 뉴스 게시판 menuId는 고정: 31
+NAVER_CAFE_NEWS_MENU_ID = "31"
+
 # 기본값(전 종목 공통 게시판). 종목별 분리는 NAVER_CAFE_MENU_MAP(JSON)로 설정 가능.
 NAVER_CAFE_CLUBID = (os.getenv("NAVER_CAFE_CLUBID") or "").strip()
 NAVER_CAFE_MENU_ID = (os.getenv("NAVER_CAFE_MENU_ID") or "").strip()
@@ -1049,7 +1058,18 @@ NAVER_CAFE_MENU_MAP_DEEP_RAW = (os.getenv("NAVER_CAFE_MENU_MAP_DEEP") or "").str
 CAFE_LOG_SHEET_NAME = (os.getenv("CAFE_LOG_SHEET_NAME") or "cafe_log").strip()
 CAFE_LOG_HEADER = ["src_id", "day", "sport", "clubid", "menuid", "articleId", "postedAt", "status"]
 
+# ───────────────── news_cafe_queue / news_cafe_log ─────────────────
+NEWS_CAFE_QUEUE_SHEET_NAME = (os.getenv("NEWS_CAFE_QUEUE_SHEET_NAME") or "news_cafe_queue").strip()
+NEWS_CAFE_QUEUE_HEADER = ["createdAt", "sport", "title", "url", "status", "postedAt", "error"]
+
+NEWS_CAFE_LOG_SHEET_NAME = (os.getenv("NEWS_CAFE_LOG_SHEET_NAME") or "news_cafe_log").strip()
+NEWS_CAFE_LOG_HEADER = ["url", "title", "postedAt", "status", "error"]
+
+# 상태값: NEW, POSTED, FAIL
+
 _naver_access_token_cache = {"token": "", "expires_at": 0}
+
+_naver_news_access_token_cache = {"token": "", "expires_at": 0}
 
 def _naver_menu_id_for_sport(sport: str) -> str:
     sport_key = (sport or "").strip().lower()
@@ -1140,6 +1160,42 @@ def _naver_refresh_access_token() -> str:
         print(f"[NAVER] token refresh exception: {e}")
         return ""
 
+
+def _naver_news_have_config() -> bool:
+    return bool(NAVER_NEWS_CLIENT_ID and NAVER_NEWS_CLIENT_SECRET and NAVER_NEWS_REFRESH_TOKEN and NAVER_CAFE_CLUBID)
+
+def _naver_news_refresh_access_token() -> str:
+    """뉴스 전용 refresh_token으로 access_token 갱신(캐시 사용)."""
+    now_ts = int(time.time())
+    if _naver_news_access_token_cache["token"] and _naver_news_access_token_cache["expires_at"] - 60 > now_ts:
+        return _naver_news_access_token_cache["token"]
+
+    if not (NAVER_NEWS_CLIENT_ID and NAVER_NEWS_CLIENT_SECRET and NAVER_NEWS_REFRESH_TOKEN):
+        return ""
+
+    url = "https://nid.naver.com/oauth2.0/token"
+    params = {
+        "grant_type": "refresh_token",
+        "client_id": NAVER_NEWS_CLIENT_ID,
+        "client_secret": NAVER_NEWS_CLIENT_SECRET,
+        "refresh_token": NAVER_NEWS_REFRESH_TOKEN,
+    }
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        if not (200 <= r.status_code < 300):
+            print(f"[NAVER][NEWS] token refresh failed status={r.status_code} body={r.text[:500]}")
+            return ""
+        data = r.json()
+        token = (data.get("access_token") or "").strip()
+        expires_in = int(str(data.get("expires_in") or "3600"))
+        if token:
+            _naver_news_access_token_cache["token"] = token
+            _naver_news_access_token_cache["expires_at"] = now_ts + max(60, expires_in)
+        return token
+    except Exception as e:
+        print(f"[NAVER][NEWS] token refresh exception: {e}")
+        return ""
+
 def _naver_clean_text(s: str) -> str:
     s = (s or "")
     s = s.replace("\r\n", "\n").replace("\r", "\n")
@@ -1220,6 +1276,156 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
 
     except Exception as e:
         return False, f"EXC:{e}"
+
+def _naver_news_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tuple[bool, str]:
+    """뉴스 전용 계정으로 네이버 카페에 글쓰기. (success, articleId_or_error)
+
+    - application/x-www-form-urlencoded 로 전송
+    - subject/content 를 URL 인코딩(기본: UTF-8→MS949 이중 인코딩)해서 한글 깨짐 방지
+    """
+    token = _naver_news_refresh_access_token()
+    if not token:
+        return False, "NO_ACCESS_TOKEN_NEWS"
+    if not clubid or not menuid:
+        return False, "NO_CLUBID_OR_MENUID"
+
+    subject_raw = (subject or "").strip() or "스포츠 뉴스"
+    if len(subject_raw) > 80:
+        subject_raw = subject_raw[:80]
+
+    content_raw = content or ""
+
+    use_double = str(os.getenv("NAVER_CAFE_DOUBLE_ENCODE", "1")).strip() not in ("0", "false", "False", "no", "NO")
+
+    enc_subject = _naver_quote_double(subject_raw) if use_double else _naver_quote_once(subject_raw)
+    enc_content  = _naver_quote_double(content_raw) if use_double else _naver_quote_once(content_raw)
+
+    body = f"subject={enc_subject}&content={enc_content}"
+
+    url = f"https://openapi.naver.com/v1/cafe/{clubid}/menu/{menuid}/articles"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, data=body.encode("utf-8"), timeout=30)
+
+        if resp.status_code != 200:
+            txt = (resp.text or "")[:800]
+            try:
+                j = resp.json()
+                code = j.get("message", {}).get("error", {}).get("code")
+                msg = j.get("message", {}).get("error", {}).get("msg")
+                if code or msg:
+                    return False, f"HTTP_{resp.status_code}:{code}:{msg}"
+            except Exception:
+                pass
+            return False, f"HTTP_{resp.status_code}:{txt}"
+
+        article_id = ""
+        try:
+            j = resp.json()
+            if isinstance(j, dict):
+                article_id = (
+                    j.get("message", {}).get("result", {}).get("articleId")
+                    or j.get("result", {}).get("articleId")
+                    or ""
+                )
+        except Exception:
+            pass
+
+        return True, (str(article_id) if article_id else "OK")
+
+    except Exception as e:
+        return False, f"EXC:{e}"
+
+
+def _naver_news_cafe_post_multipart(
+    subject: str,
+    content: str,
+    clubid: str,
+    menuid: str,
+    *,
+    image_bytes: bytes,
+    filename: str = "image.jpg",
+    mime_type: str = "image/jpeg",
+) -> tuple[bool, str]:
+    """뉴스 전용 계정으로 글쓰기 + 대표 이미지 1장 첨부(multipart).
+
+    ⚠️ 이미지 업로드가 실패해도 글 업로드는 재시도할 수 있도록,
+    이 함수는 'multipart 업로드 자체'의 성공/실패만 리턴한다.
+
+    구현 메모:
+    - 공식 문서/예제에 image[0] 형태와 0(숫자) 형태가 혼재하는 케이스가 있어
+      둘 다 시도한다. (실패 시 글만 업로드로 폴백하도록 상위 로직에서 처리)
+    """
+    token = _naver_news_refresh_access_token()
+    if not token:
+        return False, "NO_ACCESS_TOKEN_NEWS"
+    if not clubid or not menuid:
+        return False, "NO_CLUBID_OR_MENUID"
+    if not image_bytes:
+        return False, "NO_IMAGE_BYTES"
+
+    subject_raw = (subject or "").strip() or "스포츠 뉴스"
+    if len(subject_raw) > 80:
+        subject_raw = subject_raw[:80]
+
+    content_raw = content or ""
+
+    use_double = str(os.getenv("NAVER_CAFE_DOUBLE_ENCODE", "1")).strip() not in ("0", "false", "False", "no", "NO")
+    enc_subject = _naver_quote_double(subject_raw) if use_double else _naver_quote_once(subject_raw)
+    enc_content = _naver_quote_double(content_raw) if use_double else _naver_quote_once(content_raw)
+
+    url = f"https://openapi.naver.com/v1/cafe/{clubid}/menu/{menuid}/articles"
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # ※ Naver Cafe API는 multipart에서도 subject/content 를 URL 인코딩한 값을 받는 케이스가 많아
+    # 기존 글쓰기 방식과 동일하게 인코딩된 문자열을 넣는다.
+    data = {"subject": enc_subject, "content": enc_content}
+
+    last_err = ""
+    for field_name in ("image[0]", "0"):
+        files = {field_name: (filename, image_bytes, mime_type)}
+        try:
+            resp = requests.post(url, headers=headers, data=data, files=files, timeout=60)
+
+            if resp.status_code != 200:
+                txt = (resp.text or "")[:800]
+                try:
+                    j = resp.json()
+                    code = j.get("message", {}).get("error", {}).get("code")
+                    msg = j.get("message", {}).get("error", {}).get("msg")
+                    if code or msg:
+                        last_err = f"HTTP_{resp.status_code}:{code}:{msg}"
+                        continue
+                except Exception:
+                    pass
+                last_err = f"HTTP_{resp.status_code}:{txt}"
+                continue
+
+            article_id = ""
+            try:
+                j = resp.json()
+                if isinstance(j, dict):
+                    article_id = (
+                        j.get("message", {}).get("result", {}).get("articleId")
+                        or j.get("result", {}).get("articleId")
+                        or ""
+                    )
+            except Exception:
+                pass
+
+            return True, (str(article_id) if article_id else "OK")
+
+        except Exception as e:
+            last_err = f"EXC:{e}"
+            continue
+
+    return False, (last_err or "UPLOAD_FAIL")
+
+
 def get_cafe_log_ws():
     """cafe_log 워크시트 반환(없으면 생성 + 헤더 세팅)."""
     client_gs = get_gs_client()
@@ -1237,6 +1443,145 @@ def get_cafe_log_ws():
     except Exception as e:
         print(f"[GSHEET] cafe_log ws error: {e}")
         return None
+
+
+def get_news_cafe_queue_ws():
+    """news_cafe_queue 워크시트 반환(없으면 생성 + 헤더 세팅)."""
+    client_gs = get_gs_client()
+    spreadsheet_id = os.getenv("SPREADSHEET_ID")
+    if not (client_gs and spreadsheet_id):
+        return None
+    try:
+        sh = client_gs.open_by_key(spreadsheet_id)
+        ws = _get_ws_by_name(sh, NEWS_CAFE_QUEUE_SHEET_NAME)
+        if not ws:
+            ws = sh.add_worksheet(title=NEWS_CAFE_QUEUE_SHEET_NAME, rows=5000, cols=20)
+        ws.resize(cols=max(12, len(NEWS_CAFE_QUEUE_HEADER)))
+        _ensure_header(ws, NEWS_CAFE_QUEUE_HEADER)
+        return ws
+    except Exception as e:
+        print(f"[GSHEET] news_cafe_queue ws error: {e}")
+        return None
+
+
+def get_news_cafe_log_ws():
+    """news_cafe_log 워크시트 반환(없으면 생성 + 헤더 세팅)."""
+    client_gs = get_gs_client()
+    spreadsheet_id = os.getenv("SPREADSHEET_ID")
+    if not (client_gs and spreadsheet_id):
+        return None
+    try:
+        sh = client_gs.open_by_key(spreadsheet_id)
+        ws = _get_ws_by_name(sh, NEWS_CAFE_LOG_SHEET_NAME)
+        if not ws:
+            ws = sh.add_worksheet(title=NEWS_CAFE_LOG_SHEET_NAME, rows=5000, cols=20)
+        ws.resize(cols=max(12, len(NEWS_CAFE_LOG_HEADER)))
+        _ensure_header(ws, NEWS_CAFE_LOG_HEADER)
+        return ws
+    except Exception as e:
+        print(f"[GSHEET] news_cafe_log ws error: {e}")
+        return None
+
+
+def _normalize_news_url(url: str) -> str:
+    u = (url or "").strip()
+    if not u:
+        return ""
+    # 상대경로면 다음스포츠로 보정
+    if u.startswith("/"):
+        u = urljoin("https://sports.daum.net", u)
+    # fragment 제거
+    u = u.split("#", 1)[0].strip()
+    return u
+
+
+def _load_news_queue_urls(ws_queue) -> set[str]:
+    """news_cafe_queue에 이미 존재하는 normalized_url set."""
+    existing: set[str] = set()
+    try:
+        vals = ws_queue.get_all_values()
+        if not vals or len(vals) <= 1:
+            return existing
+        header = vals[0]
+        try:
+            idx_url = header.index("url")
+        except ValueError:
+            idx_url = 3  # 기본 4번째 컬럼 가정
+        for r in vals[1:]:
+            if len(r) <= idx_url:
+                continue
+            u = _normalize_news_url(r[idx_url])
+            if u:
+                existing.add(u)
+    except Exception:
+        pass
+    return existing
+
+
+def enqueue_news_to_cafe_queue(*, sport_label: str, articles: list[dict]) -> int:
+    """다음뉴스 크롤링 시점에 원문 정보를 news_cafe_queue에 동시 적재한다.
+
+    - 기존 news 탭 저장/텔레그램 게시 흐름은 건드리지 않음(추가만).
+    - url 정규화 후, queue에 이미 같은 url이 있으면 스킵.
+    """
+    ws_q = get_news_cafe_queue_ws()
+    if not ws_q:
+        return 0
+
+    existing = _load_news_queue_urls(ws_q)
+
+    now_iso = now_kst().isoformat()
+    rows: list[list[str]] = []
+    for art in (articles or []):
+        try:
+            title = (art.get("title") or "").strip()
+            url = _normalize_news_url(art.get("link") or art.get("url") or "")
+            if not url:
+                continue
+            if url in existing:
+                continue
+            rows.append([now_iso, sport_label, title, url, "NEW", "", ""])
+            existing.add(url)
+        except Exception:
+            continue
+
+    if not rows:
+        return 0
+
+    try:
+        ws_q.append_rows(rows, value_input_option="RAW", table_range="A1")
+        return len(rows)
+    except Exception as e:
+        print(f"[GSHEET] news_cafe_queue append_rows error: {e}")
+        return 0
+
+
+def _load_news_cafe_posted_urls(ws_log) -> set[str]:
+    """news_cafe_log에서 OK/POSTED 처리된 url만 로드."""
+    posted: set[str] = set()
+    try:
+        vals = ws_log.get_all_values()
+        if not vals or len(vals) <= 1:
+            return posted
+        header = vals[0]
+        try:
+            idx_url = header.index("url")
+        except ValueError:
+            idx_url = 0
+        try:
+            idx_status = header.index("status")
+        except ValueError:
+            idx_status = 3
+        for r in vals[1:]:
+            u = _normalize_news_url(r[idx_url] if len(r) > idx_url else "")
+            st = (r[idx_status] if len(r) > idx_status else "").strip().upper()
+            if not u:
+                continue
+            if st in ("OK", "POSTED"):
+                posted.add(u)
+    except Exception:
+        pass
+    return posted
 
 def _load_posted_keys(ws_log) -> set:
     """cafe_log에서 (src_id, menuid) 단위로 '성공(OK)'한 게시글만 로드.
@@ -3898,6 +4243,14 @@ async def crawl_daum_news_common(
                 )
                 return
 
+            # (추가) news_cafe_queue 동시 적재 (원문 제목/URL 저장) - 기존 news 탭 흐름은 그대로 유지
+            try:
+                enq_cnt = enqueue_news_to_cafe_queue(sport_label=sport_label, articles=articles)
+                if enq_cnt:
+                    print(f"[NEWS_QUEUE] {sport_label} {enq_cnt}건 적재")
+            except Exception as _e:
+                print(f"[NEWS_QUEUE] enqueue 실패: {_e}")
+
             # 2) 각 기사 페이지 들어가서 본문 크롤링 + 요약
             for art in articles:
                 try:
@@ -4491,6 +4844,450 @@ async def crawlvolleyball(update: Update, context: ContextTypes.DEFAULT_TYPE):
         max_articles=10,
     )
 
+
+# ───────────────── news_cafe_queue → 네이버 카페 업로드 (/cafe_news_upload) ─────────────────
+
+def _safe_truncate(s: str, n: int = 300) -> str:
+    s = (s or "").strip()
+    return s if len(s) <= n else s[:n] + "…"
+
+
+def _news_is_rate_limited(err: str) -> bool:
+    s = (err or "").lower()
+    # 네이버 OpenAPI 쪽은 429 / rate / limit / too many 등으로 오는 경우가 많아 보수적으로 체크
+    return ("429" in s) or ("rate" in s) or ("limit" in s) or ("too many" in s)
+
+
+def fetch_daum_article_text_and_image(url: str, orig_title: str = "") -> tuple[str, str]:
+    """다음스포츠 기사 URL에서 본문 텍스트 + 대표 이미지 URL(가능하면) 추출."""
+    ua = {"User-Agent": "Mozilla/5.0"}
+    r = requests.get(url, headers=ua, timeout=20)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    # 1) 대표 이미지 URL 추출 우선순위
+    img_url = ""
+    try:
+        og = soup.find("meta", attrs={"property": "og:image"})
+        if og and og.get("content"):
+            img_url = str(og.get("content")).strip()
+    except Exception:
+        pass
+
+    if not img_url:
+        try:
+            cont = soup.select_one("div#harmonyContainer")
+            if cont:
+                img = cont.find("img")
+                if img:
+                    img_url = (img.get("src") or img.get("data-src") or "").strip()
+                    if img_url and img_url.startswith("/"):
+                        img_url = urljoin(url, img_url)
+        except Exception:
+            pass
+
+    # 2) 본문 추출(크롤링 로직 재사용)
+    body_el = (
+        soup.select_one("div#harmonyContainer")
+        or soup.select_one("section#article-view-content-div")
+        or soup.select_one("div.article_view")
+        or soup.select_one("div#mArticle")
+        or soup.find("article")
+        or soup.body
+    )
+
+    raw_body = ""
+    if body_el:
+        # 이미지 설명 캡션 제거
+        try:
+            for cap in body_el.select(
+                "figcaption, .txt_caption, .photo_desc, .caption, "
+                "em.photo_desc, span.caption, p.caption"
+            ):
+                try:
+                    cap.extract()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        raw_body = body_el.get_text("\n", strip=True)
+
+    clean_text = clean_daum_body_text(raw_body)
+    if orig_title:
+        clean_text = remove_title_prefix(orig_title, clean_text)
+
+    return clean_text, img_url
+
+
+def _download_image_bytes(img_url: str) -> tuple[bytes, str, str]:
+    """이미지 URL을 다운로드해서 (bytes, filename, mime_type) 반환. 실패하면 (b"", "", "")"""
+    if not img_url:
+        return b"", "", ""
+    ua = {"User-Agent": "Mozilla/5.0"}
+    try:
+        r = requests.get(img_url, headers=ua, timeout=20)
+        r.raise_for_status()
+        content_type = (r.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if not content_type.startswith("image/"):
+            # 일부는 text/html로 오는 경우도 있어 방어
+            content_type = "image/jpeg"
+
+        ext = ".jpg"
+        if "png" in content_type:
+            ext = ".png"
+        elif "webp" in content_type:
+            ext = ".webp"
+        elif "gif" in content_type:
+            ext = ".gif"
+
+        filename = f"news_image{ext}"
+        return (r.content or b""), filename, content_type
+    except Exception as e:
+        print(f"[NEWS_IMAGE] download 실패: {img_url} / {e}")
+        return b"", "", ""
+
+
+def rewrite_news_full_with_openai(full_text: str, *, orig_title: str, sport_label: str) -> tuple[str, str]:
+    """원문 텍스트를 기반으로 '완전 재작성' 본문을 생성한다. (title, body_text)"""
+    client_oa = get_openai_client()
+    trimmed = (full_text or "").strip()
+    if len(trimmed) > 9000:
+        trimmed = trimmed[:9000]
+
+    # 키 없으면 폴백(길이는 짧아질 수 있음)
+    if not client_oa:
+        fb = trimmed
+        if len(fb) > 2000:
+            fb = fb[:2000]
+        return (orig_title or "스포츠 뉴스", fb)
+
+    prompt = (
+        "아래는 스포츠 뉴스 기사 원문이다. 원문을 그대로 베끼지 말고, 의미를 유지하되 문장/표현/구성을 "
+        "전부 새로 만들어 '완전 재작성' 기사로 써줘.\n\n"
+        "요구사항:\n"
+        "- 한국어로 작성\n"
+        "- 길이: 공백 포함 1200~2500자\n"
+        "- 구조: 요약 1문단 → 핵심 포인트 3~5개(불릿) → 내용 확장(배경/맥락) → 영향/전망 → 마무리\n"
+        "- '스포츠분석' 키워드를 자연스럽게 1~2회 포함\n"
+        "- 종목/리그/팀명은 자연스럽게 포함(원문에 나온 고유명사를 활용)\n"
+        "- 원문 문장을 길게 그대로 복사 금지(특히 문단 단위 복사 금지)\n"
+        "- 과장/추측은 최소화, 기사 원문에 근거해 서술\n\n"
+        "반드시 아래 형식으로만 출력:\n"
+        "제목: (새 제목 1개)\n"
+        "본문:\n"
+        "(여기에 본문)\n\n"
+        f"===== 종목 =====\n{sport_label}\n\n"
+        f"===== 기존 제목 =====\n{orig_title}\n\n"
+        f"===== 기사 원문 =====\n{trimmed}\n"
+    )
+
+    try:
+        resp = client_oa.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL_NEWS_LONG", os.getenv("OPENAI_MODEL_NEWS", "gpt-4.1-mini")),
+            messages=[
+                {
+                    "role": "system",
+                    "content": "너는 스포츠 전문 기자이자 에디터다. 표절 위험이 없도록 완전히 새로운 문장으로 재작성한다.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.7,
+            max_completion_tokens=1800,
+        )
+        out = (resp.choices[0].message.content or "").strip()
+        if not out:
+            raise ValueError("empty response from OpenAI (news_long)")
+
+        new_title = ""
+        body_lines: list[str] = []
+        lines = out.splitlines()
+
+        body_started = False
+        for line in lines:
+            t = line.strip()
+            if t.startswith("제목:") and not new_title:
+                new_title = t[len("제목:"):].strip(" ：:")
+                continue
+            if t.startswith("본문:") and not body_started:
+                body_started = True
+                rest = t[len("본문:"):].lstrip()
+                if rest:
+                    body_lines.append(rest)
+                continue
+            if body_started:
+                body_lines.append(line)
+
+        body = "\n".join(body_lines).strip() if body_lines else out
+
+        if not new_title:
+            new_title = orig_title or "스포츠 뉴스"
+
+        body = clean_maz_text(body)
+        return new_title, body
+
+    except Exception as e:
+        print(f"[OPENAI][NEWS_LONG] 재작성 실패 → 폴백: {e}")
+        fb = trimmed
+        if len(fb) > 2000:
+            fb = fb[:2000]
+        return (orig_title or "스포츠 뉴스", clean_maz_text(fb))
+
+
+def _make_cafe_center_html(text_body: str) -> tuple[str, str]:
+    """기존 카페 업로드 방식과 동일한 깨짐 방지/줄바꿈을 유지하기 위해 center+br 변환."""
+    content_norm = (text_body or "").strip()
+
+    # normalize newlines + strip simple html if any
+    content_norm = content_norm.replace("\r\n", "\n").replace("\r", "\n")
+    content_norm = re.sub(r"<br\s*/?>", "\n", content_norm, flags=re.I)
+    content_norm = re.sub(r"</(p|div|li)>", "\n", content_norm, flags=re.I)
+    content_norm = re.sub(r"<[^>]+>", "", content_norm)
+    content_norm = content_norm.replace("&nbsp;", " ").strip()
+
+    safe = html.escape(content_norm)
+    lines = safe.split("\n") if safe else [""]
+    html_lines = [(ln if ln.strip() else "&nbsp;") for ln in lines]
+    content_html = "<center>" + "<br>".join(html_lines) + "</center>"
+    return content_html, content_norm
+
+
+def _queue_update_status(ws_q, row_num: int, status: str, posted_at: str = "", error: str = "") -> None:
+    """news_cafe_queue의 해당 행 상태 업데이트."""
+    try:
+        ws_q.update(f"E{row_num}:G{row_num}", [[status, posted_at, error]], value_input_option="RAW")
+        return
+    except Exception:
+        pass
+
+    # 헤더가 변경된 케이스 대비(느리지만 안전)
+    try:
+        header = ws_q.row_values(1)
+        def _idx(name: str, fallback: int) -> int:
+            try:
+                return header.index(name) + 1  # 1-based
+            except ValueError:
+                return fallback
+        c_status = _idx("status", 5)
+        c_posted = _idx("postedAt", 6)
+        c_error = _idx("error", 7)
+        ws_q.update_cell(row_num, c_status, status)
+        ws_q.update_cell(row_num, c_posted, posted_at)
+        ws_q.update_cell(row_num, c_error, error)
+    except Exception as e:
+        print(f"[GSHEET] queue status update error row={row_num}: {e}")
+
+
+async def cafe_news_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/cafe_news_upload [N|latest|all] : news_cafe_queue의 NEW 항목을 뉴스 전용 계정으로 menuId=31에 업로드."""
+    if not is_admin(update):
+        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+
+    if not _naver_news_have_config():
+        await update.message.reply_text(
+            "뉴스용 네이버 토큰 설정이 없습니다.\n"
+            "환경변수: NAVER_NEWS_CLIENT_ID / NAVER_NEWS_CLIENT_SECRET / NAVER_NEWS_REFRESH_TOKEN / NAVER_CAFE_CLUBID 를 확인해주세요."
+        )
+        return
+
+    ws_q = get_news_cafe_queue_ws()
+    if not ws_q:
+        await update.message.reply_text("news_cafe_queue 시트를 열지 못했습니다.")
+        return
+
+    vals = []
+    try:
+        vals = ws_q.get_all_values()
+    except Exception as e:
+        await update.message.reply_text(f"news_cafe_queue 읽기 오류: {e}")
+        return
+
+    if not vals or len(vals) <= 1:
+        await update.message.reply_text("news_cafe_queue에 업로드할 데이터가 없습니다.")
+        return
+
+    header = vals[0]
+
+    def _hidx(name: str, fallback: int) -> int:
+        try:
+            return header.index(name)
+        except ValueError:
+            return fallback
+
+    idx_created = _hidx("createdAt", 0)
+    idx_sport = _hidx("sport", 1)
+    idx_title = _hidx("title", 2)
+    idx_url = _hidx("url", 3)
+    idx_status = _hidx("status", 4)
+
+    # args 파싱
+    n = 5
+    mode_all = False
+    if context.args:
+        arg = (context.args[0] or "").strip().lower()
+        if arg == "latest":
+            n = 1
+        elif arg == "all":
+            mode_all = True
+        else:
+            try:
+                n = int(arg)
+                if n <= 0:
+                    n = 5
+            except Exception:
+                n = 5
+
+    items = []
+    for i, row in enumerate(vals[1:], start=2):  # row number in sheet
+        st = (row[idx_status] if len(row) > idx_status else "").strip().upper()
+        if st != "NEW":
+            continue
+        url = _normalize_news_url(row[idx_url] if len(row) > idx_url else "")
+        if not url:
+            continue
+        created_at = (row[idx_created] if len(row) > idx_created else "").strip()
+        sport = (row[idx_sport] if len(row) > idx_sport else "").strip()
+        title = (row[idx_title] if len(row) > idx_title else "").strip()
+        items.append({
+            "row": i,
+            "createdAt": created_at,
+            "sport": sport,
+            "title": title,
+            "url": url,
+        })
+
+    if not items:
+        await update.message.reply_text("news_cafe_queue에 status=NEW 항목이 없습니다.")
+        return
+
+    def _parse_iso(s: str) -> datetime:
+        try:
+            return datetime.fromisoformat(s)
+        except Exception:
+            return datetime(1970, 1, 1, tzinfo=KST)
+
+    items.sort(key=lambda x: (_parse_iso(x["createdAt"]), x["row"]), reverse=True)
+
+    selected = items if mode_all else items[:n]
+
+    await update.message.reply_text(
+        f"뉴스 카페 업로드 시작: NEW {len(items)}건 중 {len(selected)}건 처리합니다. (menuId={NAVER_CAFE_NEWS_MENU_ID})"
+    )
+
+    ws_log = get_news_cafe_log_ws()
+    posted_urls = _load_news_cafe_posted_urls(ws_log) if ws_log else set()
+
+    ok_cnt = 0
+    fail_cnt = 0
+    skip_cnt = 0
+
+    for it in selected:
+        row_num = it["row"]
+        url = it["url"]
+        orig_title = it["title"]
+        sport = it["sport"]
+
+        # (안전) 이미 로그에 OK로 남아있으면 중복 업로드 방지
+        if url in posted_urls:
+            posted_at = now_kst().isoformat()
+            _queue_update_status(ws_q, row_num, "POSTED", posted_at, "")
+            skip_cnt += 1
+            continue
+
+        try:
+            # 1) 원문 다시 가져오기 + 대표 이미지 추출
+            text_body, img_url = fetch_daum_article_text_and_image(url, orig_title=orig_title)
+            if not text_body:
+                raise ValueError("EMPTY_BODY")
+
+            # 2) 완전 재작성
+            new_title, rewritten = rewrite_news_full_with_openai(
+                text_body,
+                orig_title=orig_title or "스포츠 뉴스",
+                sport_label=sport or "",
+            )
+
+            # 3) 카페 업로드용 HTML(기존 방식 유지)
+            content_html, content_plain = _make_cafe_center_html(rewritten)
+
+            # 4) 이미지 다운로드 → (가능하면) multipart 업로드
+            img_bytes, img_name, img_mime = _download_image_bytes(img_url)
+
+            posted_at = now_kst().isoformat()
+            clubid = NAVER_CAFE_CLUBID
+            menuid = NAVER_CAFE_NEWS_MENU_ID  # ✅ 고정 31
+
+            # 4-1) 이미지 포함 업로드 시도 (실패하면 글만 업로드로 폴백)
+            success = False
+            info = ""
+
+            if img_bytes:
+                success, info = _naver_news_cafe_post_multipart(
+                    new_title,
+                    content_html,
+                    clubid,
+                    menuid,
+                    image_bytes=img_bytes,
+                    filename=img_name or "image.jpg",
+                    mime_type=img_mime or "image/jpeg",
+                )
+                if not success:
+                    print(f"[NEWS_IMAGE] 업로드 실패 → 이미지 없이 재시도: {info}")
+
+            if not success:
+                # 기존 방식 1차(HTML)
+                success, info = _naver_news_cafe_post(new_title, content_html, clubid, menuid)
+
+                # HTML에서 999 등이 뜨면 plain 텍스트로 재시도
+                if (not success) and ("999" in (info or "")):
+                    success, info = _naver_news_cafe_post(new_title, content_plain, clubid, menuid)
+
+            if success:
+                _queue_update_status(ws_q, row_num, "POSTED", posted_at, "")
+                ok_cnt += 1
+
+                if ws_log:
+                    try:
+                        ws_log.append_row([url, new_title, posted_at, "OK", ""], value_input_option="RAW")
+                    except Exception:
+                        pass
+                posted_urls.add(url)
+
+            else:
+                err = _safe_truncate(info, 300)
+                _queue_update_status(ws_q, row_num, "FAIL", "", err)
+                fail_cnt += 1
+
+                if ws_log:
+                    try:
+                        ws_log.append_row([url, orig_title, "", "FAIL", err], value_input_option="RAW")
+                    except Exception:
+                        pass
+
+                # rate limit이면 잠깐 쉬었다가 계속
+                if _news_is_rate_limited(info):
+                    await asyncio.sleep(2.0)
+
+            # 요청 간 약간의 텀(과도한 호출 방지)
+            await asyncio.sleep(float(os.getenv("CAFE_NEWS_UPLOAD_DELAY_SEC", "0.8")))
+
+        except Exception as e:
+            err = _safe_truncate(f"EXC:{e}", 300)
+            _queue_update_status(ws_q, row_num, "FAIL", "", err)
+            fail_cnt += 1
+
+            if ws_log:
+                try:
+                    ws_log.append_row([url, orig_title, "", "FAIL", err], value_input_option="RAW")
+                except Exception:
+                    pass
+
+            await asyncio.sleep(0.5)
+
+    await update.message.reply_text(f"뉴스 카페 업로드 완료: OK {ok_cnt} / FAIL {fail_cnt} / SKIP {skip_cnt}")
+
+
 # 4) 인라인 버튼 콜백 처리 (분석/뉴스 팝업)
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -4999,6 +5796,9 @@ def main():
     app.add_handler(CommandHandler("cafe_baseball_deep", cafe_baseball_deep))
     app.add_handler(CommandHandler("cafe_basketball_deep", cafe_basketball_deep))
     app.add_handler(CommandHandler("cafe_volleyball_deep", cafe_volleyball_deep))
+
+    # 뉴스 큐 → 네이버 카페 업로드 (menuId=31, 뉴스용 토큰)
+    app.add_handler(CommandHandler("cafe_news_upload", cafe_news_upload))
 
     # 네이버 카페 자동 글쓰기    # 분석 시트 부분 초기화 명령어들 (모두 tomorrow 시트 기준)
     app.add_handler(CommandHandler("soccerclean", soccerclean))
