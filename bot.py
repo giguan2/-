@@ -1353,15 +1353,11 @@ def _naver_news_cafe_post_multipart(
 ) -> tuple[bool, str]:
     """뉴스 전용 계정으로 글쓰기 + 대표 이미지 1장 첨부(multipart).
 
-    ⚠️ 이미지 업로드가 실패해도 글 업로드는 재시도할 수 있도록,
-    이 함수는 'multipart 업로드 자체'의 성공/실패만 리턴한다.
-
-    🔥 중요(인코딩 이슈):
-    - multipart 요청에서 subject/content 를 URL 인코딩해서 보내면,
-      일부 케이스에서 네이버가 이를 디코딩하지 않고 그대로 저장하여
-      제목이 '%ED%...' 형태(퍼센트 인코딩 문자열)로 올라가는 문제가 발생할 수 있다.
-    - 따라서 **RAW(UTF-8 문자열) 전송을 1순위**로 시도하고,
-      서버가 이를 거부하는 경우에만 기존 URL 인코딩 방식(UTF-8→MS949 이중 인코딩)을 폴백으로 시도한다.
+    ✅ 인코딩(매우 중요)
+    - 네이버 공식 카페 API 가이드의 multipart 예제는 subject/content 를 **UTF-8로 1회 URL 인코딩(quote)** 해서 전송한다.
+    - (일반 x-www-form-urlencoded 방식은 UTF-8 인코딩 후 MS949로 재 인코딩한 값을 보내야 함)
+    - multipart에서 RAW 문자열을 그대로 보내면 서버 측에서 잘못된 charset으로 해석되어
+      제목/본문이 깨지는 사례가 있어, **RAW 전송은 사용하지 않는다.**
     """
     token = _naver_news_refresh_access_token()
     if not token:
@@ -1372,67 +1368,61 @@ def _naver_news_cafe_post_multipart(
         return False, "NO_IMAGE_BYTES"
 
     subject_raw = (subject or "").strip() or "스포츠 뉴스"
+    subject_raw = _safe_url_decode(subject_raw)
     if len(subject_raw) > 80:
         subject_raw = subject_raw[:80]
 
     content_raw = content or ""
 
-    # (폴백용) 기존 URL 인코딩 방식도 준비
-    use_double = str(os.getenv("NAVER_CAFE_DOUBLE_ENCODE", "1")).strip() not in ("0", "false", "False", "no", "NO")
-    enc_subject = _naver_quote_double(subject_raw) if use_double else _naver_quote_once(subject_raw)
-    enc_content = _naver_quote_double(content_raw) if use_double else _naver_quote_once(content_raw)
+    # multipart 예제 방식(UTF-8 1회 URL 인코딩)
+    enc_subject = _naver_quote_once(subject_raw)
+    enc_content = _naver_quote_once(content_raw)
 
     url = f"https://openapi.naver.com/v1/cafe/{clubid}/menu/{menuid}/articles"
     headers = {"Authorization": f"Bearer {token}"}
 
-    # RAW → (실패 시) ENC 폴백
-    data_variants = [
-        ("RAW", {"subject": subject_raw, "content": content_raw}),
-        ("ENC", {"subject": enc_subject, "content": enc_content}),
-    ]
-
     last_err = ""
-    # 공식 문서/예제에 image[0] 형태와 0(숫자) 형태가 혼재 → 둘 다 시도
-    for _dtype, data in data_variants:
-        for field_name in ("image[0]", "0"):
-            files = {field_name: (filename, image_bytes, mime_type)}
-            try:
-                resp = requests.post(url, headers=headers, data=data, files=files, timeout=60)
 
-                if resp.status_code != 200:
-                    txt = (resp.text or "")[:800]
-                    try:
-                        j = resp.json()
-                        code = j.get("message", {}).get("error", {}).get("code")
-                        msg = j.get("message", {}).get("error", {}).get("msg")
-                        if code or msg:
-                            last_err = f"HTTP_{resp.status_code}:{code}:{msg}"
-                            continue
-                    except Exception:
-                        pass
-                    last_err = f"HTTP_{resp.status_code}:{txt}"
-                    continue
+    # 공식 문서/샘플에 '0' / 'image[0]' 모두 등장 → 둘 다 시도
+    for field_name in ("0", "image[0]"):
+        files = {field_name: (filename, image_bytes, mime_type)}
+        data = {"subject": enc_subject, "content": enc_content}
+        try:
+            resp = requests.post(url, headers=headers, data=data, files=files, timeout=60)
 
-                article_id = ""
+            if resp.status_code != 200:
+                txt = (resp.text or "")[:800]
                 try:
                     j = resp.json()
-                    if isinstance(j, dict):
-                        article_id = (
-                            j.get("message", {}).get("result", {}).get("articleId")
-                            or j.get("result", {}).get("articleId")
-                            or ""
-                        )
+                    code = j.get("message", {}).get("error", {}).get("code")
+                    msg = j.get("message", {}).get("error", {}).get("msg")
+                    if code or msg:
+                        last_err = f"HTTP_{resp.status_code}:{code}:{msg}"
+                        continue
                 except Exception:
                     pass
-
-                return True, (str(article_id) if article_id else "OK")
-
-            except Exception as e:
-                last_err = f"EXC:{e}"
+                last_err = f"HTTP_{resp.status_code}:{txt}"
                 continue
 
-    return False, (last_err or "UPLOAD_FAIL")
+            article_id = ""
+            try:
+                j = resp.json()
+                if isinstance(j, dict):
+                    article_id = (
+                        j.get("message", {}).get("result", {}).get("articleId")
+                        or j.get("result", {}).get("articleId")
+                        or ""
+                    )
+            except Exception:
+                pass
 
+            return True, (str(article_id) if article_id else "OK")
+
+        except Exception as e:
+            last_err = f"EXC:{e}"
+            continue
+
+    return False, (last_err or "UPLOAD_FAIL")
 
 def get_cafe_log_ws():
     """cafe_log 워크시트 반환(없으면 생성 + 헤더 세팅)."""
@@ -4866,6 +4856,36 @@ def _news_is_rate_limited(err: str) -> bool:
     return ("429" in s) or ("rate" in s) or ("limit" in s) or ("too many" in s)
 
 
+def _normalize_daum_image_url(img_url: str) -> str:
+    """다음(daumcdn) 대표 이미지 URL을 가능한 한 '원본'에 가깝게 정규화한다.
+
+    - Daum은 og:image 등에 thumb 프록시 URL을 넣는 경우가 있고, 이때 querystring의 fname= 에 원본 URL이 들어있다.
+      예) https://img1.daumcdn.net/thumb/.../?fname=https%3A%2F%2Ft1.daumcdn.net%2F...
+    - 이런 케이스는 fname 값을 unquote하여 원본 URL로 교체한다.
+    - 실패하면 원래 URL을 그대로 반환한다.
+    """
+    u = (img_url or "").strip()
+    if not u:
+        return ""
+
+    if u.startswith("//"):
+        u = "https:" + u
+
+    # Daum thumb proxy → 원본(fname) 추출
+    try:
+        m = re.search(r"[?&]fname=([^&]+)", u)
+        if m:
+            fname = (unquote_plus(m.group(1)) or "").strip()
+            if fname.startswith("//"):
+                fname = "https:" + fname
+            if fname.startswith("http://") or fname.startswith("https://"):
+                return fname
+    except Exception:
+        pass
+
+    return u
+
+
 def fetch_daum_article_text_and_image(url: str, orig_title: str = "") -> tuple[str, str]:
     """다음스포츠 기사 URL에서 본문 텍스트 + 대표 이미지 URL(가능하면) 추출."""
     ua = {"User-Agent": "Mozilla/5.0"}
@@ -4893,6 +4913,10 @@ def fetch_daum_article_text_and_image(url: str, orig_title: str = "") -> tuple[s
                         img_url = urljoin(url, img_url)
         except Exception:
             pass
+
+
+    # 대표 이미지 URL 정규화(thumb → 원본)
+    img_url = _normalize_daum_image_url(img_url)
 
     # 2) 본문 추출(크롤링 로직 재사용)
     body_el = (
