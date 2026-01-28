@@ -1441,9 +1441,14 @@ def _naver_news_cafe_post_multipart(
     - 제목/본문 한글이 %ED%.. 형태(퍼센트 문자열)로 올라가거나, 깨지는 문제 방지
     - 이미지 업로드 실패 시에도 글은 이미지 없이 업로드(fallback)되도록(상위 로직에서 처리)
 
-    ✅ 네이버 개발자센터 공식 예제(카페 Multipart 글쓰기)는
-    subject/content 값을 UTF-8로 URL 인코딩(1회)해서 전송합니다.
-    (일반 글쓰기(x-www-form-urlencoded)와 달리, multipart는 'MS949 이중 인코딩'을 쓰지 않습니다.)
+    ✅ 구현 포인트(실전 안정화)
+    1) 네이버 개발자센터 공식 예제 방식대로 subject/content 값을 UTF-8 URL 인코딩(1회)해서 전송(ENCODED_UTF8)
+       - 일부 환경에서 RAW가 더 잘 먹는 케이스가 있어 RAW_UTF8도 추가로 시도(환경변수로 순서 변경 가능)
+    2) 파일 파트 필드명: 공식 예제에 따라 'image'를 우선 사용, 그 외 'image[0]', '0'도 폴백 시도
+    3) 403 + code=999(연속등록/일시적 제한) 계열은 짧게 백오프 후 재시도
+    4) 이미지 용량/포맷 이슈(webp/avif/과대용량 등)로 multipart가 실패할 수 있어
+       - 1차: 원본 업로드 시도
+       - 2차: (필요 시) 비율 유지 리사이즈 + JPEG 재인코딩(자르지 않음) 후 재시도
     """
     token = _naver_news_refresh_access_token()
     if not token:
@@ -1462,7 +1467,17 @@ def _naver_news_cafe_post_multipart(
     content_raw = _naver_clean_text(content or "")
 
     url = f"https://openapi.naver.com/v1/cafe/{clubid}/menu/{menuid}/articles"
-    headers = {"Authorization": f"Bearer {token}"}
+
+    # ✅ 헤더(Authorization은 필수)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "Mozilla/5.0",
+    }
+    # (옵션) 일부 샘플(C#)에서 Client ID/Secret 헤더도 함께 보내는 케이스가 있어 같이 넣어 둠(무해)
+    if NAVER_NEWS_CLIENT_ID:
+        headers["X-Naver-Client-Id"] = NAVER_NEWS_CLIENT_ID
+    if NAVER_NEWS_CLIENT_SECRET:
+        headers["X-Naver-Client-Secret"] = NAVER_NEWS_CLIENT_SECRET
 
     from urllib.parse import quote
 
@@ -1475,55 +1490,175 @@ def _naver_news_cafe_post_multipart(
 
     # 환경에 따라 raw가 더 잘 먹는 케이스가 있어 순서 토글 가능
     prefer_raw = (os.getenv("NAVER_NEWS_MULTIPART_PREFER_RAW") or "0").strip().lower() in ("1", "true", "yes", "y", "on")
-    data_variants = [("ENCODED_UTF8", data_encoded), ("RAW_UTF8", data_raw)]
+    data_variants: list[tuple[str, dict]] = [("ENCODED_UTF8", data_encoded), ("RAW_UTF8", data_raw)]
     if prefer_raw:
         data_variants = [("RAW_UTF8", data_raw), ("ENCODED_UTF8", data_encoded)]
-
-    last_err = ""
 
     # ✅ 파일 파트 헤더(공식 예제에 Expires: 0 사용 사례가 있어 안전하게 포함)
     part_headers = {"Expires": "0"}
 
-    # 공식 문서/예제는 field name 'image' (Python/Node), 일부 예제는 '0'(Java)도 보임 → 순차 시도
-    for variant_name, data in data_variants:
-        for field_name in ("image", "0", "image[0]"):
-            files = [(field_name, (filename, image_bytes, mime_type, part_headers))]
-            try:
-                resp = requests.post(url, headers=headers, data=data, files=files, timeout=60)
+    # rate limit 백오프
+    backoff_sec = float(os.getenv("NAVER_NEWS_MULTIPART_BACKOFF_SEC", "15"))
+    max_retries = int(os.getenv("NAVER_NEWS_MULTIPART_RETRIES", "2"))
+    import time as _time
 
-                if resp.status_code != 200:
-                    txt = (resp.text or "")[:800]
+    def _parse_err(resp: requests.Response) -> tuple[str, str, str]:
+        """(status, code, msg)"""
+        status = str(resp.status_code)
+        code = ""
+        msg = ""
+        try:
+            j = resp.json()
+            code = (j.get("message", {}).get("error", {}).get("code") or "").strip()
+            msg = (j.get("message", {}).get("error", {}).get("msg") or "").strip()
+        except Exception:
+            pass
+        if not msg:
+            msg = ((resp.text or "")[:300]).strip()
+        return status, code, msg
+
+    def _is_rate_limited(status: str, code: str, msg: str) -> bool:
+        # 403 + code=999가 가장 흔한 케이스(연속등록/일시적 제한)
+        if status == "403" and (code == "999" or "999" in code):
+            return True
+        # 메시지 기반 폴백
+        m = (msg or "")
+        if ("연속" in m and "등록" in m) or ("잠시" in m and "후" in m) or ("오류가 발생" in m):
+            return True
+        return False
+
+    def _shrink_image_for_naver(data: bytes, mime: str) -> tuple[bytes, str, str]:
+        """비율 유지(자르지 않음)로 리사이즈 + JPEG 재인코딩하여 용량을 줄인다.
+        실패 시 원본 그대로 반환.
+        """
+        if not data:
+            return data, filename, mime_type
+
+        # 이미 충분히 작고, 포맷도 안전하면 그대로
+        max_bytes = int(os.getenv("NAVER_NEWS_IMAGE_MAX_BYTES", "1800000"))  # 1.8MB 기본
+        if (len(data) <= max_bytes) and (mime in ("image/jpeg", "image/png")):
+            return data, filename, mime
+
+        try:
+            from PIL import Image  # type: ignore
+            from io import BytesIO
+
+            im = Image.open(BytesIO(data))
+            im.load()
+
+            # 투명도 처리(흰 배경)
+            if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+                im = im.convert("RGBA")
+                bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
+                bg.paste(im, mask=im.split()[-1])
+                im = bg.convert("RGB")
+            else:
+                im = im.convert("RGB")
+
+            # 최대 변 길이 제한(자르지 않고 축소만)
+            max_dim = int(os.getenv("NAVER_NEWS_IMAGE_MAX_DIM", "1600"))  # 기본 1600px
+            w, h = im.size
+            mx = max(w, h)
+            if mx > max_dim and mx > 0:
+                scale = max_dim / float(mx)
+                nw = max(1, int(round(w * scale)))
+                nh = max(1, int(round(h * scale)))
+                im = im.resize((nw, nh), Image.LANCZOS)
+
+            # 품질을 단계적으로 낮추며 max_bytes 이하로 맞춘다
+            qualities = [92, 88, 85, 82, 78, 74, 70, 65]
+            best = b""
+            for q in qualities:
+                out = BytesIO()
+                im.save(out, format="JPEG", quality=q, optimize=True, progressive=True)
+                b = out.getvalue()
+                best = b
+                if len(b) <= max_bytes:
+                    break
+
+            # 너무 큰 경우 max_dim을 더 줄여 1회 더 시도
+            if best and len(best) > max_bytes:
+                max_dim2 = int(os.getenv("NAVER_NEWS_IMAGE_MAX_DIM_FALLBACK", "1280"))
+                if max_dim2 < max_dim and max(im.size) > max_dim2:
+                    w2, h2 = im.size
+                    mx2 = max(w2, h2)
+                    if mx2 > 0:
+                        scale2 = max_dim2 / float(mx2)
+                        nw2 = max(1, int(round(w2 * scale2)))
+                        nh2 = max(1, int(round(h2 * scale2)))
+                        im2 = im.resize((nw2, nh2), Image.LANCZOS)
+                        out2 = BytesIO()
+                        im2.save(out2, format="JPEG", quality=82, optimize=True, progressive=True)
+                        best2 = out2.getvalue()
+                        if best2:
+                            best = best2
+
+            if best:
+                return best, "news_image.jpg", "image/jpeg"
+        except Exception:
+            pass
+
+        return data, filename, mime
+
+    def _attempt_post(img_b: bytes, img_fn: str, img_mime: str) -> tuple[bool, str]:
+        last_err = ""
+        # field name 우선순위: 공식 예제 기반으로 image → image[0] → 0
+        for variant_name, data in data_variants:
+            for field_name in ("image", "image[0]", "0"):
+                files = [(field_name, (img_fn, img_b, img_mime, part_headers))]
+
+                # 같은 조합으로 rate-limit 재시도
+                for attempt in range(max_retries + 1):
                     try:
-                        j = resp.json()
-                        code = j.get("message", {}).get("error", {}).get("code")
-                        msg = j.get("message", {}).get("error", {}).get("msg")
-                        if code or msg:
-                            last_err = f"{variant_name}:{field_name}:HTTP_{resp.status_code}:{code}:{msg}"
-                            continue
-                    except Exception:
-                        pass
-                    last_err = f"{variant_name}:{field_name}:HTTP_{resp.status_code}:{txt}"
-                    continue
+                        resp = requests.post(url, headers=headers, data=data, files=files, timeout=70)
 
-                article_id = ""
-                try:
-                    j = resp.json()
-                    if isinstance(j, dict):
-                        article_id = (
-                            j.get("message", {}).get("result", {}).get("articleId")
-                            or j.get("result", {}).get("articleId")
-                            or ""
-                        )
-                except Exception:
-                    pass
+                        if resp.status_code != 200:
+                            st, code, msg = _parse_err(resp)
+                            last_err = f"{variant_name}:{field_name}:HTTP_{st}:{code}:{msg}"
 
-                return True, (str(article_id) if article_id else "OK")
+                            if _is_rate_limited(st, code, msg) and attempt < max_retries:
+                                sleep_s = backoff_sec * (attempt + 1)
+                                print(f"[NEWS_IMAGE] rate-limit 감지({st}/{code}). {sleep_s:.0f}s 대기 후 재시도...")
+                                _time.sleep(sleep_s)
+                                continue
 
-            except Exception as e:
-                last_err = f"{variant_name}:{field_name}:EXC:{e}"
-                continue
+                            break  # 다음 field/variant 시도
+                        # success
+                        article_id = ""
+                        try:
+                            j = resp.json()
+                            if isinstance(j, dict):
+                                article_id = (
+                                    j.get("message", {}).get("result", {}).get("articleId")
+                                    or j.get("result", {}).get("articleId")
+                                    or ""
+                                )
+                        except Exception:
+                            pass
 
-    return False, (last_err or "UPLOAD_FAIL")
+                        return True, (str(article_id) if article_id else "OK")
+
+                    except Exception as e:
+                        last_err = f"{variant_name}:{field_name}:EXC:{e}"
+                        break
+
+        return False, (last_err or "UPLOAD_FAIL")
+
+    # 1) 원본 업로드 1차
+    ok, info = _attempt_post(image_bytes, filename or "image.jpg", mime_type or "image/jpeg")
+    if ok:
+        return True, info
+
+    # 2) (필요 시) 축소/재인코딩 버전으로 2차(원본을 자르지 않고 '비율 유지 축소'만)
+    small_b, small_fn, small_mime = _shrink_image_for_naver(image_bytes, mime_type or "")
+    if small_b and (small_b != image_bytes):
+        ok2, info2 = _attempt_post(small_b, small_fn, small_mime)
+        if ok2:
+            return True, info2
+        # 2차도 실패하면 2차 에러를 더 우선 노출
+        return False, info2
+
+    return False, info
 
 
 def get_cafe_log_ws():
@@ -5671,7 +5806,7 @@ def _make_cafe_center_html(text_body: str, raw_prefix_html: str = "") -> tuple[s
 def _queue_update_status(ws_q, row_num: int, status: str, posted_at: str = "", error: str = "") -> None:
     """news_cafe_queue의 해당 행 상태 업데이트."""
     try:
-        ws_q.update(f"E{row_num}:G{row_num}", [[status, posted_at, error]], value_input_option="RAW")
+        ws_q.update(range_name=f"E{row_num}:G{row_num}", values=[[status, posted_at, error]], value_input_option="RAW")
         return
     except Exception:
         pass
