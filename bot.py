@@ -1437,10 +1437,13 @@ def _naver_news_cafe_post_multipart(
 ) -> tuple[bool, str]:
     """뉴스 전용 계정으로 글쓰기 + 이미지 1장 첨부(multipart).
 
-    ✅ 목표:
-    - 제목이 '%ED%..' 처럼 URL 인코딩 문자열로 올라가는 문제 방지 → subject/content는 "RAW UTF-8" 우선 전송
-    - 한글/줄바꿈/HTML 깨짐 없이 업로드
-    - 파일 필드명은 환경/예제 차이를 고려해 순차 시도(image, image[0], 0)
+    ✅ 목표
+    - 제목/본문 한글이 %ED%.. 형태(퍼센트 문자열)로 올라가거나, 깨지는 문제 방지
+    - 이미지 업로드 실패 시에도 글은 이미지 없이 업로드(fallback)되도록(상위 로직에서 처리)
+
+    ✅ 네이버 개발자센터 공식 예제(카페 Multipart 글쓰기)는
+    subject/content 값을 UTF-8로 URL 인코딩(1회)해서 전송합니다.
+    (일반 글쓰기(x-www-form-urlencoded)와 달리, multipart는 'MS949 이중 인코딩'을 쓰지 않습니다.)
     """
     token = _naver_news_refresh_access_token()
     if not token:
@@ -1450,38 +1453,41 @@ def _naver_news_cafe_post_multipart(
     if not image_bytes:
         return False, "NO_IMAGE_BYTES"
 
-    subject_raw = _naver_clean_text(_safe_url_decode(subject) or "스포츠 뉴스")
+    # ✅ 제목은 항상 사람이 읽을 수 있는 문자열로 정리
+    subject_raw = _naver_clean_text(_safe_url_decode(subject) or "스포츠 뉴스").strip()
     if len(subject_raw) > 80:
         subject_raw = subject_raw[:80]
 
-    # content는 HTML 포함 문자열이므로 _naver_clean_text로만 1차 정리(제어문자 제거)
+    # ✅ content는 HTML 포함 문자열이므로 제어문자만 제거(태그 유지)
     content_raw = _naver_clean_text(content or "")
 
     url = f"https://openapi.naver.com/v1/cafe/{clubid}/menu/{menuid}/articles"
     headers = {"Authorization": f"Bearer {token}"}
 
+    from urllib.parse import quote
+
+    # ✅ 기본: UTF-8 URL 인코딩 1회 (공식 예제 방식)
+    subject_enc = quote(subject_raw, safe="", encoding="utf-8", errors="strict")
+    content_enc = quote(content_raw, safe="", encoding="utf-8", errors="strict")
+
+    data_encoded = {"subject": subject_enc, "content": content_enc}
+    data_raw = {"subject": subject_raw, "content": content_raw}
+
+    # 환경에 따라 raw가 더 잘 먹는 케이스가 있어 순서 토글 가능
+    prefer_raw = (os.getenv("NAVER_NEWS_MULTIPART_PREFER_RAW") or "0").strip().lower() in ("1", "true", "yes", "y", "on")
+    data_variants = [("ENCODED_UTF8", data_encoded), ("RAW_UTF8", data_raw)]
+    if prefer_raw:
+        data_variants = [("RAW_UTF8", data_raw), ("ENCODED_UTF8", data_encoded)]
+
     last_err = ""
 
-    # ✅ 가장 우선: RAW 전송(서버가 별도 디코딩을 기대하지 않도록)
-    #    (이 방식이 제목 URL 인코딩 문자열 업로드 문제를 가장 확실하게 막는다.)
-    data_variants = [
-        {"subject": subject_raw, "content": content_raw},
-    ]
+    # ✅ 파일 파트 헤더(공식 예제에 Expires: 0 사용 사례가 있어 안전하게 포함)
+    part_headers = {"Expires": "0"}
 
-    # (옵션) 만약 환경에 따라 RAW가 실패한다면 URL 인코딩을 fallback으로 켤 수 있게 한다.
-    # 기본값 OFF(0). 켜려면 NAVER_NEWS_MULTIPART_ALLOW_URLENCODE_FALLBACK=1
-    allow_urlenc = (os.getenv("NAVER_NEWS_MULTIPART_ALLOW_URLENCODE_FALLBACK") or "0").strip() not in ("0", "false", "False", "no", "NO")
-    if allow_urlenc:
-        from urllib.parse import quote_plus
-        data_variants.append({
-            "subject": quote_plus(subject_raw, safe="", encoding="utf-8", errors="strict"),
-            "content": quote_plus(content_raw, safe="", encoding="utf-8", errors="strict"),
-        })
-
-    for data in data_variants:
-        # 공식 문서/예제는 field name 'image'를 사용. 환경별로 'image[0]' / '0'도 보이므로 순차 시도.
-        for field_name in ("image", "image[0]", "0"):
-            files = [(field_name, (filename, image_bytes, mime_type))]
+    # 공식 문서/예제는 field name 'image' (Python/Node), 일부 예제는 '0'(Java)도 보임 → 순차 시도
+    for variant_name, data in data_variants:
+        for field_name in ("image", "0", "image[0]"):
+            files = [(field_name, (filename, image_bytes, mime_type, part_headers))]
             try:
                 resp = requests.post(url, headers=headers, data=data, files=files, timeout=60)
 
@@ -1492,11 +1498,11 @@ def _naver_news_cafe_post_multipart(
                         code = j.get("message", {}).get("error", {}).get("code")
                         msg = j.get("message", {}).get("error", {}).get("msg")
                         if code or msg:
-                            last_err = f"HTTP_{resp.status_code}:{code}:{msg}"
+                            last_err = f"{variant_name}:{field_name}:HTTP_{resp.status_code}:{code}:{msg}"
                             continue
                     except Exception:
                         pass
-                    last_err = f"HTTP_{resp.status_code}:{txt}"
+                    last_err = f"{variant_name}:{field_name}:HTTP_{resp.status_code}:{txt}"
                     continue
 
                 article_id = ""
@@ -1514,10 +1520,11 @@ def _naver_news_cafe_post_multipart(
                 return True, (str(article_id) if article_id else "OK")
 
             except Exception as e:
-                last_err = f"EXC:{e}"
+                last_err = f"{variant_name}:{field_name}:EXC:{e}"
                 continue
 
     return False, (last_err or "UPLOAD_FAIL")
+
 
 def get_cafe_log_ws():
     """cafe_log 워크시트 반환(없으면 생성 + 헤더 세팅)."""
@@ -5088,10 +5095,16 @@ def fetch_daum_article_text_and_image(url: str, orig_title: str = "") -> tuple[s
 def _download_image_bytes(img_url: str, *, referer: str = "") -> tuple[bytes, str, str]:
     """이미지 URL을 다운로드해서 (bytes, filename, mime_type) 반환. 실패하면 (b"", "", "").
 
-    ✅ 다운로드 안정성:
+    ✅ 다운로드 안정성
     - User-Agent/Referer 포함
     - daumcdn thumb URL(?fname=...)이면 원본 URL을 우선 시도하고, 실패 시 thumb로 폴백
     - Content-Type이 image/*가 아니면 '파일 시그니처'로 2차 판정(HTML 다운로드 방지)
+
+    ✅ 카페 API 업로드 호환성
+    - 일부 CDN은 Accept 헤더에 webp/avif가 포함되면 webp로 내려주는 경우가 있습니다.
+      네이버 카페 Open API multipart 이미지 첨부는 JPEG/PNG 계열이 가장 안정적이라,
+      기본 Accept는 webp/avif를 광고하지 않도록 설정합니다.
+    - 혹시 webp로 받아진 경우에는 (가능하면) JPEG로 변환해서 반환합니다.
     """
     if not img_url:
         return b"", "", ""
@@ -5140,7 +5153,8 @@ def _download_image_bytes(img_url: str, *, referer: str = "") -> tuple[bytes, st
 
     headers = {
         "User-Agent": "Mozilla/5.0",
-        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        # ✅ webp/avif를 광고하지 않음(= JPG/PNG로 받게 유도)
+        "Accept": "image/jpeg,image/png,image/gif,image/*;q=0.8,*/*;q=0.5",
         "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
     }
     if referer:
@@ -5157,7 +5171,34 @@ def _download_image_bytes(img_url: str, *, referer: str = "") -> tuple[bytes, st
             return "image/gif"
         if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
             return "image/webp"
+        # AVIF/HEIC 간단 시그니처(ftyp) 탐지
+        if len(data) >= 16 and data[4:8] == b"ftyp":
+            brand = data[8:12]
+            if brand in (b"avif", b"avis"):
+                return "image/avif"
+            if brand in (b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1"):
+                return "image/heic"
         return ""
+
+    def _convert_webp_to_jpeg(data: bytes) -> bytes:
+        """webp 등을 JPEG로 변환. Pillow가 없으면 b'' 반환."""
+        try:
+            from PIL import Image  # type: ignore
+            from io import BytesIO
+            im = Image.open(BytesIO(data))
+            # 투명도 처리
+            if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+                im = im.convert("RGBA")
+                bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
+                bg.paste(im, mask=im.split()[-1])
+                im = bg.convert("RGB")
+            else:
+                im = im.convert("RGB")
+            out = BytesIO()
+            im.save(out, format="JPEG", quality=92, optimize=True)
+            return out.getvalue()
+        except Exception:
+            return b""
 
     last_err = ""
     for u in cand2:
@@ -5180,14 +5221,21 @@ def _download_image_bytes(img_url: str, *, referer: str = "") -> tuple[bytes, st
                     continue
                 content_type = sniff
 
+            # ✅ webp/avif 등은 네이버 카페 업로드가 실패할 수 있어 가능하면 jpeg로 변환
+            if content_type in ("image/webp", "image/avif", "image/heic"):
+                conv = _convert_webp_to_jpeg(data)
+                if conv:
+                    data = conv
+                    content_type = "image/jpeg"
+
             # 확장자 결정
             ext = ".jpg"
             if "png" in content_type:
                 ext = ".png"
-            elif "webp" in content_type:
-                ext = ".webp"
             elif "gif" in content_type:
                 ext = ".gif"
+            else:
+                ext = ".jpg"
 
             filename = f"news_image{ext}"
             return data, filename, content_type
@@ -5197,6 +5245,7 @@ def _download_image_bytes(img_url: str, *, referer: str = "") -> tuple[bytes, st
 
     print(f"[NEWS_IMAGE] download 실패: {img_url} / last_err={last_err}")
     return b"", "", ""
+
 
 def _needs_url_decode(s: str) -> bool:
     s = s or ""
