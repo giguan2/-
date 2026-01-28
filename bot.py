@@ -1351,13 +1351,11 @@ def _naver_news_cafe_post_multipart(
     filename: str = "image.jpg",
     mime_type: str = "image/jpeg",
 ) -> tuple[bool, str]:
-    """뉴스 전용 계정으로 글쓰기 + 대표 이미지 1장 첨부(multipart).
+    """뉴스 전용 계정으로 글쓰기 + 이미지 1장 첨부(multipart).
 
-    ✅ 인코딩(매우 중요)
-    - 네이버 공식 카페 API 가이드의 multipart 예제는 subject/content 를 **UTF-8로 1회 URL 인코딩(quote)** 해서 전송한다.
-    - (일반 x-www-form-urlencoded 방식은 UTF-8 인코딩 후 MS949로 재 인코딩한 값을 보내야 함)
-    - multipart에서 RAW 문자열을 그대로 보내면 서버 측에서 잘못된 charset으로 해석되어
-      제목/본문이 깨지는 사례가 있어, **RAW 전송은 사용하지 않는다.**
+    ✅ 인코딩 주의:
+    - NAVER Developers 공식 예제에서 multipart 글쓰기 시에도 subject/content를 URL 인코딩(UTF-8)하여 전송한다.
+    - 이 방식으로 보내면 subject/content 값이 ASCII(%XX)로만 구성되어, 서버측 문자셋 해석 문제(모지박/깨짐)를 크게 줄일 수 있다.
     """
     token = _naver_news_refresh_access_token()
     if not token:
@@ -1368,25 +1366,25 @@ def _naver_news_cafe_post_multipart(
         return False, "NO_IMAGE_BYTES"
 
     subject_raw = (subject or "").strip() or "스포츠 뉴스"
-    subject_raw = _safe_url_decode(subject_raw)
     if len(subject_raw) > 80:
         subject_raw = subject_raw[:80]
 
     content_raw = content or ""
 
-    # multipart 예제 방식(UTF-8 1회 URL 인코딩)
-    enc_subject = _naver_quote_once(subject_raw)
-    enc_content = _naver_quote_once(content_raw)
+    # multipart에서는 '단일 UTF-8 URL 인코딩'이 가장 안전(공식 예제 방식)
+    from urllib.parse import quote
+    enc_subject = quote(_naver_clean_text(subject_raw), safe="", encoding="utf-8", errors="strict")
+    enc_content = quote(_naver_clean_text(content_raw), safe="", encoding="utf-8", errors="strict")
+
+    data = {"subject": enc_subject, "content": enc_content}
 
     url = f"https://openapi.naver.com/v1/cafe/{clubid}/menu/{menuid}/articles"
     headers = {"Authorization": f"Bearer {token}"}
 
     last_err = ""
-
-    # 공식 문서/샘플에 '0' / 'image[0]' 모두 등장 → 둘 다 시도
-    for field_name in ("0", "image[0]"):
-        files = {field_name: (filename, image_bytes, mime_type)}
-        data = {"subject": enc_subject, "content": enc_content}
+    # 공식 문서/예제는 field name 'image'를 사용. 환경별로 'image[0]' / '0'도 보이므로 순차 시도.
+    for field_name in ("image", "image[0]", "0"):
+        files = [(field_name, (filename, image_bytes, mime_type))]
         try:
             resp = requests.post(url, headers=headers, data=data, files=files, timeout=60)
 
@@ -1423,6 +1421,7 @@ def _naver_news_cafe_post_multipart(
             continue
 
     return False, (last_err or "UPLOAD_FAIL")
+
 
 def get_cafe_log_ws():
     """cafe_log 워크시트 반환(없으면 생성 + 헤더 세팅)."""
@@ -4856,36 +4855,6 @@ def _news_is_rate_limited(err: str) -> bool:
     return ("429" in s) or ("rate" in s) or ("limit" in s) or ("too many" in s)
 
 
-def _normalize_daum_image_url(img_url: str) -> str:
-    """다음(daumcdn) 대표 이미지 URL을 가능한 한 '원본'에 가깝게 정규화한다.
-
-    - Daum은 og:image 등에 thumb 프록시 URL을 넣는 경우가 있고, 이때 querystring의 fname= 에 원본 URL이 들어있다.
-      예) https://img1.daumcdn.net/thumb/.../?fname=https%3A%2F%2Ft1.daumcdn.net%2F...
-    - 이런 케이스는 fname 값을 unquote하여 원본 URL로 교체한다.
-    - 실패하면 원래 URL을 그대로 반환한다.
-    """
-    u = (img_url or "").strip()
-    if not u:
-        return ""
-
-    if u.startswith("//"):
-        u = "https:" + u
-
-    # Daum thumb proxy → 원본(fname) 추출
-    try:
-        m = re.search(r"[?&]fname=([^&]+)", u)
-        if m:
-            fname = (unquote_plus(m.group(1)) or "").strip()
-            if fname.startswith("//"):
-                fname = "https:" + fname
-            if fname.startswith("http://") or fname.startswith("https://"):
-                return fname
-    except Exception:
-        pass
-
-    return u
-
-
 def fetch_daum_article_text_and_image(url: str, orig_title: str = "") -> tuple[str, str]:
     """다음스포츠 기사 URL에서 본문 텍스트 + 대표 이미지 URL(가능하면) 추출."""
     ua = {"User-Agent": "Mozilla/5.0"}
@@ -4913,10 +4882,6 @@ def fetch_daum_article_text_and_image(url: str, orig_title: str = "") -> tuple[s
                         img_url = urljoin(url, img_url)
         except Exception:
             pass
-
-
-    # 대표 이미지 URL 정규화(thumb → 원본)
-    img_url = _normalize_daum_image_url(img_url)
 
     # 2) 본문 추출(크롤링 로직 재사용)
     body_el = (
@@ -5371,8 +5336,13 @@ def rewrite_news_full_with_openai(
     return (_safe_url_decode(orig_title or "스포츠 뉴스"), _clean_news_rewrite_text_keep_newlines(body_fb))
 
 
-def _make_cafe_center_html(text_body: str) -> tuple[str, str]:
-    """기존 카페 업로드 방식과 동일한 깨짐 방지/줄바꿈을 유지하기 위해 center+br 변환."""
+def _make_cafe_center_html(text_body: str, raw_prefix_html: str = "") -> tuple[str, str]:
+    """카페 업로드용 HTML 생성.
+
+    - 기존 방식(줄바꿈 유지 + 깨짐 방지)을 그대로 사용하되,
+    - raw_prefix_html(예: 이미지 태그 블록)을 <center> 내부 최상단에 "그대로" 삽입할 수 있게 확장.
+      (text_body는 안전하게 escape 처리)
+    """
     content_norm = (text_body or "").strip()
 
     # normalize newlines + strip simple html if any
@@ -5385,7 +5355,14 @@ def _make_cafe_center_html(text_body: str) -> tuple[str, str]:
     safe = html.escape(content_norm)
     lines = safe.split("\n") if safe else [""]
     html_lines = [(ln if ln.strip() else "&nbsp;") for ln in lines]
-    content_html = "<center>" + "<br>".join(html_lines) + "</center>"
+
+    prefix = (raw_prefix_html or "").strip()
+    if prefix:
+        # prefix가 이미 <br>로 끝나지 않으면 한 줄 띄우기
+        if not re.search(r"<br\s*/?>\s*$", prefix, flags=re.I):
+            prefix += "<br>"
+
+    content_html = "<center>" + prefix + "<br>".join(html_lines) + "</center>"
     return content_html, content_norm
 
 
@@ -5416,7 +5393,12 @@ def _queue_update_status(ws_q, row_num: int, status: str, posted_at: str = "", e
 
 
 async def cafe_news_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/cafe_news_upload [N|latest|all] : news_cafe_queue의 NEW 항목을 뉴스 전용 계정으로 menuId=31에 업로드."""
+    """/cafe_news_upload [N|latest|all] : news_cafe_queue의 NEW 항목을 뉴스 전용 계정으로 menuId=31에 업로드.
+
+    추가 기능:
+    - 주제 중복 필터(제목 유사도 → 본문 첫부분 해시)
+    - 대표 이미지가 있을 경우 본문 최상단에 1장 삽입 + 가운데 정렬(#0 플레이스홀더)
+    """
     if not is_admin(update):
         await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
         return
@@ -5433,7 +5415,6 @@ async def cafe_news_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("news_cafe_queue 시트를 열지 못했습니다.")
         return
 
-    vals = []
     try:
         vals = ws_q.get_all_values()
     except Exception as e:
@@ -5457,8 +5438,9 @@ async def cafe_news_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     idx_title = _hidx("title", 2)
     idx_url = _hidx("url", 3)
     idx_status = _hidx("status", 4)
+    idx_error = _hidx("error", 6)
 
-    # args 파싱
+    # ── args 파싱
     n = 5
     mode_all = False
     if context.args:
@@ -5475,27 +5457,121 @@ async def cafe_news_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 n = 5
 
+    # ── 유틸: queue error만 갱신(상태는 변경하지 않음)
+    def _queue_append_error_only(row_num: int, reason: str, current_error: str = "") -> None:
+        try:
+            old = (current_error or "").strip()
+            if reason and (reason in old):
+                return
+            new_err = reason if not old else (old + " | " + reason)
+            ws_q.update_cell(row_num, idx_error + 1, new_err)
+        except Exception as e:
+            print(f"[GSHEET] queue error update fail row={row_num}: {e}")
+
+    # ── 1차: 제목 유사도 기반 주제 중복 필터
+    STOPWORDS = {
+        "단독", "속보", "공식", "입장", "전망", "인터뷰", "전했다", "밝혔다", "밝혔다고", "말했다", "말한",
+        "알렸다", "발표", "확정", "오피셜", "논란", "충격", "반전", "단신", "기자",
+        # 자주 붙는 군더더기
+        "오늘", "어제", "내일", "이번", "최근", "최신", "현지", "보도", "소식", "이슈",
+    }
+
+    def _norm_title_for_dedup(t: str) -> str:
+        s = _safe_url_decode(t or "")
+        s = s.strip()
+        if not s:
+            return ""
+        # 괄호/대괄호/따옴표 내용 포함 통째로 제거(잡음 제거)
+        s = re.sub(r"\([^)]*\)", " ", s)
+        s = re.sub(r"\[[^\]]*\]", " ", s)
+        s = re.sub(r"[\"'“”‘’]", " ", s)
+
+        # 날짜/숫자 제거
+        s = re.sub(r"\d{1,4}[./-]\d{1,2}[./-]\d{1,2}", " ", s)  # 2026.01.28 등
+        s = re.sub(r"\d+", " ", s)
+
+        # 특수문자 제거(한글/영문/공백만 남김)
+        s = re.sub(r"[^0-9A-Za-z가-힣\s]", " ", s)
+
+        # 다중 공백 정리
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    def _title_tokens(t: str) -> list[str]:
+        s = _norm_title_for_dedup(t)
+        if not s:
+            return []
+        toks = []
+        for w in s.split():
+            if w in STOPWORDS:
+                continue
+            # 너무 짧은 토큰은 잡음으로 처리
+            if len(w) <= 1:
+                continue
+            toks.append(w)
+        return toks
+
+    def _title_similarity(a: dict, b: dict) -> float:
+        """difflib + Jaccard 중 큰 값을 사용."""
+        ta = a.get("_toks") or []
+        tb = b.get("_toks") or []
+        sa = " ".join(ta)
+        sb = " ".join(tb)
+        if not sa or not sb:
+            return 0.0
+
+        try:
+            import difflib
+            seq = difflib.SequenceMatcher(None, sa, sb).ratio()
+        except Exception:
+            seq = 0.0
+
+        set_a = set(ta)
+        set_b = set(tb)
+        inter = len(set_a & set_b)
+        uni = len(set_a | set_b)
+        jac = (inter / uni) if uni else 0.0
+
+        return max(seq, jac)
+
+    title_thr = float(os.getenv("NEWS_DUP_TITLE_SIM_THRESHOLD", "0.8"))
+
+    # ── NEW 로드(이미 DUP 표시된 건은 아예 처리 대상에서 제외)
     items = []
+    total_new = 0
     for i, row in enumerate(vals[1:], start=2):  # row number in sheet
         st = (row[idx_status] if len(row) > idx_status else "").strip().upper()
         if st != "NEW":
             continue
+        total_new += 1
+
         url = _normalize_news_url(row[idx_url] if len(row) > idx_url else "")
         if not url:
             continue
+
         created_at = (row[idx_created] if len(row) > idx_created else "").strip()
         sport = (row[idx_sport] if len(row) > idx_sport else "").strip()
-        title = (row[idx_title] if len(row) > idx_title else "").strip()
-        items.append({
-            "row": i,
-            "createdAt": created_at,
-            "sport": sport,
-            "title": title,
-            "url": url,
-        })
+        title_raw = (row[idx_title] if len(row) > idx_title else "").strip()
+        title = _safe_url_decode(title_raw)
+        err = (row[idx_error] if len(row) > idx_error else "").strip()
+
+        # 이미 중복(SKIP)로 표시한 항목은 재처리하지 않음(상태는 NEW 유지)
+        if err.startswith("DUP_TOPIC_TITLE") or err.startswith("DUP_TOPIC_BODY"):
+            continue
+
+        items.append(
+            {
+                "row": i,
+                "createdAt": created_at,
+                "sport": sport,
+                "title": title,
+                "url": url,
+                "error": err,
+            }
+        )
 
     if not items:
-        await update.message.reply_text("news_cafe_queue에 status=NEW 항목이 없습니다.")
+        await update.message.reply_text("news_cafe_queue에 처리 가능한 status=NEW 항목이 없습니다.")
         return
 
     def _parse_iso(s: str) -> datetime:
@@ -5504,14 +5580,27 @@ async def cafe_news_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             return datetime(1970, 1, 1, tzinfo=KST)
 
+    # 최신 우선
     items.sort(key=lambda x: (_parse_iso(x["createdAt"]), x["row"]), reverse=True)
 
-    selected = items if mode_all else items[:n]
+    # 제목 토큰 준비 + 제목 기반 중복 제거
+    kept = []
+    dup_by_title = []
+    for it in items:
+        it["_toks"] = _title_tokens(it["title"])
+        is_dup = False
+        for k in kept:
+            # 종목이 다르면 비교하지 않음(오탐 방지)
+            if (k.get("sport") or "").strip() != (it.get("sport") or "").strip():
+                continue
+            if _title_similarity(it, k) >= title_thr:
+                is_dup = True
+                dup_by_title.append(it)
+                break
+        if not is_dup:
+            kept.append(it)
 
-    await update.message.reply_text(
-        f"뉴스 카페 업로드 시작: NEW {len(items)}건 중 {len(selected)}건 처리합니다. (menuId={NAVER_CAFE_NEWS_MENU_ID})"
-    )
-
+    # ── 로그 워크시트(선택)
     ws_log = get_news_cafe_log_ws()
     posted_urls = _load_news_cafe_posted_urls(ws_log) if ws_log else set()
 
@@ -5519,7 +5608,55 @@ async def cafe_news_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fail_cnt = 0
     skip_cnt = 0
 
-    for it in selected:
+    # ── 제목 중복은 업로드 SKIP + error/log 기록(상태는 그대로 NEW)
+    if dup_by_title:
+        now_iso = now_kst().isoformat()
+        for dup in dup_by_title:
+            _queue_append_error_only(dup["row"], "DUP_TOPIC_TITLE", dup.get("error", ""))
+            skip_cnt += 1
+            if ws_log:
+                try:
+                    ws_log.append_row([dup["url"], dup["title"], now_iso, "SKIP", "DUP_TOPIC_TITLE"], value_input_option="RAW")
+                except Exception:
+                    pass
+
+    # 처리 대상(중복 제거 후)
+    candidates = kept if mode_all else kept[:n]
+
+    await update.message.reply_text(
+        f"뉴스 카페 업로드 시작: NEW {total_new}건(중복필터 후 {len(kept)}건) 중 {len(candidates)}건 처리합니다. "
+        f"(menuId={NAVER_CAFE_NEWS_MENU_ID})"
+    )
+
+    # ── 2차: 본문 첫부분 해시 기반 중복(동일 이슈/동일 기사) 필터
+    body_hash_len = int(os.getenv("NEWS_DUP_BODY_HASH_CHARS", "550"))
+    seen_body_hash = set()
+
+    def _body_hash(text: str) -> str:
+        t = (text or "").strip()
+        if not t:
+            return ""
+        snip = t[: max(400, min(body_hash_len, 650))]  # 400~650 사이로 제한
+        snip = snip.lower()
+        snip = re.sub(r"\s+", " ", snip).strip()
+        snip = re.sub(r"\d+", " ", snip)
+        snip = re.sub(r"[^0-9A-Za-z가-힣\s]", " ", snip)
+        snip = re.sub(r"\s+", " ", snip).strip()
+        try:
+            import hashlib
+            return hashlib.sha1(snip.encode("utf-8", "ignore")).hexdigest()
+        except Exception:
+            return ""
+
+    # 이미지 삽입(가운데 정렬)용 prefix: 첫 번째 이미지(#0)를 본문 최상단에 넣는다.
+    def _image_prefix_html() -> str:
+        return (
+            '<p style="text-align:center;">'
+            '<img src="#0" style="max-width:100%; height:auto;" />'
+            "</p><br>"
+        )
+
+    for it in candidates:
         row_num = it["row"]
         url = it["url"]
         orig_title = it["title"]
@@ -5538,7 +5675,21 @@ async def cafe_news_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not text_body:
                 raise ValueError("EMPTY_BODY")
 
-            # 2) 완전 재작성
+            # 2) 본문 해시 기반 중복 필터(1차 통과 항목들 사이에서만)
+            h = _body_hash(text_body)
+            if h and (h in seen_body_hash):
+                _queue_append_error_only(row_num, "DUP_TOPIC_BODY", it.get("error", ""))
+                skip_cnt += 1
+                if ws_log:
+                    try:
+                        ws_log.append_row([url, orig_title, now_kst().isoformat(), "SKIP", "DUP_TOPIC_BODY"], value_input_option="RAW")
+                    except Exception:
+                        pass
+                continue
+            if h:
+                seen_body_hash.add(h)
+
+            # 3) 완전 재작성
             new_title, rewritten = rewrite_news_full_with_openai(
                 text_body,
                 orig_title=orig_title or "스포츠 뉴스",
@@ -5546,24 +5697,25 @@ async def cafe_news_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 has_image=bool(img_url),
             )
 
-            # 3) 카페 업로드용 HTML(기존 방식 유지)
+            # 4) 카페 업로드용 HTML(기존 방식 유지)
             content_html, content_plain = _make_cafe_center_html(rewritten)
 
-            # 4) 이미지 다운로드 → (가능하면) multipart 업로드
+            # 5) 이미지 다운로드(가능하면 multipart 업로드) - 실패해도 글은 업로드
             img_bytes, img_name, img_mime = _download_image_bytes(img_url)
 
             posted_at = now_kst().isoformat()
             clubid = NAVER_CAFE_CLUBID
             menuid = NAVER_CAFE_NEWS_MENU_ID  # ✅ 고정 31
 
-            # 4-1) 이미지 포함 업로드 시도 (실패하면 글만 업로드로 폴백)
             success = False
             info = ""
 
+            # 5-1) 이미지가 있으면: 본문 최상단에 1장(#0) 삽입 + 가운데 정렬
             if img_bytes:
+                content_html_img, _ = _make_cafe_center_html(rewritten, raw_prefix_html=_image_prefix_html())
                 success, info = _naver_news_cafe_post_multipart(
                     new_title,
-                    content_html,
+                    content_html_img,
                     clubid,
                     menuid,
                     image_bytes=img_bytes,
@@ -5573,8 +5725,8 @@ async def cafe_news_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not success:
                     print(f"[NEWS_IMAGE] 업로드 실패 → 이미지 없이 재시도: {info}")
 
+            # 5-2) 이미지 업로드 실패/이미지 없음 → 글만 업로드
             if not success:
-                # 기존 방식 1차(HTML)
                 success, info = _naver_news_cafe_post(new_title, content_html, clubid, menuid)
 
                 # HTML에서 999 등이 뜨면 plain 텍스트로 재시도
