@@ -1353,9 +1353,10 @@ def _naver_news_cafe_post_multipart(
 ) -> tuple[bool, str]:
     """뉴스 전용 계정으로 글쓰기 + 이미지 1장 첨부(multipart).
 
-    ✅ 인코딩 주의:
-    - NAVER Developers 공식 예제에서 multipart 글쓰기 시에도 subject/content를 URL 인코딩(UTF-8)하여 전송한다.
-    - 이 방식으로 보내면 subject/content 값이 ASCII(%XX)로만 구성되어, 서버측 문자셋 해석 문제(모지박/깨짐)를 크게 줄일 수 있다.
+    ✅ 목표:
+    - 제목이 '%ED%..' 처럼 URL 인코딩 문자열로 올라가는 문제 방지 → subject/content는 "RAW UTF-8" 우선 전송
+    - 한글/줄바꿈/HTML 깨짐 없이 업로드
+    - 파일 필드명은 환경/예제 차이를 고려해 순차 시도(image, image[0], 0)
     """
     token = _naver_news_refresh_access_token()
     if not token:
@@ -1365,63 +1366,74 @@ def _naver_news_cafe_post_multipart(
     if not image_bytes:
         return False, "NO_IMAGE_BYTES"
 
-    subject_raw = (subject or "").strip() or "스포츠 뉴스"
+    subject_raw = _naver_clean_text(_safe_url_decode(subject) or "스포츠 뉴스")
     if len(subject_raw) > 80:
         subject_raw = subject_raw[:80]
 
-    content_raw = content or ""
-
-    # multipart에서는 '단일 UTF-8 URL 인코딩'이 가장 안전(공식 예제 방식)
-    from urllib.parse import quote
-    enc_subject = quote(_naver_clean_text(subject_raw), safe="", encoding="utf-8", errors="strict")
-    enc_content = quote(_naver_clean_text(content_raw), safe="", encoding="utf-8", errors="strict")
-
-    data = {"subject": enc_subject, "content": enc_content}
+    # content는 HTML 포함 문자열이므로 _naver_clean_text로만 1차 정리(제어문자 제거)
+    content_raw = _naver_clean_text(content or "")
 
     url = f"https://openapi.naver.com/v1/cafe/{clubid}/menu/{menuid}/articles"
     headers = {"Authorization": f"Bearer {token}"}
 
     last_err = ""
-    # 공식 문서/예제는 field name 'image'를 사용. 환경별로 'image[0]' / '0'도 보이므로 순차 시도.
-    for field_name in ("image", "image[0]", "0"):
-        files = [(field_name, (filename, image_bytes, mime_type))]
-        try:
-            resp = requests.post(url, headers=headers, data=data, files=files, timeout=60)
 
-            if resp.status_code != 200:
-                txt = (resp.text or "")[:800]
+    # ✅ 가장 우선: RAW 전송(서버가 별도 디코딩을 기대하지 않도록)
+    #    (이 방식이 제목 URL 인코딩 문자열 업로드 문제를 가장 확실하게 막는다.)
+    data_variants = [
+        {"subject": subject_raw, "content": content_raw},
+    ]
+
+    # (옵션) 만약 환경에 따라 RAW가 실패한다면 URL 인코딩을 fallback으로 켤 수 있게 한다.
+    # 기본값 OFF(0). 켜려면 NAVER_NEWS_MULTIPART_ALLOW_URLENCODE_FALLBACK=1
+    allow_urlenc = (os.getenv("NAVER_NEWS_MULTIPART_ALLOW_URLENCODE_FALLBACK") or "0").strip() not in ("0", "false", "False", "no", "NO")
+    if allow_urlenc:
+        from urllib.parse import quote_plus
+        data_variants.append({
+            "subject": quote_plus(subject_raw, safe="", encoding="utf-8", errors="strict"),
+            "content": quote_plus(content_raw, safe="", encoding="utf-8", errors="strict"),
+        })
+
+    for data in data_variants:
+        # 공식 문서/예제는 field name 'image'를 사용. 환경별로 'image[0]' / '0'도 보이므로 순차 시도.
+        for field_name in ("image", "image[0]", "0"):
+            files = [(field_name, (filename, image_bytes, mime_type))]
+            try:
+                resp = requests.post(url, headers=headers, data=data, files=files, timeout=60)
+
+                if resp.status_code != 200:
+                    txt = (resp.text or "")[:800]
+                    try:
+                        j = resp.json()
+                        code = j.get("message", {}).get("error", {}).get("code")
+                        msg = j.get("message", {}).get("error", {}).get("msg")
+                        if code or msg:
+                            last_err = f"HTTP_{resp.status_code}:{code}:{msg}"
+                            continue
+                    except Exception:
+                        pass
+                    last_err = f"HTTP_{resp.status_code}:{txt}"
+                    continue
+
+                article_id = ""
                 try:
                     j = resp.json()
-                    code = j.get("message", {}).get("error", {}).get("code")
-                    msg = j.get("message", {}).get("error", {}).get("msg")
-                    if code or msg:
-                        last_err = f"HTTP_{resp.status_code}:{code}:{msg}"
-                        continue
+                    if isinstance(j, dict):
+                        article_id = (
+                            j.get("message", {}).get("result", {}).get("articleId")
+                            or j.get("result", {}).get("articleId")
+                            or ""
+                        )
                 except Exception:
                     pass
-                last_err = f"HTTP_{resp.status_code}:{txt}"
+
+                return True, (str(article_id) if article_id else "OK")
+
+            except Exception as e:
+                last_err = f"EXC:{e}"
                 continue
 
-            article_id = ""
-            try:
-                j = resp.json()
-                if isinstance(j, dict):
-                    article_id = (
-                        j.get("message", {}).get("result", {}).get("articleId")
-                        or j.get("result", {}).get("articleId")
-                        or ""
-                    )
-            except Exception:
-                pass
-
-            return True, (str(article_id) if article_id else "OK")
-
-        except Exception as e:
-            last_err = f"EXC:{e}"
-            continue
-
     return False, (last_err or "UPLOAD_FAIL")
-
 
 def get_cafe_log_ws():
     """cafe_log 워크시트 반환(없으면 생성 + 헤더 세팅)."""
@@ -4856,34 +4868,64 @@ def _news_is_rate_limited(err: str) -> bool:
 
 
 def fetch_daum_article_text_and_image(url: str, orig_title: str = "") -> tuple[str, str]:
-    """다음스포츠 기사 URL에서 본문 텍스트 + 대표 이미지 URL(가능하면) 추출."""
-    ua = {"User-Agent": "Mozilla/5.0"}
-    r = requests.get(url, headers=ua, timeout=20)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
+    """다음/다음스포츠/다음뉴스(v.daum.net 포함) 기사 URL에서
+    - 본문 텍스트
+    - 대표 이미지 URL(가능하면)
+    를 추출한다.
 
-    # 1) 대표 이미지 URL 추출 우선순위
-    img_url = ""
+    ⚠️ 주의:
+    - v.daum.net(다음뉴스) 페이지는 div#harmonyContainer가 없을 수 있어,
+      본문 컨테이너(body_el) 기준으로 첫 img를 추가로 탐색한다.
+    """
+    if not url:
+        return "", ""
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
+        # 일부 CDN이 referer 없는 호출을 막는 케이스가 있어 안전장치로 넣음
+        "Referer": url,
+    }
+
+    r = requests.get(url, headers=headers, timeout=25)
+    r.raise_for_status()
+
+    # requests가 간혹 encoding을 못 잡는 케이스가 있어 UTF-8로 폴백
     try:
-        og = soup.find("meta", attrs={"property": "og:image"})
-        if og and og.get("content"):
-            img_url = str(og.get("content")).strip()
+        if not r.encoding:
+            r.encoding = "utf-8"
     except Exception:
         pass
 
-    if not img_url:
-        try:
-            cont = soup.select_one("div#harmonyContainer")
-            if cont:
-                img = cont.find("img")
-                if img:
-                    img_url = (img.get("src") or img.get("data-src") or "").strip()
-                    if img_url and img_url.startswith("/"):
-                        img_url = urljoin(url, img_url)
-        except Exception:
-            pass
+    soup = BeautifulSoup(r.text, "html.parser")
 
-    # 2) 본문 추출(크롤링 로직 재사용)
+    def _pick_img_attr(tag) -> str:
+        if not tag:
+            return ""
+        return (
+            (tag.get("src") or "")
+            or (tag.get("data-src") or "")
+            or (tag.get("data-original") or "")
+            or (tag.get("data-lazy-src") or "")
+            or (tag.get("data-original-src") or "")
+        ).strip()
+
+    def _norm_img(u: str) -> str:
+        from urllib.parse import urljoin
+        u = (u or "").strip()
+        u = html.unescape(u)
+        u = u.strip(" \"'")
+        if not u:
+            return ""
+        if u.startswith("data:"):
+            return ""
+        if u.startswith("//"):
+            u = "https:" + u
+        if u.startswith("/"):
+            u = urljoin(url, u)
+        return u
+
+    # 0) 본문 컨테이너 후보(텍스트/이미지 공용)
     body_el = (
         soup.select_one("div#harmonyContainer")
         or soup.select_one("section#article-view-content-div")
@@ -4893,6 +4935,49 @@ def fetch_daum_article_text_and_image(url: str, orig_title: str = "") -> tuple[s
         or soup.body
     )
 
+    # 1) 대표 이미지 URL 추출 우선순위
+    img_url = ""
+
+    # 1-a) og:image(가장 안정적)
+    for prop in ("og:image", "og:image:secure_url"):
+        try:
+            meta = soup.find("meta", attrs={"property": prop})
+            if meta and meta.get("content"):
+                img_url = _norm_img(str(meta.get("content")).strip())
+                if img_url:
+                    break
+        except Exception:
+            pass
+
+    # 1-b) twitter:image 폴백
+    if not img_url:
+        try:
+            meta = soup.find("meta", attrs={"name": "twitter:image"})
+            if meta and meta.get("content"):
+                img_url = _norm_img(str(meta.get("content")).strip())
+        except Exception:
+            pass
+
+    # 1-c) 본문 컨테이너 내 첫 img 폴백(특히 v.daum.net 대응)
+    if not img_url:
+        try:
+            if body_el:
+                img = body_el.find("img")
+                if img:
+                    img_url = _norm_img(_pick_img_attr(img))
+        except Exception:
+            pass
+
+    # 1-d) 최후 폴백: 페이지 전체에서 첫 img
+    if not img_url:
+        try:
+            img = soup.find("img")
+            if img:
+                img_url = _norm_img(_pick_img_attr(img))
+        except Exception:
+            pass
+
+    # 2) 본문 텍스트 추출(크롤링 로직 재사용)
     raw_body = ""
     if body_el:
         # 이미지 설명 캡션 제거
@@ -4916,34 +5001,118 @@ def fetch_daum_article_text_and_image(url: str, orig_title: str = "") -> tuple[s
 
     return clean_text, img_url
 
+def _download_image_bytes(img_url: str, *, referer: str = "") -> tuple[bytes, str, str]:
+    """이미지 URL을 다운로드해서 (bytes, filename, mime_type) 반환. 실패하면 (b"", "", "").
 
-def _download_image_bytes(img_url: str) -> tuple[bytes, str, str]:
-    """이미지 URL을 다운로드해서 (bytes, filename, mime_type) 반환. 실패하면 (b"", "", "")"""
+    ✅ 다운로드 안정성:
+    - User-Agent/Referer 포함
+    - daumcdn thumb URL(?fname=...)이면 원본 URL을 우선 시도하고, 실패 시 thumb로 폴백
+    - Content-Type이 image/*가 아니면 '파일 시그니처'로 2차 판정(HTML 다운로드 방지)
+    """
     if not img_url:
         return b"", "", ""
-    ua = {"User-Agent": "Mozilla/5.0"}
-    try:
-        r = requests.get(img_url, headers=ua, timeout=20)
-        r.raise_for_status()
-        content_type = (r.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
-        if not content_type.startswith("image/"):
-            # 일부는 text/html로 오는 경우도 있어 방어
-            content_type = "image/jpeg"
 
-        ext = ".jpg"
-        if "png" in content_type:
-            ext = ".png"
-        elif "webp" in content_type:
-            ext = ".webp"
-        elif "gif" in content_type:
-            ext = ".gif"
+    # --- URL 후보 만들기(원본 우선) ---
+    from urllib.parse import urlparse, parse_qs, unquote, urljoin
 
-        filename = f"news_image{ext}"
-        return (r.content or b""), filename, content_type
-    except Exception as e:
-        print(f"[NEWS_IMAGE] download 실패: {img_url} / {e}")
+    raw = html.unescape((img_url or "").strip()).strip(" \"'")
+    if not raw or raw.startswith("data:"):
         return b"", "", ""
+    if raw.startswith("//"):
+        raw = "https:" + raw
+    if raw.startswith("/") and referer:
+        raw = urljoin(referer, raw)
 
+    candidates: list[str] = []
+    # thumb URL이면 fname 원본 먼저
+    try:
+        pr = urlparse(raw)
+        qs = parse_qs(pr.query or "")
+        fname = (qs.get("fname", [""]) or [""])[0]
+        if fname:
+            orig = unquote(fname)
+            # fname가 2중 인코딩인 케이스가 있어 1~2회 추가 디코딩
+            for _ in range(2):
+                if "%2F" in orig or "%3A" in orig or "%3a" in orig:
+                    orig = unquote(orig)
+            if orig and orig.startswith("//"):
+                orig = "https:" + orig
+            if orig and orig.startswith("http"):
+                candidates.append(orig)
+    except Exception:
+        pass
+
+    candidates.append(raw)
+
+    # 중복 제거(순서 유지)
+    seen = set()
+    cand2 = []
+    for u in candidates:
+        u2 = (u or "").strip()
+        if not u2 or u2 in seen:
+            continue
+        seen.add(u2)
+        cand2.append(u2)
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
+    }
+    if referer:
+        headers["Referer"] = referer
+
+    def _sniff_mime(data: bytes) -> str:
+        if not data:
+            return ""
+        if data[:3] == b"\xFF\xD8\xFF":
+            return "image/jpeg"
+        if data[:8] == b"\x89PNG\r\n\x1a\n":
+            return "image/png"
+        if data[:6] in (b"GIF87a", b"GIF89a"):
+            return "image/gif"
+        if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            return "image/webp"
+        return ""
+
+    last_err = ""
+    for u in cand2:
+        try:
+            r = requests.get(u, headers=headers, timeout=25, stream=False)
+            r.raise_for_status()
+
+            data = r.content or b""
+            if not data:
+                last_err = "EMPTY_IMAGE"
+                continue
+
+            content_type = (r.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+
+            # Content-Type이 image가 아니면 시그니처로 판정(HTML 다운로드 방지)
+            if not content_type.startswith("image/"):
+                sniff = _sniff_mime(data)
+                if not sniff:
+                    last_err = f"NOT_IMAGE:{content_type or 'unknown'}"
+                    continue
+                content_type = sniff
+
+            # 확장자 결정
+            ext = ".jpg"
+            if "png" in content_type:
+                ext = ".png"
+            elif "webp" in content_type:
+                ext = ".webp"
+            elif "gif" in content_type:
+                ext = ".gif"
+
+            filename = f"news_image{ext}"
+            return data, filename, content_type
+
+        except Exception as e:
+            last_err = str(e)
+
+    print(f"[NEWS_IMAGE] download 실패: {img_url} / last_err={last_err}")
+    return b"", "", ""
 
 def _needs_url_decode(s: str) -> bool:
     s = s or ""
@@ -5701,7 +5870,7 @@ async def cafe_news_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             content_html, content_plain = _make_cafe_center_html(rewritten)
 
             # 5) 이미지 다운로드(가능하면 multipart 업로드) - 실패해도 글은 업로드
-            img_bytes, img_name, img_mime = _download_image_bytes(img_url)
+            img_bytes, img_name, img_mime = _download_image_bytes(img_url, referer=url)
 
             posted_at = now_kst().isoformat()
             clubid = NAVER_CAFE_CLUBID
