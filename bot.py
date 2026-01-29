@@ -6087,11 +6087,10 @@ async def cafe_news_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 이미지 삽입(가운데 정렬)용 prefix: 첫 번째 이미지(#0)를 본문 최상단에 넣는다.
     def _image_prefix_html() -> str:
-        return (
-            '<p style="text-align:center;">'
-            '<img src="#0" style="max-width:100%; height:auto;" />'
-            "</p><br>"
-        )
+        # style/따옴표를 최소화해 403/999(필터/일시제한) 가능성을 낮춘다.
+        # (필요하면 html을 아예 넣지 않고, 첨부 이미지가 상단에 자동 노출되는 방식만 사용해도 됨)
+        return "<img src=#0><br>"
+
 
     for it in candidates:
         row_num = it["row"]
@@ -6147,22 +6146,50 @@ async def cafe_news_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             success = False
             info = ""
 
-            # 5-1) 이미지가 있으면: 본문 최상단에 1장(#0) 삽입 + 가운데 정렬
+            # 5-1) 이미지가 있으면: multipart로 여러 변형을 시도 (실패해도 글 업로드는 계속)
             if img_bytes:
-                content_html_img, _ = _make_cafe_center_html(rewritten, raw_prefix_html=_image_prefix_html())
+                # 1) 가장 보수적인 본문(이미지 태그 없음)으로 multipart 시도
                 success, info = _naver_news_cafe_post_multipart(
                     new_title,
-                    content_html_img,
+                    content_html,
                     clubid,
                     menuid,
                     image_bytes=img_bytes,
                     filename=img_name or "image.jpg",
                     mime_type=img_mime or "image/jpeg",
                 )
+
+                # 2) 그래도 실패하면 plain 텍스트로 한 번 더 (필터 회피 목적)
+                if not success:
+                    print(f"[NEWS_IMAGE] multipart(본문 그대로) 실패 → plain 본문으로 1회 더: {info}")
+                    success, info = _naver_news_cafe_post_multipart(
+                        new_title,
+                        content_plain,
+                        clubid,
+                        menuid,
+                        image_bytes=img_bytes,
+                        filename=img_name or "image.jpg",
+                        mime_type=img_mime or "image/jpeg",
+                    )
+
+                # 3) (옵션) inline(#0) 태그 버전도 1회 더 시도
+                if not success:
+                    print(f"[NEWS_IMAGE] multipart(plain)도 실패 → inline(#0)로 1회 더: {info}")
+                    content_html_img, _ = _make_cafe_center_html(rewritten, raw_prefix_html=_image_prefix_html())
+                    success, info = _naver_news_cafe_post_multipart(
+                        new_title,
+                        content_html_img,
+                        clubid,
+                        menuid,
+                        image_bytes=img_bytes,
+                        filename=img_name or "image.jpg",
+                        mime_type=img_mime or "image/jpeg",
+                    )
+
                 if not success:
                     print(f"[NEWS_IMAGE] 업로드 실패 → 이미지 없이 재시도: {info}")
 
-            # 5-2) 이미지 업로드 실패/이미지 없음 → 글만 업로드
+# 5-2) 이미지 업로드 실패/이미지 없음 → 글만 업로드
             if not success:
                 success, info = _naver_news_cafe_post(new_title, content_html, clubid, menuid)
 
@@ -6197,7 +6224,7 @@ async def cafe_news_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await asyncio.sleep(2.0)
 
             # 요청 간 약간의 텀(과도한 호출 방지)
-            await asyncio.sleep(float(os.getenv("CAFE_NEWS_UPLOAD_DELAY_SEC", "0.8")))
+            await asyncio.sleep(float(os.getenv("CAFE_NEWS_UPLOAD_DELAY_SEC", "7")))
 
         except Exception as e:
             err = _safe_truncate(f"EXC:{e}", 300)
