@@ -6089,7 +6089,7 @@ async def cafe_news_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     def _image_prefix_html() -> str:
         # style/따옴표를 최소화해 403/999(필터/일시제한) 가능성을 낮춘다.
         # (필요하면 html을 아예 넣지 않고, 첨부 이미지가 상단에 자동 노출되는 방식만 사용해도 됨)
-        return "<img src=#0><br>"
+        return "<img src=#0 style=display:block;margin-left:auto;margin-right:auto;max-width:100%;height:auto><br>"
 
 
     for it in candidates:
