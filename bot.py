@@ -2324,7 +2324,7 @@ def get_menu_caption() -> str:
     today_str, tomorrow_str = get_date_labels()
     return (
         "📌 스포츠 정보&분석 공유방 메뉴 안내\n\n"
-        "1️⃣ 실시간 무료 중계 - GOAT-TV 라이브 중계 바로가기\n"
+        "1️⃣ 실시간 무료 중계 - 라이브 중계 바로가기\n"
         f"2️⃣ {today_str} 경기 분석픽 - 종목별로 {today_str} 경기 분석을 확인하세요\n"
         f"3️⃣ {tomorrow_str} 경기 분석픽 - 종목별로 {tomorrow_str} 경기 분석을 확인하세요\n"
         "4️⃣ 스포츠 뉴스 요약 - 주요 이슈 & 뉴스 요약 정리\n\n"
