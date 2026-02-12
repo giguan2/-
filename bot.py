@@ -2886,6 +2886,84 @@ def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
 
 
 
+# ───────────────── Naver Cafe → Google Sheet (youtoo 탭) ─────────────────
+# youtoo 탭: 카페 게시글 백업/수집용
+YOUTOO_SHEET_NAME = (os.getenv("YOUTOO_SHEET_NAME") or "youtoo").strip()
+YOUTOO_HEADER = ["경기", "댓글수", "별명", "게시시간(날짜)", "조회수", "좋아요", "본문링크", "src_id"]
+
+def ensure_youtoo_header(ws) -> None:
+    """youtoo 시트 헤더가 다르면 강제로 맞춘다."""
+    try:
+        top = ws.row_values(1)
+    except Exception:
+        top = []
+    if (not top) or top[: len(YOUTOO_HEADER)] != YOUTOO_HEADER:
+        ws.update("A1", [YOUTOO_HEADER])
+
+def get_youtoo_ws():
+    """youtoo 탭 워크시트 반환(없으면 생성 + 헤더 세팅)."""
+    client_gs = get_gs_client()
+    spreadsheet_id = os.getenv("SPREADSHEET_ID")
+    if not (client_gs and spreadsheet_id):
+        return None
+
+    try:
+        sh = client_gs.open_by_key(spreadsheet_id)
+        ws = _get_ws_by_name(sh, YOUTOO_SHEET_NAME)
+        if not ws:
+            ws = sh.add_worksheet(title=YOUTOO_SHEET_NAME, rows=2000, cols=max(10, len(YOUTOO_HEADER)))
+        try:
+            ws.resize(cols=max(10, len(YOUTOO_HEADER)))
+        except Exception:
+            pass
+        ensure_youtoo_header(ws)
+        return ws
+    except Exception as e:
+        print(f"[GSHEET][YOUTOO] 워크시트 준비 실패({YOUTOO_SHEET_NAME}): {e}")
+        return None
+
+def get_existing_youtoo_src_ids() -> set[str]:
+    """youtoo 시트에서 src_id 목록을 읽어 중복 저장 방지용 set으로 반환."""
+    ws = get_youtoo_ws()
+    if not ws:
+        return set()
+
+    try:
+        values = ws.get_all_values()
+        if not values:
+            return set()
+        header = [c.strip() for c in values[0]]
+        if "src_id" not in header:
+            return set()
+        idx = header.index("src_id")
+        out: set[str] = set()
+        for row in values[1:]:
+            if len(row) > idx:
+                v = (row[idx] or "").strip()
+                if v:
+                    out.add(v)
+        return out
+    except Exception as e:
+        print(f"[GSHEET][YOUTOO] 기존 src_id 로딩 실패: {e}")
+        return set()
+
+def append_youtoo_rows(rows: list[list[str]]) -> bool:
+    """youtoo 시트에 rows append."""
+    if not rows:
+        return True
+    ws = get_youtoo_ws()
+    if not ws:
+        return False
+    try:
+        ws.append_rows(rows, value_input_option="RAW", table_range="A1")
+        print(f"[GSHEET][YOUTOO] {YOUTOO_SHEET_NAME} 에 {len(rows)}건 추가")
+        return True
+    except Exception as e:
+        print(f"[GSHEET][YOUTOO] append_rows 오류: {e}")
+        return False
+
+
+
 def get_existing_site_src_ids(day_str: str) -> set[str]:
     """site_export 탭에서 day가 같은 행들의 src_id를 set으로 가져와 중복 저장 방지."""
     client_gs = get_gs_client()
@@ -6733,6 +6811,299 @@ async def export_rollover(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"롤오버 중 오류: {e}")
         return
 
+# ───────────────── 네이버 카페(웹 API) 게시글 수집 → youtoo 시트 저장 ─────────────────
+# ⚠️ 주의: 아래 API는 '카페 웹'에서 사용하는 내부 API 성격이라, 스펙/정책이 바뀔 수 있습니다.
+# - 필요 환경변수:
+#   - NAVER_COOKIE : 브라우저에서 로그인한 뒤 얻은 쿠키 문자열(예: "NID_AUT=...; NID_SES=...; ...;")
+#   - SPREADSHEET_ID, GOOGLE_SERVICE_KEY : 구글시트 저장용(기존 설정 그대로)
+#
+# - 선택 환경변수(기본값은 seane01/18677861/menu=20):
+#   - NAVER_CAFE_BASE_URL (default: https://cafe.naver.com/seane01)
+#   - NAVER_CAFE_WEB_CAFE_ID (default: 18677861)
+#   - NAVER_CAFE_WEB_MENU_ID (default: 20)
+
+NAVER_CAFE_BASE_URL = (os.getenv("NAVER_CAFE_BASE_URL") or "https://cafe.naver.com/seane01").strip().rstrip("/")
+NAVER_CAFE_WEB_CAFE_ID = (os.getenv("NAVER_CAFE_WEB_CAFE_ID") or "18677861").strip()
+NAVER_CAFE_WEB_MENU_ID = (os.getenv("NAVER_CAFE_WEB_MENU_ID") or "20").strip()
+NAVER_CAFE_WEB_SORT_BY = (os.getenv("NAVER_CAFE_WEB_SORT_BY") or "TIME").strip()
+NAVER_CAFE_WEB_VIEW_TYPE = (os.getenv("NAVER_CAFE_WEB_VIEW_TYPE") or "L").strip()
+
+def _get_naver_web_cookie() -> str:
+    """Render 환경변수에 저장된 쿠키 문자열을 가져온다.
+    지원 키: NAVER_COOKIE > NAVER_CAFE_COOKIE > NAVER_WEB_COOKIE
+    """
+    ck = (
+        os.getenv("NAVER_COOKIE")
+        or os.getenv("NAVER_CAFE_COOKIE")
+        or os.getenv("NAVER_WEB_COOKIE")
+        or ""
+    )
+    ck = str(ck).strip()
+
+    # Render 환경변수에 따옴표로 감싸 넣은 경우 제거
+    if (ck.startswith('"') and ck.endswith('"')) or (ck.startswith("'") and ck.endswith("'")):
+        ck = ck[1:-1].strip()
+
+    if ck.lower().startswith("cookie:"):
+        ck = ck.split(":", 1)[1].strip()
+
+    # 줄바꿈/연속 공백 제거
+    ck = " ".join(ck.splitlines()).strip()
+    return ck
+
+def _naver_web_headers(cafe_id: str, menu_id: str) -> dict[str, str]:
+    cookie = _get_naver_web_cookie()
+    ua = (
+        (os.getenv("NAVER_USER_AGENT") or "").strip()
+        or (os.getenv("MAZ_USER_AGENT") or "").strip()
+        or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    )
+
+    # Referer는 엄격히 체크되는 경우가 있어 '게시판 목록' 페이지 형태로 맞춰준다.
+    referer = (os.getenv("NAVER_CAFE_REFERER") or "").strip()
+    if not referer:
+        referer = f"{NAVER_CAFE_BASE_URL}/ArticleList.nhn?search.clubid={cafe_id}&search.menuid={menu_id}"
+
+    headers = {
+        "User-Agent": ua,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": referer,
+        "Origin": "https://cafe.naver.com",
+        "Connection": "keep-alive",
+    }
+    if cookie:
+        headers["Cookie"] = cookie
+    return headers
+
+def _ms_to_kst_str(ts_ms) -> str:
+    """네이버 writeDateTimestamp(ms 또는 sec)를 KST 문자열로 변환."""
+    try:
+        n = int(ts_ms)
+    except Exception:
+        return ""
+    # 13자리면 ms로 판단
+    if n > 10**12:
+        sec = n / 1000.0
+    else:
+        sec = float(n)
+    try:
+        dt = datetime.fromtimestamp(sec, tz=timezone.utc).astimezone(KST)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return ""
+
+async def _fetch_cafe_boardlist_page(
+    client: httpx.AsyncClient,
+    *,
+    cafe_id: str,
+    menu_id: str,
+    page: int,
+    page_size: int,
+    sort_by: str,
+    view_type: str,
+) -> tuple[int, dict | None, str]:
+    """(status_code, json_or_none, text_snippet)"""
+    url = f"https://apis.naver.com/cafe-web/cafe-boardlist-api/v1/cafes/{cafe_id}/menus/{menu_id}/articles"
+    params = {
+        "page": max(1, int(page)),
+        "pageSize": max(1, int(page_size)),
+        "sortBy": (sort_by or "TIME"),
+        "viewType": (view_type or "L"),
+    }
+    headers = _naver_web_headers(cafe_id, menu_id)
+    r = await client.get(url, params=params, headers=headers, timeout=20.0)
+    snippet = (r.text or "")[:500]
+    if not (200 <= r.status_code < 300):
+        return r.status_code, None, snippet
+    try:
+        return r.status_code, r.json(), snippet
+    except Exception:
+        return r.status_code, None, snippet
+
+async def youtoo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/youtoo 명령어:
+    네이버 카페(기본: 18677861) 메뉴(기본: 20) 글 목록을 가져와 구글시트 youtoo 탭에 저장한다.
+
+    사용 예)
+    - /youtoo                -> 1페이지(page=1) 15개 저장
+    - /youtoo 3              -> 1~3페이지까지 저장
+    - /youtoo 3 30           -> 1~3페이지, 페이지당 30개
+    - /youtoo page=2         -> 2페이지(1페이지만)
+    - /youtoo page=2 pages=2 -> 2~3페이지
+    - /youtoo menu=20        -> 메뉴ID를 바꿔서 수집(테스트/확장용)
+    """
+    if not is_admin(update):
+        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+
+    cookie = _get_naver_web_cookie()
+    if not cookie:
+        await update.message.reply_text(
+            "NAVER_COOKIE 환경변수가 비어있습니다.\n"
+            "Render 환경변수에 브라우저 쿠키 문자열을 넣어주세요."
+        )
+        return
+
+    # 기본값
+    start_page = 1
+    pages = 1
+    page_size = 15
+
+    # args 파싱(키=값 우선)
+    raw_args = list(context.args or [])
+    kv = {}
+    nums = []
+    for a in raw_args:
+        s = (a or "").strip()
+        if not s:
+            continue
+        if "=" in s:
+            k, v = s.split("=", 1)
+            kv[k.strip().lower()] = v.strip()
+        elif s.isdigit():
+            nums.append(int(s))
+
+    def _safe_int(v, default: int) -> int:
+        try:
+            return int(str(v).strip())
+        except Exception:
+            return default
+
+    # 키=값 우선 처리
+    if "page" in kv or "p" in kv:
+        start_page = _safe_int(kv.get("page") or kv.get("p"), 1)
+    if "pages" in kv or "n" in kv:
+        pages = _safe_int(kv.get("pages") or kv.get("n"), 1)
+    if "size" in kv or "pagesize" in kv or "ps" in kv:
+        page_size = _safe_int(kv.get("size") or kv.get("pagesize") or kv.get("ps"), 15)
+
+    # 숫자 인자 처리 (/youtoo 3 30 형태)
+    if nums:
+        pages = nums[0]
+        if len(nums) >= 2:
+            page_size = nums[1]
+
+    # 안전 범위
+    start_page = max(1, start_page)
+    pages = max(1, min(20, pages))          # 너무 많이 가져오면 차단/시간초과 위험
+    page_size = max(1, min(50, page_size))  # 일반적으로 50이면 충분
+
+    cafe_id = str(kv.get("cafe") or kv.get("cafeid") or NAVER_CAFE_WEB_CAFE_ID).strip() or NAVER_CAFE_WEB_CAFE_ID
+    menu_id = str(kv.get("menu") or kv.get("menuid") or NAVER_CAFE_WEB_MENU_ID).strip() or NAVER_CAFE_WEB_MENU_ID
+
+    await update.message.reply_text(
+        f"네이버 카페 게시글을 가져옵니다. (cafeId={cafe_id}, menuId={menu_id})\n"
+        f"- page={start_page} ~ {start_page + pages - 1}\n"
+        f"- pageSize={page_size}\n"
+        f"잠시만 기다려 주세요..."
+    )
+
+    ws = get_youtoo_ws()
+    if not ws:
+        await update.message.reply_text("구글시트(youtoo 탭) 준비에 실패했습니다. SPREADSHEET_ID/권한을 확인하세요.")
+        return
+
+    existing = get_existing_youtoo_src_ids()
+    new_rows: list[list[str]] = []
+    added = 0
+    dup = 0
+
+    sort_by = NAVER_CAFE_WEB_SORT_BY
+    view_type = NAVER_CAFE_WEB_VIEW_TYPE
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            for p in range(start_page, start_page + pages):
+                status, data, snippet = await _fetch_cafe_boardlist_page(
+                    client,
+                    cafe_id=cafe_id,
+                    menu_id=menu_id,
+                    page=p,
+                    page_size=page_size,
+                    sort_by=sort_by,
+                    view_type=view_type,
+                )
+
+                # 쿠키/권한 문제 감지
+                if status in (401, 403):
+                    await update.message.reply_text(
+                        f"접근이 거부되었습니다. (HTTP {status})\n"
+                        "쿠키가 만료되었거나(또는 해당 게시판을 읽을 권한이 없는 계정)일 수 있습니다.\n"
+                        "브라우저에서 해당 계정으로 다시 로그인한 뒤 쿠키를 갱신해서 Render 환경변수(NAVER_COOKIE)를 업데이트해주세요."
+                    )
+                    return
+
+                if not data:
+                    # 200인데 JSON 파싱 실패 등
+                    await update.message.reply_text(
+                        f"page={p} 응답 파싱에 실패했습니다.\n"
+                        f"(HTTP {status}) 응답 일부: {snippet}"
+                    )
+                    return
+
+                result = data.get("result") if isinstance(data, dict) else None
+                article_list = (result or {}).get("articleList") if isinstance(result, dict) else None
+                if not isinstance(article_list, list) or not article_list:
+                    # 더 이상 글이 없으면 중단
+                    break
+
+                for entry in article_list:
+                    if not isinstance(entry, dict):
+                        continue
+                    item = entry.get("item")
+                    if not isinstance(item, dict):
+                        continue
+
+                    article_id = item.get("articleId")
+                    if not article_id:
+                        continue
+
+                    src_id = f"navercafe:{cafe_id}:{menu_id}:{article_id}"
+                    if src_id in existing:
+                        dup += 1
+                        continue
+
+                    subject = str(item.get("subject") or "").strip()
+                    comment_cnt = item.get("commentCount")
+                    if comment_cnt is None:
+                        comment_cnt = item.get("replyArticleCount")
+                    comment_cnt = str(comment_cnt or 0)
+
+                    writer = item.get("writerInfo") if isinstance(item.get("writerInfo"), dict) else {}
+                    nick = str((writer or {}).get("nickName") or "").strip()
+
+                    posted_at = _ms_to_kst_str(item.get("writeDateTimestamp"))
+                    read_cnt = str(item.get("readCount") or 0)
+                    like_cnt = str(item.get("likeCount") or 0)
+
+                    # 본문 링크(카페 별칭 URL 기반)
+                    link = f"{NAVER_CAFE_BASE_URL}/{article_id}"
+
+                    new_rows.append([subject, comment_cnt, nick, posted_at, read_cnt, like_cnt, link, src_id])
+                    existing.add(src_id)
+                    added += 1
+
+        # 시트 저장
+        if new_rows:
+            ok = append_youtoo_rows(new_rows)
+            if not ok:
+                await update.message.reply_text("구글시트(youtoo)에 저장하지 못했습니다. 권한/시트 상태를 확인하세요.")
+                return
+
+        await update.message.reply_text(
+            f"✅ youtoo 수집 완료\n"
+            f"- 추가 저장: {added}건\n"
+            f"- 중복 스킵: {dup}건\n"
+            f"- 대상 페이지: {start_page}~{start_page + pages - 1} (pageSize={page_size})"
+        )
+
+    except Exception as e:
+        await update.message.reply_text(f"요청 중 오류가 발생했습니다: {e}")
+        return
+
+
+
 def main():
     reload_analysis_from_sheet()
     reload_news_from_sheet()
@@ -6752,6 +7123,7 @@ def main():
 
     # export_tomorrow → export_today 롤오버
     app.add_handler(CommandHandler("export_rollover", export_rollover))    
+    app.add_handler(CommandHandler("youtoo", youtoo))  # 네이버 카페 메뉴 글 수집 → youtoo 시트
 
     # 네이버 카페 자동 글쓰기(종목별 게시판)  ※ /cafe_soccer [tomorrow] 처럼 사용
     app.add_handler(CommandHandler("cafe_soccer", cafe_soccer))
