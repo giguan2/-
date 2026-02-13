@@ -2892,7 +2892,8 @@ def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
 YOUTOO_SHEET_NAME = (os.getenv("YOUTOO_SHEET_NAME") or "youtoo").strip()
 
 # ✅ 사용자가 원하는 최종 헤더 순서(고정)
-YOUTOO_HEADER = [
+# ✅ 사용자가 원하는 자동 수집 헤더 순서(고정)  (A~K)
+YOUTOO_AUTO_HEADER = [
     "src_id",
     "경기",
     "댓글수",
@@ -2906,10 +2907,33 @@ YOUTOO_HEADER = [
     "별명",
 ]
 
+# ✅ 수기 입력 컬럼 (L~M) - 봇이 절대 덮어쓰지 않음
+YOUTOO_MANUAL_HEADER = [
+    "적중건제출여부",
+    "지급여부",
+]
+
+# 전체 헤더(A~M)
+YOUTOO_HEADER = YOUTOO_AUTO_HEADER + YOUTOO_MANUAL_HEADER
+
+def _col_letter(n: int) -> str:
+    """1-indexed column number -> A1 column letter."""
+    s = ""
+    x = int(n)
+    while x > 0:
+        x, r = divmod(x - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+# 자동 갱신 범위(A~K)의 끝 컬럼(기본: K)
+YOUTOO_AUTO_END_COL = _col_letter(len(YOUTOO_AUTO_HEADER))
+
 # 과거 버전/표기 차이 호환(자동 마이그레이션용)
 _YOUTOO_COL_ALIASES: dict[str, list[str]] = {
     "첫댓글내용": ["첫댓글"],
     "첫댓글작성자": ["첫댓글별명", "첫댓글닉네임"],
+    "적중건제출여부": ["적중 제출 여부", "적중제출여부", "적중여부"],
+    "지급여부": ["지급 여부"],
 }
 
 def _youtoo_find_header_index(old_header: list[str], col: str) -> int | None:
@@ -2929,33 +2953,83 @@ def _youtoo_find_header_index(old_header: list[str], col: str) -> int | None:
 def ensure_youtoo_header(ws) -> None:
     """youtoo 시트 헤더를 최신 스펙으로 맞춘다.
 
-    - 헤더가 비어있으면 1행에 헤더를 깐다.
-    - 헤더가 다르면(과거 버전 포함) 기존 데이터를 가능한 한 매핑해서
-      ✅ 새 헤더 순서로 재정렬(마이그레이션)한 뒤 갱신한다.
+    - A~K: 봇이 자동 수집/갱신하는 컬럼
+    - L~M: 사람이 수기로 입력하는 컬럼(적중건제출여부/지급여부) → ✅ 봇이 절대 덮어쓰지 않음
+
+    헤더가 어긋난 과거 버전(구/신 헤더 혼재)도 가능한 범위 내에서 자동 마이그레이션한다.
     """
     try:
         values = ws.get_all_values()
     except Exception:
         values = []
 
+    # 시트가 비어있으면 헤더부터 세팅
     if not values:
+        try:
+            if getattr(ws, "col_count", 0) < len(YOUTOO_HEADER):
+                ws.resize(cols=len(YOUTOO_HEADER))
+        except Exception:
+            pass
         ws.update("A1", [YOUTOO_HEADER])
         return
 
-    old_header = [c.strip() for c in (values[0] or [])]
-    if old_header == YOUTOO_HEADER:
+    # get_all_values()는 "헤더 행의 빈 셀"을 끝까지 반환하지 않을 수 있으므로,
+    # 전체 데이터에서 가장 긴 열 길이를 기준으로 헤더를 패딩한다.
+    max_cols = max([len(r) for r in values] + [len(YOUTOO_HEADER)])
+    raw_header = list(values[0] or [])
+    header = [str(c).strip() for c in raw_header] + [""] * (max_cols - len(raw_header))
+
+    # 필요한 경우에만 cols 확장(절대 축소 금지)
+    try:
+        desired_cols = max(len(YOUTOO_HEADER), max_cols)
+        if getattr(ws, "col_count", 0) < desired_cols:
+            ws.resize(cols=desired_cols)
+    except Exception:
+        pass
+
+    auto_len = len(YOUTOO_AUTO_HEADER)
+    auto_match = [str(c).strip() for c in header[:auto_len]] == YOUTOO_AUTO_HEADER
+
+    # ✅ A~K 헤더가 이미 맞으면: L/M 헤더만 보정하고(필요 시) 끝낸다. (수기 데이터 보호)
+    if auto_match:
+        # 헤더 배열 길이 보정
+        if len(header) < len(YOUTOO_HEADER):
+            header += [""] * (len(YOUTOO_HEADER) - len(header))
+
+        for i, name in enumerate(YOUTOO_MANUAL_HEADER):
+            col_idx_1based = auto_len + 1 + i  # L=12, M=13
+            cur = str(header[auto_len + i] or "").strip()
+            if cur == name:
+                continue
+            # 헤더 셀만 업데이트 (데이터 행은 건드리지 않음)
+            try:
+                ws.update_cell(1, col_idx_1based, name)
+            except Exception:
+                try:
+                    ws.update(f"{_col_letter(col_idx_1based)}1", [[name]])
+                except Exception:
+                    pass
         return
 
-    # 기존 데이터 → 새 헤더 순서로 매핑
+    # ✅ 헤더가 과거 버전이면: 가능한 범위에서 전체 마이그레이션(수기 L/M도 보존)
+    old_header = header  # 패딩된 헤더
+
     new_rows: list[list[str]] = []
     for row in values[1:]:
+        rp = list(row) + [""] * (max_cols - len(row))
         nr: list[str] = []
-        for col in YOUTOO_HEADER:
-            idx = _youtoo_find_header_index(old_header, col)
-            if idx is not None and idx < len(row):
-                nr.append(row[idx])
+        for col_name in YOUTOO_HEADER:
+            idx = _youtoo_find_header_index(old_header, col_name)
+            if idx is None:
+                # 헤더명이 비어있던 경우를 대비해, L/M은 "위치 기반"으로도 복원 시도
+                if col_name in YOUTOO_MANUAL_HEADER:
+                    pos = YOUTOO_HEADER.index(col_name)
+                    nr.append(rp[pos] if pos < len(rp) else "")
+                else:
+                    nr.append("")
             else:
-                nr.append("")
+                nr.append(rp[idx] if idx < len(rp) else "")
+
         # 완전 빈 행은 건너뛰기(공백 공간 누적 방지)
         if any((x or "").strip() for x in nr):
             new_rows.append(nr)
@@ -2965,14 +3039,13 @@ def ensure_youtoo_header(ws) -> None:
     except Exception:
         pass
 
-    # cols 보정
     try:
-        ws.resize(cols=max(len(YOUTOO_HEADER), ws.col_count))
+        if getattr(ws, "col_count", 0) < len(YOUTOO_HEADER):
+            ws.resize(cols=len(YOUTOO_HEADER))
     except Exception:
         pass
 
     ws.update("A1", [YOUTOO_HEADER] + new_rows, value_input_option="RAW")
-
 
 def get_youtoo_ws():
     """youtoo 탭 워크시트 반환(없으면 생성 + 헤더 세팅)."""
@@ -2986,10 +3059,14 @@ def get_youtoo_ws():
         ws = _get_ws_by_name(sh, YOUTOO_SHEET_NAME)
         if not ws:
             ws = sh.add_worksheet(title=YOUTOO_SHEET_NAME, rows=2000, cols=max(10, len(YOUTOO_HEADER)))
+
+        # ✅ cols는 "필요할 때만 확장" (절대 축소 금지: 수기 L/M 보호)
         try:
-            ws.resize(cols=max(10, len(YOUTOO_HEADER)))
+            if getattr(ws, "col_count", 0) < len(YOUTOO_HEADER):
+                ws.resize(cols=len(YOUTOO_HEADER))
         except Exception:
             pass
+
         ensure_youtoo_header(ws)
         return ws
     except Exception as e:
@@ -3090,7 +3167,8 @@ def upsert_youtoo_rows_top(rows: list[list[str]]) -> tuple[bool, int, int]:
         if sid in existing_map:
             row_num = existing_map[sid]
             try:
-                ws.update(f"A{row_num}", [rr], value_input_option="RAW")
+                rr_auto = rr[: len(YOUTOO_AUTO_HEADER)]
+                ws.update(f"A{row_num}:{YOUTOO_AUTO_END_COL}{row_num}", [rr_auto], value_input_option="RAW")
                 updated += 1
             except Exception as e:
                 print(f"[GSHEET][YOUTOO] update 실패(src_id={sid}): {e}")
