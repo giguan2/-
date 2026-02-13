@@ -2888,17 +2888,91 @@ def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
 
 # ───────────────── Naver Cafe → Google Sheet (youtoo 탭) ─────────────────
 # youtoo 탭: 카페 게시글 백업/수집용
+
 YOUTOO_SHEET_NAME = (os.getenv("YOUTOO_SHEET_NAME") or "youtoo").strip()
-YOUTOO_HEADER = ["경기", "댓글수", "별명", "게시시간(날짜)", "조회수", "좋아요", "본문링크", "src_id"]
+
+# ✅ 사용자가 원하는 최종 헤더 순서(고정)
+YOUTOO_HEADER = [
+    "src_id",
+    "경기",
+    "댓글수",
+    "조회수",
+    "좋아요",
+    "본문링크",
+    "첫댓글내용",
+    "첫댓글작성자",
+    "첫댓글시간",
+    "게시시간(날짜)",
+    "별명",
+]
+
+# 과거 버전/표기 차이 호환(자동 마이그레이션용)
+_YOUTOO_COL_ALIASES: dict[str, list[str]] = {
+    "첫댓글내용": ["첫댓글"],
+    "첫댓글작성자": ["첫댓글별명", "첫댓글닉네임"],
+}
+
+def _youtoo_find_header_index(old_header: list[str], col: str) -> int | None:
+    """old_header에서 col(또는 별칭)의 위치를 찾는다."""
+    try:
+        return old_header.index(col)
+    except ValueError:
+        pass
+    for alt in _YOUTOO_COL_ALIASES.get(col, []):
+        try:
+            return old_header.index(alt)
+        except ValueError:
+            continue
+    return None
+
 
 def ensure_youtoo_header(ws) -> None:
-    """youtoo 시트 헤더가 다르면 강제로 맞춘다."""
+    """youtoo 시트 헤더를 최신 스펙으로 맞춘다.
+
+    - 헤더가 비어있으면 1행에 헤더를 깐다.
+    - 헤더가 다르면(과거 버전 포함) 기존 데이터를 가능한 한 매핑해서
+      ✅ 새 헤더 순서로 재정렬(마이그레이션)한 뒤 갱신한다.
+    """
     try:
-        top = ws.row_values(1)
+        values = ws.get_all_values()
     except Exception:
-        top = []
-    if (not top) or top[: len(YOUTOO_HEADER)] != YOUTOO_HEADER:
+        values = []
+
+    if not values:
         ws.update("A1", [YOUTOO_HEADER])
+        return
+
+    old_header = [c.strip() for c in (values[0] or [])]
+    if old_header == YOUTOO_HEADER:
+        return
+
+    # 기존 데이터 → 새 헤더 순서로 매핑
+    new_rows: list[list[str]] = []
+    for row in values[1:]:
+        nr: list[str] = []
+        for col in YOUTOO_HEADER:
+            idx = _youtoo_find_header_index(old_header, col)
+            if idx is not None and idx < len(row):
+                nr.append(row[idx])
+            else:
+                nr.append("")
+        # 완전 빈 행은 건너뛰기(공백 공간 누적 방지)
+        if any((x or "").strip() for x in nr):
+            new_rows.append(nr)
+
+    try:
+        ws.clear()
+    except Exception:
+        pass
+
+    # cols 보정
+    try:
+        ws.resize(cols=max(len(YOUTOO_HEADER), ws.col_count))
+    except Exception:
+        pass
+
+    ws.update("A1", [YOUTOO_HEADER] + new_rows, value_input_option="RAW")
+
 
 def get_youtoo_ws():
     """youtoo 탭 워크시트 반환(없으면 생성 + 헤더 세팅)."""
@@ -2922,8 +2996,9 @@ def get_youtoo_ws():
         print(f"[GSHEET][YOUTOO] 워크시트 준비 실패({YOUTOO_SHEET_NAME}): {e}")
         return None
 
+
 def get_existing_youtoo_src_ids() -> set[str]:
-    """youtoo 시트에서 src_id 목록을 읽어 중복 저장 방지용 set으로 반환."""
+    """youtoo 시트에서 src_id 목록을 읽어 중복/업데이트 판단용 set으로 반환."""
     ws = get_youtoo_ws()
     if not ws:
         return set()
@@ -2932,10 +3007,13 @@ def get_existing_youtoo_src_ids() -> set[str]:
         values = ws.get_all_values()
         if not values:
             return set()
+
         header = [c.strip() for c in values[0]]
-        if "src_id" not in header:
+        try:
+            idx = header.index("src_id")
+        except ValueError:
             return set()
-        idx = header.index("src_id")
+
         out: set[str] = set()
         for row in values[1:]:
             if len(row) > idx:
@@ -2947,21 +3025,90 @@ def get_existing_youtoo_src_ids() -> set[str]:
         print(f"[GSHEET][YOUTOO] 기존 src_id 로딩 실패: {e}")
         return set()
 
-def append_youtoo_rows(rows: list[list[str]]) -> bool:
-    """youtoo 시트에 rows append."""
+
+def upsert_youtoo_rows_top(rows: list[list[str]]) -> tuple[bool, int, int]:
+    """youtoo 시트에 rows를 upsert 하되, ✅ 신규는 2행(헤더 아래)에 삽입해서 '위로 업데이트'되게 만든다.
+
+    반환: (ok, inserted_count, updated_count)
+
+    - src_id 기준으로 중복을 판단한다.
+    - 이미 존재하면 해당 행을 덮어쓴다(댓글수/조회수/좋아요 등이 갱신될 수 있으므로).
+    - 신규는 insert_rows(row=2)로 상단에 붙인다.
+    """
     if not rows:
-        return True
+        return True, 0, 0
+
     ws = get_youtoo_ws()
     if not ws:
-        return False
-    try:
-        ws.append_rows(rows, value_input_option="RAW", table_range="A1")
-        print(f"[GSHEET][YOUTOO] {YOUTOO_SHEET_NAME} 에 {len(rows)}건 추가")
-        return True
-    except Exception as e:
-        print(f"[GSHEET][YOUTOO] append_rows 오류: {e}")
-        return False
+        return False, 0, 0
 
+    # 헤더 보정/마이그레이션
+    ensure_youtoo_header(ws)
+
+    try:
+        values = ws.get_all_values()
+    except Exception:
+        values = []
+
+    if not values:
+        ws.update("A1", [YOUTOO_HEADER])
+        values = [YOUTOO_HEADER]
+
+    header = [c.strip() for c in values[0]]
+    try:
+        idx_src = header.index("src_id")
+    except ValueError:
+        idx_src = 0
+
+    # src_id -> row_number(1-indexed)
+    existing_map: dict[str, int] = {}
+    for i, row in enumerate(values[1:], start=2):
+        if len(row) > idx_src:
+            sid = (row[idx_src] or "").strip()
+            if sid and sid not in existing_map:
+                existing_map[sid] = i
+
+    updated = 0
+    to_insert: list[list[str]] = []
+    seen: set[str] = set()
+
+    # 1) 기존 행 업데이트(삽입 전에 수행해야 row index가 흔들리지 않음)
+    for r in rows:
+        if not r:
+            continue
+        rr = list(r)
+        if len(rr) < len(YOUTOO_HEADER):
+            rr += [""] * (len(YOUTOO_HEADER) - len(rr))
+        elif len(rr) > len(YOUTOO_HEADER):
+            rr = rr[: len(YOUTOO_HEADER)]
+
+        sid = (rr[idx_src] or "").strip()
+        if (not sid) or (sid in seen):
+            continue
+        seen.add(sid)
+
+        if sid in existing_map:
+            row_num = existing_map[sid]
+            try:
+                ws.update(f"A{row_num}", [rr], value_input_option="RAW")
+                updated += 1
+            except Exception as e:
+                print(f"[GSHEET][YOUTOO] update 실패(src_id={sid}): {e}")
+        else:
+            to_insert.append(rr)
+
+    inserted = 0
+    if to_insert:
+        try:
+            # ✅ 신규는 맨 위(2행)에 넣어서 최신이 위로 오게 한다.
+            ws.insert_rows(to_insert, row=2, value_input_option="RAW")
+            inserted = len(to_insert)
+        except Exception as e:
+            print(f"[GSHEET][YOUTOO] insert_rows 오류: {e}")
+            return False, inserted, updated
+
+    print(f"[GSHEET][YOUTOO] {YOUTOO_SHEET_NAME}: inserted={inserted}, updated={updated}")
+    return True, inserted, updated
 
 
 def get_existing_site_src_ids(day_str: str) -> set[str]:
@@ -6827,6 +6974,31 @@ NAVER_CAFE_WEB_CAFE_ID = (os.getenv("NAVER_CAFE_WEB_CAFE_ID") or "18677861").str
 NAVER_CAFE_WEB_MENU_ID = (os.getenv("NAVER_CAFE_WEB_MENU_ID") or "20").strip()
 NAVER_CAFE_WEB_SORT_BY = (os.getenv("NAVER_CAFE_WEB_SORT_BY") or "TIME").strip()
 NAVER_CAFE_WEB_VIEW_TYPE = (os.getenv("NAVER_CAFE_WEB_VIEW_TYPE") or "L").strip()
+# 댓글 목록 API(웹 내부). 환경변수로 템플릿을 지정하면 가장 안정적이다.
+# - NAVER_CAFE_COMMENT_URL_TEMPLATE 예)
+#   https://apis.naver.com/cafe-web/cafe-comment-api/v1/cafes/{cafeId}/articles/{articleId}/comments?page=1&pageSize=20&sortBy=TIME
+NAVER_CAFE_COMMENT_URL_TEMPLATE = (os.getenv("NAVER_CAFE_COMMENT_URL_TEMPLATE") or "").strip()
+
+def _build_comment_url_candidates(cafe_id: str, article_id: str) -> list[str]:
+    """댓글 목록 API 후보 URL 리스트.
+    네이버가 내부 API를 바꾸는 경우가 있어서, 템플릿을 환경변수로 지정하는 걸 권장한다.
+    """
+    if NAVER_CAFE_COMMENT_URL_TEMPLATE:
+        return [
+            NAVER_CAFE_COMMENT_URL_TEMPLATE.format(cafeId=cafe_id, articleId=article_id, cafe_id=cafe_id, article_id=article_id)
+        ]
+
+    # 기본 후보(실패할 수 있음). 실제 운영에서는 템플릿을 설정하는 걸 권장.
+    base = "https://apis.naver.com/cafe-web"
+    return [
+        f"{base}/cafe-comment-api/v1/cafes/{cafe_id}/articles/{article_id}/comments?page=1&pageSize=20&sortBy=TIME",
+        f"{base}/cafe-comment-api/v2/cafes/{cafe_id}/articles/{article_id}/comments?page=1&pageSize=20&sortBy=TIME",
+        f"{base}/cafe-comment-api/v3/cafes/{cafe_id}/articles/{article_id}/comments?page=1&pageSize=20&sortBy=TIME",
+        f"{base}/cafe-comment-api/v1/cafes/{cafe_id}/articles/{article_id}/comments?page=1&pageSize=20",
+        f"{base}/cafe-comment-api/v2/cafes/{cafe_id}/articles/{article_id}/comments?page=1&pageSize=20",
+        f"{base}/cafe-comment-api/v1/cafes/{cafe_id}/articles/{article_id}/best-comments?page=1&pageSize=20",
+    ]
+
 
 def _get_naver_web_cookie() -> str:
     """Render 환경변수에 저장된 쿠키 문자열을 가져온다.
@@ -6921,6 +7093,70 @@ async def _fetch_cafe_boardlist_page(
     except Exception:
         return r.status_code, None, snippet
 
+
+async def _fetch_first_comment(
+    client: httpx.AsyncClient,
+    *,
+    cafe_id: str,
+    article_id: str,
+    cookie: str,
+) -> tuple[str, str, str]:
+    """해당 게시글의 '첫 댓글'을 가져온다.
+
+    반환: (content, nick, time_kst_str)
+    - 댓글이 없거나 실패하면 ("", "", "") 반환
+    """
+    # 댓글이 없을 때는 굳이 호출하지 않도록 youtoo()에서 commentCount로 1차 거름.
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json, text/plain, */*",
+        "Cookie": cookie,
+        # Referer/Origin을 넣어야 정상 응답이 오는 경우가 많다.
+        "Referer": f"{NAVER_CAFE_BASE_URL}/{article_id}",
+        "Origin": "https://cafe.naver.com",
+    }
+
+    for url in _build_comment_url_candidates(cafe_id, str(article_id)):
+        try:
+            r = await client.get(url, headers=headers, timeout=15.0)
+        except Exception:
+            continue
+
+        if r.status_code in (401, 403):
+            # 쿠키/권한 문제
+            return ("", "", "")
+
+        if not (200 <= r.status_code < 300):
+            continue
+
+        try:
+            data = r.json()
+        except Exception:
+            continue
+
+        # 기대 구조: {"comments": {"items": [ ... ]}}
+        comments = data.get("comments") if isinstance(data, dict) else None
+        items = (comments or {}).get("items") if isinstance(comments, dict) else None
+        if not isinstance(items, list) or not items:
+            # 다른 응답 스키마 가능성 대비: {"result":{"comments":{"items":[]}}}
+            result = data.get("result") if isinstance(data, dict) else None
+            comments = (result or {}).get("comments") if isinstance(result, dict) else None
+            items = (comments or {}).get("items") if isinstance(comments, dict) else None
+
+        if not isinstance(items, list) or not items:
+            continue
+
+        first = items[0] if isinstance(items[0], dict) else None
+        if not isinstance(first, dict):
+            continue
+
+        content = str(first.get("content") or "").strip()
+        writer = first.get("writer") if isinstance(first.get("writer"), dict) else {}
+        nick = str((writer or {}).get("nick") or "").strip()
+        t = _ms_to_kst_str(first.get("updateDate"))
+        return (content, nick, t)
+
+    return ("", "", "")
 async def youtoo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/youtoo 명령어:
     네이버 카페(기본: 18677861) 메뉴(기본: 20) 글 목록을 가져와 구글시트 youtoo 탭에 저장한다.
@@ -7004,10 +7240,8 @@ async def youtoo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("구글시트(youtoo 탭) 준비에 실패했습니다. SPREADSHEET_ID/권한을 확인하세요.")
         return
 
-    existing = get_existing_youtoo_src_ids()
     new_rows: list[list[str]] = []
-    added = 0
-    dup = 0
+    seen: set[str] = set()
 
     sort_by = NAVER_CAFE_WEB_SORT_BY
     view_type = NAVER_CAFE_WEB_VIEW_TYPE
@@ -7060,9 +7294,10 @@ async def youtoo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         continue
 
                     src_id = f"navercafe:{cafe_id}:{menu_id}:{article_id}"
-                    if src_id in existing:
-                        dup += 1
+                    # 동일 실행 내 중복만 방지(시트에 이미 있어도 '업데이트' 대상이므로 스킵하지 않음)
+                    if src_id in seen:
                         continue
+                    seen.add(src_id)
 
                     subject = str(item.get("subject") or "").strip()
                     comment_cnt = item.get("commentCount")
@@ -7077,24 +7312,42 @@ async def youtoo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     read_cnt = str(item.get("readCount") or 0)
                     like_cnt = str(item.get("likeCount") or 0)
 
+
+                    # 첫 댓글(있을 때만 추가 호출)
+                    first_comment = ""
+                    first_comment_nick = ""
+                    first_comment_time = ""
+                    try:
+                        _cc = int(str(comment_cnt))
+                    except Exception:
+                        _cc = 0
+                    if _cc > 0:
+                        first_comment, first_comment_nick, first_comment_time = await _fetch_first_comment(
+                            client,
+                            cafe_id=cafe_id,
+                            article_id=str(article_id),
+                            cookie=cookie,
+                        )
+
                     # 본문 링크(카페 별칭 URL 기반)
                     link = f"{NAVER_CAFE_BASE_URL}/{article_id}"
 
-                    new_rows.append([subject, comment_cnt, nick, posted_at, read_cnt, like_cnt, link, src_id])
-                    existing.add(src_id)
-                    added += 1
+                    new_rows.append([src_id, subject, comment_cnt, read_cnt, like_cnt, link, first_comment, first_comment_nick, first_comment_time, posted_at, nick])
 
-        # 시트 저장
+        # 시트 저장 (✅ 신규는 상단 삽입 / 기존은 덮어쓰기)
+        inserted = 0
+        updated = 0
         if new_rows:
-            ok = append_youtoo_rows(new_rows)
+            ok, inserted, updated = upsert_youtoo_rows_top(new_rows)
             if not ok:
                 await update.message.reply_text("구글시트(youtoo)에 저장하지 못했습니다. 권한/시트 상태를 확인하세요.")
                 return
 
         await update.message.reply_text(
             f"✅ youtoo 수집 완료\n"
-            f"- 추가 저장: {added}건\n"
-            f"- 중복 스킵: {dup}건\n"
+            f"- 신규 추가(상단): {inserted}건\n"
+            f"- 기존 업데이트: {updated}건\n"
+            f"- 수집: {len(new_rows)}건\n"
             f"- 대상 페이지: {start_page}~{start_page + pages - 1} (pageSize={page_size})"
         )
 
