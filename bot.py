@@ -6977,28 +6977,107 @@ NAVER_CAFE_WEB_VIEW_TYPE = (os.getenv("NAVER_CAFE_WEB_VIEW_TYPE") or "L").strip(
 # 댓글 목록 API(웹 내부). 환경변수로 템플릿을 지정하면 가장 안정적이다.
 # - NAVER_CAFE_COMMENT_URL_TEMPLATE 예)
 #   https://apis.naver.com/cafe-web/cafe-comment-api/v1/cafes/{cafeId}/articles/{articleId}/comments?page=1&pageSize=20&sortBy=TIME
+# 댓글 목록 API(웹 내부). 가장 안정적인 건 브라우저(Network)에서 확인한 "댓글 목록" Request URL 패턴을
+# 템플릿으로 지정하는 것이다.
+#
+# ✅ 2026-02 기준 댓글 목록 URL 패턴(예):
+#   https://article.cafe.naver.com/gw/v4/cafes/{cafeId}/articles/{articleId}/comments/pages/1
+#
+# 위 URL 끝에 querystring이 붙는 경우가 있는데(브라우저 Network의 Request URL에서 '?...' 부분),
+# Render 환경변수 NAVER_CAFE_COMMENT_QUERYSTRING 에 '?' 뒤의 문자열을 그대로 넣으면 된다.
+#
+# - NAVER_CAFE_COMMENT_URL_TEMPLATE: 댓글 목록 URL 템플릿(권장)
+# - NAVER_CAFE_COMMENT_QUERYSTRING: 댓글 목록 URL에 붙는 쿼리스트링(선택)
 NAVER_CAFE_COMMENT_URL_TEMPLATE = (os.getenv("NAVER_CAFE_COMMENT_URL_TEMPLATE") or "").strip()
+NAVER_CAFE_COMMENT_QUERYSTRING = (
+    (os.getenv("NAVER_CAFE_COMMENT_QUERYSTRING") or "").strip()
+    or (os.getenv("NAVER_CAFE_COMMENT_QS") or "").strip()
+)
+
+def _normalize_qs(q: str) -> str:
+    q = (q or "").strip()
+    if not q:
+        return ""
+    if q.startswith("?"):
+        q = q[1:].strip()
+    return q
+
+def _append_qs(url: str, q: str) -> str:
+    q = _normalize_qs(q)
+    if not q:
+        return url
+    if "?" in url:
+        # 이미 쿼리가 있으면 '&'로 이어붙인다.
+        if url.endswith("?") or url.endswith("&"):
+            return f"{url}{q}"
+        return f"{url}&{q}"
+    return f"{url}?{q}"
 
 def _build_comment_url_candidates(cafe_id: str, article_id: str) -> list[str]:
     """댓글 목록 API 후보 URL 리스트.
-    네이버가 내부 API를 바꾸는 경우가 있어서, 템플릿을 환경변수로 지정하는 걸 권장한다.
-    """
-    if NAVER_CAFE_COMMENT_URL_TEMPLATE:
-        return [
-            NAVER_CAFE_COMMENT_URL_TEMPLATE.format(cafeId=cafe_id, articleId=article_id, cafe_id=cafe_id, article_id=article_id)
-        ]
 
-    # 기본 후보(실패할 수 있음). 실제 운영에서는 템플릿을 설정하는 걸 권장.
+    ✅ 2026-02 기준: 댓글 목록은 `article.cafe.naver.com/gw/v4/.../comments/pages/1` 형태로 내려오는 경우가 많다.
+    - 가장 확실한 방법: 브라우저 Network에서 확인한 URL 패턴을 NAVER_CAFE_COMMENT_URL_TEMPLATE로 지정
+    - URL에 querystring이 붙는 경우: NAVER_CAFE_COMMENT_QUERYSTRING에 '?' 뒤 문자열을 지정
+    """
+    candidates: list[str] = []
+
+    # 1) 사용자 지정 템플릿(가장 안정)
+    if NAVER_CAFE_COMMENT_URL_TEMPLATE:
+        u = NAVER_CAFE_COMMENT_URL_TEMPLATE.format(
+            cafeId=cafe_id,
+            articleId=article_id,
+            cafe_id=cafe_id,
+            article_id=article_id,
+        )
+        if NAVER_CAFE_COMMENT_QUERYSTRING and "?" not in u:
+            candidates.append(_append_qs(u, NAVER_CAFE_COMMENT_QUERYSTRING))
+        candidates.append(u)
+
+        # 중복 제거(순서 유지)
+        out: list[str] = []
+        seen: set[str] = set()
+        for x in candidates:
+            if x and x not in seen:
+                out.append(x)
+                seen.add(x)
+        return out
+
+    # 2) 기본(추천) 패턴: article.cafe gateway
+    base_article = f"https://article.cafe.naver.com/gw/v4/cafes/{cafe_id}/articles/{article_id}/comments/pages/1"
+    qs_options: list[str] = []
+    if NAVER_CAFE_COMMENT_QUERYSTRING:
+        qs_options.append(NAVER_CAFE_COMMENT_QUERYSTRING)
+    qs_options.append("")  # 쿼리 없이도 되는 경우가 있어 먼저 시도
+
+    # 흔한 후보(필수는 아님 - 네이버가 요구하는 파라미터가 있으면 env로 지정 권장)
+    qs_options.extend([
+        "pageSize=20",
+        "pageSize=50",
+        "pageSize=20&sortBy=TIME",
+        "pageSize=50&sortBy=TIME",
+    ])
+
+    for q in qs_options:
+        candidates.append(_append_qs(base_article, q) if q else base_article)
+
+    # 3) 과거/대체 패턴(cafe-web) - fallback
     base = "https://apis.naver.com/cafe-web"
-    return [
+    candidates.extend([
         f"{base}/cafe-comment-api/v1/cafes/{cafe_id}/articles/{article_id}/comments?page=1&pageSize=20&sortBy=TIME",
         f"{base}/cafe-comment-api/v2/cafes/{cafe_id}/articles/{article_id}/comments?page=1&pageSize=20&sortBy=TIME",
         f"{base}/cafe-comment-api/v3/cafes/{cafe_id}/articles/{article_id}/comments?page=1&pageSize=20&sortBy=TIME",
-        f"{base}/cafe-comment-api/v1/cafes/{cafe_id}/articles/{article_id}/comments?page=1&pageSize=20",
-        f"{base}/cafe-comment-api/v2/cafes/{cafe_id}/articles/{article_id}/comments?page=1&pageSize=20",
         f"{base}/cafe-comment-api/v1/cafes/{cafe_id}/articles/{article_id}/best-comments?page=1&pageSize=20",
-    ]
+    ])
 
+    # 중복 제거(순서 유지)
+    out: list[str] = []
+    seen: set[str] = set()
+    for x in candidates:
+        if x and x not in seen:
+            out.append(x)
+            seen.add(x)
+    return out
 
 def _get_naver_web_cookie() -> str:
     """Render 환경변수에 저장된 쿠키 문자열을 가져온다.
@@ -7107,13 +7186,21 @@ async def _fetch_first_comment(
     - 댓글이 없거나 실패하면 ("", "", "") 반환
     """
     # 댓글이 없을 때는 굳이 호출하지 않도록 youtoo()에서 commentCount로 1차 거름.
+    ua = (
+        (os.getenv("NAVER_USER_AGENT") or "").strip()
+        or (os.getenv("MAZ_USER_AGENT") or "").strip()
+        or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    )
     headers = {
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": ua,
         "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Connection": "keep-alive",
         "Cookie": cookie,
         # Referer/Origin을 넣어야 정상 응답이 오는 경우가 많다.
         "Referer": f"{NAVER_CAFE_BASE_URL}/{article_id}",
         "Origin": "https://cafe.naver.com",
+        "X-Requested-With": "XMLHttpRequest",
     }
 
     for url in _build_comment_url_candidates(cafe_id, str(article_id)):
