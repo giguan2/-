@@ -2239,7 +2239,8 @@ from oauth2client.service_account import ServiceAccountCredentials
 
 # ───────────────── 기본 설정 ─────────────────
 TOKEN = os.getenv("BOT_TOKEN")
-APP_URL = (os.getenv("APP_URL") or "").strip()
+APP_URL = (os.getenv("APP_URL") or "").strip().rstrip("/")
+WEBHOOK_PATH = (os.getenv("TELEGRAM_WEBHOOK_PATH") or "telegram").strip().lstrip("/")
 CHANNEL_ID = (os.getenv("CHANNEL_ID") or "").strip()  # 예: @채널아이디 또는 -100xxxxxxxxxxxx
 
 # 🔴 여기만 네 봇 유저네임으로 수정하면 됨 (@ 빼고)
@@ -7597,8 +7598,8 @@ def main():
     app.run_webhook(
         listen="0.0.0.0",
         port=port,
-        url_path=TOKEN,
-        webhook_url=f"{APP_URL}/{TOKEN}",
+        url_path=WEBHOOK_PATH,
+        webhook_url=f"{APP_URL}/{WEBHOOK_PATH}",
     )
 
 
