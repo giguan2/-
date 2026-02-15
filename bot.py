@@ -2171,7 +2171,7 @@ def _log_httpx_exception(prefix: str, e: Exception) -> None:
 # ----------------------------
 # HTTP helpers (Mazgtv anti-bot 대응: 브라우저 헤더 + 쿠키 워밍업)
 # ----------------------------
-MAZ_BASE_URL = os.getenv("MAZ_BASE_URL", "https://mazgtv3.com").rstrip("/")
+MAZ_BASE_URL = os.getenv("MAZ_BASE_URL", "https://mazgtv2.com").rstrip("/")
 MAZ_LIST_API = os.getenv("MAZ_LIST_API", f"{MAZ_BASE_URL}/api/board/list")
 
 
@@ -2265,6 +2265,78 @@ def is_admin(update: Update) -> bool:
         return True
     user = update.effective_user
     return bool(user and user.id in ADMIN_IDS)
+
+# ───────────────── 중복 실행 방지 (Webhook 재전송/중복 업데이트 대응) ─────────────────
+# Render/Telegram 환경에서 간헐적으로 동일 update 가 여러 번 전달되는 경우가 있어,
+# update_id 기준으로 중복 처리를 걸러냅니다.
+DEDUP_TTL_SEC = int(os.getenv("DEDUP_TTL_SEC", "900"))  # 기본 15분
+
+# update_id -> 마지막 처리 시각(epoch)
+_PROCESSED_UPDATE_IDS: dict[int, float] = {}
+_PROCESSED_LOCK = asyncio.Lock()
+
+# (chat_id, command) 단위로 동시에 한 번만 실행되도록 락
+_RUNNING_COMMANDS: set[tuple[int, str]] = set()
+_RUNNING_LOCK = asyncio.Lock()
+
+
+async def _dedup_seen(update: Update) -> bool:
+    """이미 처리된 update면 True (중복)"""
+    uid = getattr(update, "update_id", None)
+    if uid is None:
+        return False
+
+    now = time.time()
+    async with _PROCESSED_LOCK:
+        # TTL 정리
+        if _PROCESSED_UPDATE_IDS:
+            expired = [k for k, ts in _PROCESSED_UPDATE_IDS.items() if now - ts > DEDUP_TTL_SEC]
+            for k in expired:
+                _PROCESSED_UPDATE_IDS.pop(k, None)
+
+        if uid in _PROCESSED_UPDATE_IDS:
+            print(f"[DEDUP] drop duplicate update_id={uid}")
+            return True
+
+        _PROCESSED_UPDATE_IDS[uid] = now
+        return False
+
+
+def wrap_command(func, command_name: str):
+    """CommandHandler에 붙일 중복 방지 래퍼"""
+    async def _wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # 1) 같은 update_id 재처리 방지
+        if await _dedup_seen(update):
+            return
+
+        # 2) 같은 채팅에서 같은 명령어 동시 실행 방지 (중복 클릭/재전송 대비)
+        chat_id = 0
+        try:
+            if update.effective_chat:
+                chat_id = int(update.effective_chat.id)
+        except Exception:
+            chat_id = 0
+
+        key = (chat_id, command_name)
+        async with _RUNNING_LOCK:
+            if key in _RUNNING_COMMANDS:
+                # 너무 시끄럽게 하지 않도록 1회만 안내하고 끝냄
+                try:
+                    if update.message:
+                        await update.message.reply_text("⏳ 이미 실행 중입니다. 완료될 때까지 잠시만 기다려 주세요.")
+                except Exception:
+                    pass
+                return
+            _RUNNING_COMMANDS.add(key)
+
+        try:
+            await func(update, context)
+        finally:
+            async with _RUNNING_LOCK:
+                _RUNNING_COMMANDS.discard(key)
+
+    return _wrapped
+
 
 
 # ───────────────── 날짜 헬퍼 ─────────────────
@@ -5046,7 +5118,7 @@ async def crawl_maz_analysis_common(
 
     try:
         async with httpx.AsyncClient(
-            headers=BROWSER_HEADERS,
+            headers={"User-Agent": "Mozilla/5.0"},
             follow_redirects=True,
         ) as client:
             await _maz_warmup(client)
@@ -5067,23 +5139,6 @@ async def crawl_maz_analysis_common(
                 except Exception as e:
                     print(f"[MAZ][LIST] JSON 파싱 실패(page={page}): {e}")
                     print("  응답 일부:", r.text[:200])
-
-                    # 응답이 HTML이면(<!doctype ...>) API 경로/권한/헤더 변화 가능성이 큽니다.
-                    head = (r.text or "").lstrip()[:200].lower()
-                    if head.startswith("<!doctype") or head.startswith("<html"):
-                        try:
-                            await update.message.reply_text(
-                                "⚠️ mazgtv 목록 API가 JSON이 아니라 HTML을 반환합니다.\n"
-                                "도메인 변경(mazgtv3) 이후 API 경로/요청 방식이 바뀌었을 가능성이 큽니다.\n\n"
-                                f"- 현재 MAZ_LIST_API: {MAZ_LIST_API}\n"
-                                "브라우저 개발자도구(Network → Fetch/XHR)에서 '목록'을 불러오는 JSON 요청 URL을 확인해서\n"
-                                "그 URL을 MAZ_LIST_API 환경변수로 지정한 뒤 다시 시도해 주세요."
-                            )
-                        except Exception:
-                            pass
-                        break
-
-                    # HTML이 아니면 일시적 오류일 수 있으니 다음 페이지로 진행
                     continue
 
                 if isinstance(data, dict):
@@ -7546,65 +7601,65 @@ def main():
 
     app = ApplicationBuilder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("myid", myid))
+    app.add_handler(CommandHandler("start", wrap_command(start, "start")))
+    app.add_handler(CommandHandler("myid", wrap_command(myid, "myid")))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    app.add_handler(CommandHandler("publish", publish))
-    app.add_handler(CommandHandler("syncsheet", syncsheet))
+    app.add_handler(CommandHandler("publish", wrap_command(publish, "publish")))
+    app.add_handler(CommandHandler("syncsheet", wrap_command(syncsheet, "syncsheet")))
     # 뉴스 시트 전체 초기화
-    app.add_handler(CommandHandler("newsclean", newsclean))
+    app.add_handler(CommandHandler("newsclean", wrap_command(newsclean, "newsclean")))
     # today / tomorrow / news 전체 초기화
-    app.add_handler(CommandHandler("allclean", allclean))
+    app.add_handler(CommandHandler("allclean", wrap_command(allclean, "allclean")))
 
     # export_tomorrow → export_today 롤오버
-    app.add_handler(CommandHandler("export_rollover", export_rollover))    
-    app.add_handler(CommandHandler("youtoo", youtoo))  # 네이버 카페 메뉴 글 수집 → youtoo 시트
+    app.add_handler(CommandHandler("export_rollover", wrap_command(export_rollover, "export_rollover")))
+    app.add_handler(CommandHandler("youtoo", wrap_command(youtoo, "youtoo")))  # 네이버 카페 메뉴 글 수집 → youtoo 시트
 
     # 네이버 카페 자동 글쓰기(종목별 게시판)  ※ /cafe_soccer [tomorrow] 처럼 사용
-    app.add_handler(CommandHandler("cafe_soccer", cafe_soccer))
-    app.add_handler(CommandHandler("cafe_baseball", cafe_baseball))
-    app.add_handler(CommandHandler("cafe_basketball", cafe_basketball))
-    app.add_handler(CommandHandler("cafe_volleyball", cafe_volleyball))
+    app.add_handler(CommandHandler("cafe_soccer", wrap_command(cafe_soccer, "cafe_soccer")))
+    app.add_handler(CommandHandler("cafe_baseball", wrap_command(cafe_baseball, "cafe_baseball")))
+    app.add_handler(CommandHandler("cafe_basketball", wrap_command(cafe_basketball, "cafe_basketball")))
+    app.add_handler(CommandHandler("cafe_volleyball", wrap_command(cafe_volleyball, "cafe_volleyball")))
 
     # 네이버 카페 자동 글쓰기(심층 분석 게시판)  ※ /cafe_soccer_deep [tomorrow]
-    app.add_handler(CommandHandler("cafe_soccer_deep", cafe_soccer_deep))
-    app.add_handler(CommandHandler("cafe_baseball_deep", cafe_baseball_deep))
-    app.add_handler(CommandHandler("cafe_basketball_deep", cafe_basketball_deep))
-    app.add_handler(CommandHandler("cafe_volleyball_deep", cafe_volleyball_deep))
+    app.add_handler(CommandHandler("cafe_soccer_deep", wrap_command(cafe_soccer_deep, "cafe_soccer_deep")))
+    app.add_handler(CommandHandler("cafe_baseball_deep", wrap_command(cafe_baseball_deep, "cafe_baseball_deep")))
+    app.add_handler(CommandHandler("cafe_basketball_deep", wrap_command(cafe_basketball_deep, "cafe_basketball_deep")))
+    app.add_handler(CommandHandler("cafe_volleyball_deep", wrap_command(cafe_volleyball_deep, "cafe_volleyball_deep")))
 
     # 뉴스 큐 → 네이버 카페 업로드 (menuId=31, 뉴스용 토큰)
-    app.add_handler(CommandHandler("cafe_news_upload", cafe_news_upload))
+    app.add_handler(CommandHandler("cafe_news_upload", wrap_command(cafe_news_upload, "cafe_news_upload")))
 
     # 네이버 카페 자동 글쓰기    # 분석 시트 부분 초기화 명령어들 (모두 tomorrow 시트 기준)
-    app.add_handler(CommandHandler("soccerclean", soccerclean))
-    app.add_handler(CommandHandler("baseballclean", baseballclean))
-    app.add_handler(CommandHandler("basketclean", basketclean))
-    app.add_handler(CommandHandler("volleyclean", volleyclean))
-    app.add_handler(CommandHandler("etcclean", etcclean))
-    app.add_handler(CommandHandler("analysisclean", analysisclean))
+    app.add_handler(CommandHandler("soccerclean", wrap_command(soccerclean, "soccerclean")))
+    app.add_handler(CommandHandler("baseballclean", wrap_command(baseballclean, "baseballclean")))
+    app.add_handler(CommandHandler("basketclean", wrap_command(basketclean, "basketclean")))
+    app.add_handler(CommandHandler("volleyclean", wrap_command(volleyclean, "volleyclean")))
+    app.add_handler(CommandHandler("etcclean", wrap_command(etcclean, "etcclean")))
+    app.add_handler(CommandHandler("analysisclean", wrap_command(analysisclean, "analysisclean")))
 
-    app.add_handler(CommandHandler("rollover", rollover))
+    app.add_handler(CommandHandler("rollover", wrap_command(rollover, "rollover")))
 
     # 뉴스 크롤링 명령어들 (Daum)
-    app.add_handler(CommandHandler("crawlsoccer", crawlsoccer))             # 해외축구
-    app.add_handler(CommandHandler("crawlsoccerkr", crawlsoccerkr))         # 국내축구
-    app.add_handler(CommandHandler("crawlbaseball", crawlbaseball))         # KBO
-    app.add_handler(CommandHandler("crawloverbaseball", crawloverbaseball)) # 해외야구
-    app.add_handler(CommandHandler("crawlbasketball", crawlbasketball))     # 농구
-    app.add_handler(CommandHandler("crawlvolleyball", crawlvolleyball))     # 배구
+    app.add_handler(CommandHandler("crawlsoccer", wrap_command(crawlsoccer, "crawlsoccer")))             # 해외축구
+    app.add_handler(CommandHandler("crawlsoccerkr", wrap_command(crawlsoccerkr, "crawlsoccerkr")))         # 국내축구
+    app.add_handler(CommandHandler("crawlbaseball", wrap_command(crawlbaseball, "crawlbaseball")))         # KBO
+    app.add_handler(CommandHandler("crawloverbaseball", wrap_command(crawloverbaseball, "crawloverbaseball"))) # 해외야구
+    app.add_handler(CommandHandler("crawlbasketball", wrap_command(crawlbasketball, "crawlbasketball")))     # 농구
+    app.add_handler(CommandHandler("crawlvolleyball", wrap_command(crawlvolleyball, "crawlvolleyball")))     # 배구
 
     # mazgtv 해외축구 분석 (오늘 / 내일 경기 → today / tomorrow 시트)
-    app.add_handler(CommandHandler("crawlmazsoccer_today", crawlmazsoccer_today))
-    app.add_handler(CommandHandler("crawlmazsoccer_tomorrow", crawlmazsoccer_tomorrow))
+    app.add_handler(CommandHandler("crawlmazsoccer_today", wrap_command(crawlmazsoccer_today, "crawlmazsoccer_today")))
+    app.add_handler(CommandHandler("crawlmazsoccer_tomorrow", wrap_command(crawlmazsoccer_tomorrow, "crawlmazsoccer_tomorrow")))
 
     # mazgtv 야구 분석 (오늘 / 내일)
-    app.add_handler(CommandHandler("crawlmazbaseball_today", crawlmazbaseball_today))
-    app.add_handler(CommandHandler("crawlmazbaseball_tomorrow", crawlmazbaseball_tomorrow))
+    app.add_handler(CommandHandler("crawlmazbaseball_today", wrap_command(crawlmazbaseball_today, "crawlmazbaseball_today")))
+    app.add_handler(CommandHandler("crawlmazbaseball_tomorrow", wrap_command(crawlmazbaseball_tomorrow, "crawlmazbaseball_tomorrow")))
 
     # mazgtv 농구 + 배구 분석 (오늘 / 내일)
-    app.add_handler(CommandHandler("bvcrawl_today", bvcrawl_today))
-    app.add_handler(CommandHandler("bvcrawl_tomorrow", bvcrawl_tomorrow))
+    app.add_handler(CommandHandler("bvcrawl_today", wrap_command(bvcrawl_today, "bvcrawl_today")))
+    app.add_handler(CommandHandler("bvcrawl_tomorrow", wrap_command(bvcrawl_tomorrow, "bvcrawl_tomorrow")))
 
 
 
@@ -7622,7 +7677,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 
