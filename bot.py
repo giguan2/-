@@ -2171,14 +2171,14 @@ def _log_httpx_exception(prefix: str, e: Exception) -> None:
 # ----------------------------
 # HTTP helpers (Mazgtv anti-bot 대응: 브라우저 헤더 + 쿠키 워밍업)
 # ----------------------------
-MAZ_BASE_URL = os.getenv("MAZ_BASE_URL", "https://mazgtv2.com").rstrip("/")
+MAZ_BASE_URL = os.getenv("MAZ_BASE_URL", "https://mazgtv3.com").rstrip("/")
 MAZ_LIST_API = os.getenv("MAZ_LIST_API", f"{MAZ_BASE_URL}/api/board/list")
 
 
 def build_maz_list_params(*, page: int = 1, perpage: int = 15, type_: str = "event",
                           boardType: int = 4, category: int = 0,
                           secretFlag: int = 0, fixFlag: bool = True) -> dict:
-    """mazgtv2 list API 파라미터를 표준화한다."""
+    """mazgtv list API 파라미터를 표준화한다."""
     return {
         "page": page,
         "perpage": perpage,
