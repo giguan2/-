@@ -2178,7 +2178,7 @@ MAZ_LIST_API = os.getenv("MAZ_LIST_API", f"{MAZ_BASE_URL}/api/board/list")
 def build_maz_list_params(*, page: int = 1, perpage: int = 15, type_: str = "event",
                           boardType: int = 4, category: int = 0,
                           secretFlag: int = 0, fixFlag: bool = True) -> dict:
-    """mazgtv list API 파라미터를 표준화한다."""
+    """mazgtv2 list API 파라미터를 표준화한다."""
     return {
         "page": page,
         "perpage": perpage,
@@ -6746,7 +6746,7 @@ async def crawlmazsoccer_tomorrow(update: Update, context: ContextTypes.DEFAULT_
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv1.com/analyze/overseas",
+        base_url="https://mazgtv3.com/analyze/overseas",
         sport_label="축구",
         league_default="해외축구",
         day_key="tomorrow",
@@ -6760,7 +6760,7 @@ async def crawlmazsoccer_tomorrow(update: Update, context: ContextTypes.DEFAULT_
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv1.com/analyze/asia",
+        base_url="https://mazgtv3.com/analyze/asia",
         sport_label="축구",
         league_default="K리그/J리그",
         day_key="tomorrow",
@@ -6783,7 +6783,7 @@ async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAUL
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv1.com/analyze/mlb",
+        base_url="https://mazgtv3.com/analyze/mlb",
         sport_label="야구",
         league_default="해외야구",
         day_key="tomorrow",
@@ -6797,7 +6797,7 @@ async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAUL
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv1.com/analyze/baseball",
+        base_url="https://mazgtv3.com/analyze/baseball",
         sport_label="야구",
         league_default="KBO/NPB",
         day_key="tomorrow",
@@ -6815,8 +6815,8 @@ async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAUL
 async def bvcrawl_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     mazgtv 농구/배구 분석:
-    - NBA 분석:    https://mazgtv1.com/analyze/nba
-    - 국내 농구/배구: https://mazgtv1.com/analyze/volleyball
+    - NBA 분석:    https://mazgtv3.com/analyze/nba
+    - 국내 농구/배구: https://mazgtv3.com/analyze/volleyball
     두 곳에서 '내일 경기' 분석글을 크롤링해서 tomorrow 시트에 저장한다.
     """
 
@@ -6824,7 +6824,7 @@ async def bvcrawl_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv1.com/analyze/nba",
+        base_url="https://mazgtv3.com/analyze/nba",
         sport_label="농구",          # 시트에는 NBA/KBL/WKBL 등으로 나뉨
         league_default="NBA",
         day_key="tomorrow",
@@ -6839,7 +6839,7 @@ async def bvcrawl_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv1.com/analyze/volleyball",
+        base_url="https://mazgtv3.com/analyze/volleyball",
         sport_label="농구/배구",     # 분류 함수에서 KBL/WKBL/V리그/배구 등으로 세분화
         league_default="국내농구/배구",
         day_key="tomorrow",
@@ -6864,7 +6864,7 @@ async def crawlmazsoccer_today(update: Update, context: ContextTypes.DEFAULT_TYP
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv1.com/analyze/overseas",
+        base_url="https://mazgtv3.com/analyze/overseas",
         sport_label="축구",          # 안에서 '해외축구/K리그/J리그'로 다시 분류됨
         league_default="해외축구",
         day_key="today",            # ✅ today
@@ -6878,7 +6878,7 @@ async def crawlmazsoccer_today(update: Update, context: ContextTypes.DEFAULT_TYP
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv1.com/analyze/asia",
+        base_url="https://mazgtv3.com/analyze/asia",
         sport_label="축구",
         league_default="K리그/J리그",
         day_key="today",            # ✅ today
@@ -6902,7 +6902,7 @@ async def crawlmazbaseball_today(update: Update, context: ContextTypes.DEFAULT_T
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv1.com/analyze/mlb",
+        base_url="https://mazgtv3.com/analyze/mlb",
         sport_label="야구",          # 시트에서는 해외야구/KBO/NPB로 분리됨
         league_default="해외야구",
         day_key="today",            # 🔴 오늘
@@ -6916,7 +6916,7 @@ async def crawlmazbaseball_today(update: Update, context: ContextTypes.DEFAULT_T
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv1.com/analyze/baseball",
+        base_url="https://mazgtv3.com/analyze/baseball",
         sport_label="야구",
         league_default="KBO/NPB",
         day_key="today",            # 🔴 오늘
@@ -6935,8 +6935,8 @@ async def crawlmazbaseball_today(update: Update, context: ContextTypes.DEFAULT_T
 async def bvcrawl_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     mazgtv 농구/배구 분석:
-    - NBA 분석:    https://mazgtv1.com/analyze/nba
-    - 국내 농구/배구: https://mazgtv1.com/analyze/volleyball
+    - NBA 분석:    https://mazgtv3.com/analyze/nba
+    - 국내 농구/배구: https://mazgtv3.com/analyze/volleyball
     두 곳에서 '오늘 경기' 분석글을 크롤링해서 today 시트에 저장한다.
     """
 
@@ -6944,7 +6944,7 @@ async def bvcrawl_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv1.com/analyze/nba",
+        base_url="https://mazgtv3.com/analyze/nba",
         sport_label="농구",
         league_default="NBA",
         day_key="today",             # ✅ 오늘
@@ -6958,7 +6958,7 @@ async def bvcrawl_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv1.com/analyze/volleyball",
+        base_url="https://mazgtv3.com/analyze/volleyball",
         sport_label="농구/배구",
         league_default="국내농구/배구",
         day_key="today",             # ✅ 오늘
