@@ -509,6 +509,10 @@ def _inject_match_keyword(text: str, matchup: str, *, keyword_word: str) -> str:
 
     # 이미 키워드가 들어가 있으면 그대로
     if re.search(rf"{re.escape(matchup)}\s*(?:경기분석|스포츠분석)", out):
+        try:
+            _EXPORT_SRC_ID_CACHE[sheet_name] = {"ts": time.time(), "ids": set(out)}
+        except Exception:
+            pass
         return out
 
     def _rewrite_first_sentence(line: str) -> str:
@@ -2202,6 +2206,11 @@ BROWSER_HEADERS = {
     "Connection": "keep-alive",
 }
 
+# Optional: If mazgtv API requires login/session, pass browser cookies via env.
+MAZ_COOKIE = (os.getenv("MAZ_COOKIE") or "").strip()
+if MAZ_COOKIE:
+    BROWSER_HEADERS["Cookie"] = MAZ_COOKIE
+
 async def _maz_warmup(client: httpx.AsyncClient) -> None:
     """API 호출 전 1회 워밍업으로 쿠키/세션 세팅을 유도한다.
     403이 계속이면 사이트 측(WAF/차단)에서 서버 IP를 막았을 가능성이 큼.
@@ -2804,12 +2813,18 @@ def append_site_export_rows(rows: list[list[str]]) -> bool:
         return False
 
 
+_EXPORT_WS_CACHE = {}
+
 def get_export_ws(sheet_name: str):
     """export_today / export_tomorrow 워크시트 반환(없으면 생성 + 헤더 세팅)."""
     client_gs = get_gs_client()
     spreadsheet_id = os.getenv("SPREADSHEET_ID")
     if not (client_gs and spreadsheet_id):
         return None
+
+    # ✅ 동일 프로세스 내에서는 워크시트를 캐시해 불필요한 Read 요청을 줄인다(429 방지).
+    if sheet_name in _EXPORT_WS_CACHE:
+        return _EXPORT_WS_CACHE[sheet_name]
 
     try:
         sh = client_gs.open_by_key(spreadsheet_id)
@@ -2818,14 +2833,27 @@ def get_export_ws(sheet_name: str):
             ws = sh.add_worksheet(title=sheet_name, rows=2000, cols=10)
         ws.resize(cols=max(10, len(EXPORT_HEADER)))
         _ensure_header(ws, EXPORT_HEADER)
+        _EXPORT_WS_CACHE[sheet_name] = ws
         return ws
     except Exception as e:
         print(f"[GSHEET][EXPORT] 워크시트 준비 실패({sheet_name}): {e}")
         return None
 
 
+_EXPORT_SRC_ID_CACHE = {}
+_EXPORT_SRC_ID_CACHE_TTL = int(os.getenv("EXPORT_SRC_ID_CACHE_TTL", "60"))
+
 def get_existing_export_src_ids(sheet_name: str) -> set[str]:
     """지정 export 시트에서 src_id 목록을 읽어 중복 저장 방지용 set으로 반환."""
+    # ✅ 캐시(짧은 TTL): 같은 명령이 연속 호출되면 Google Sheets Read quota(429) 방지
+    try:
+        now_ts = time.time()
+        cached = _EXPORT_SRC_ID_CACHE.get(sheet_name)
+        if cached and (now_ts - cached.get("ts", 0) < _EXPORT_SRC_ID_CACHE_TTL):
+            return set(cached.get("ids", set()))
+    except Exception:
+        pass
+
     ws = get_export_ws(sheet_name)
     if not ws:
         return set()
@@ -2879,6 +2907,19 @@ def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
 
     try:
         ws.append_rows(rows, value_input_option="RAW", table_range="A1")
+
+        # ✅ 캐시 업데이트(같은 프로세스 내에서 중복 체크 비용 절감)
+        try:
+            cached = _EXPORT_SRC_ID_CACHE.get(sheet_name)
+            if cached and isinstance(cached.get("ids"), set):
+                for rr in rows:
+                    sid = (rr[2] if len(rr) > 2 else "").strip()
+                    if sid:
+                        cached["ids"].add(sid)
+                cached["ts"] = time.time()
+        except Exception:
+            pass
+
         return True
     except Exception as e:
         print(f"[GSHEET][EXPORT] append 실패({sheet_name}): {e}")
@@ -4730,8 +4771,8 @@ async def crawl_daum_news_common(
 
     try:
         async with httpx.AsyncClient(
-            headers={"User-Agent": "Mozilla/5.0"},
-            follow_redirects=True,
+            headers=BROWSER_HEADERS,
+            follow_redirects=False,
         ) as client:
             await _maz_warmup(client)
             contents = await fetch_daum_news_json(client, category_id, size=max_articles)
@@ -4887,9 +4928,7 @@ async def crawl_daum_news_common(
 # ───────────────── mazgtv 분석 공통 (내일 경기 → today/tomorrow 시트, JSON/API 버전) ─────────────────
 
 # 상세 API 실제 경로에 맞게 여기만 수정하면 됨
-MAZ_DETAIL_API_TEMPLATE = f"{MAZ_BASE_URL}/api/board/{{board_id}}"
-
-
+MAZ_DETAIL_API_TEMPLATE = os.getenv("MAZ_DETAIL_API_TEMPLATE", f"{MAZ_BASE_URL}/api/board/{{board_id}}")
 def _parse_game_start_date(game_start_at: str) -> date | None:
     """
     '2025-11-28T05:00:00' 같은 문자열에서 날짜(date)만 뽑는다.
@@ -5046,8 +5085,8 @@ async def crawl_maz_analysis_common(
 
     try:
         async with httpx.AsyncClient(
-            headers={"User-Agent": "Mozilla/5.0"},
-            follow_redirects=True,
+            headers=BROWSER_HEADERS,
+            follow_redirects=False,
         ) as client:
             await _maz_warmup(client)
 
@@ -5060,12 +5099,21 @@ async def crawl_maz_analysis_common(
                 )
 
                 r = await client.get(list_url, timeout=10.0)
+
+                # NOTE: API가 302로 홈/로그인으로 리다이렉트되면 follow_redirects=False 상태에서 3xx가 그대로 온다.
+                if 300 <= r.status_code < 400:
+                    loc = r.headers.get("location") or r.headers.get("Location") or ""
+                    print(f"[MAZ][LIST] redirect(page={page}) status={r.status_code} location={loc}")
+                    continue
+
                 r.raise_for_status()
 
+                ctype = (r.headers.get("content-type") or "").lower()
                 try:
                     data = r.json()
                 except Exception as e:
                     print(f"[MAZ][LIST] JSON 파싱 실패(page={page}): {e}")
+                    print(f"  status={r.status_code} content-type={ctype} url={r.url}")
                     print("  응답 일부:", r.text[:200])
                     continue
 
@@ -5146,8 +5194,21 @@ async def crawl_maz_analysis_common(
                     detail_url = MAZ_DETAIL_API_TEMPLATE.format(board_id=board_id)
                     try:
                         r2 = await client.get(detail_url, timeout=10.0)
+
+                        if 300 <= r2.status_code < 400:
+                            loc = r2.headers.get("location") or r2.headers.get("Location") or ""
+                            print(f"[MAZ][DETAIL] redirect id={board_id} status={r2.status_code} location={loc}")
+                            continue
+
                         r2.raise_for_status()
-                        detail = r2.json()
+                        ctype2 = (r2.headers.get("content-type") or "").lower()
+                        try:
+                            detail = r2.json()
+                        except Exception as je:
+                            print(f"[MAZ][DETAIL] id={board_id} JSON 파싱 실패: {je}")
+                            print(f"  status={r2.status_code} content-type={ctype2} url={r2.url}")
+                            print("  응답 일부:", r2.text[:200])
+                            continue
                     except Exception as e:
                         print(f"[MAZ][DETAIL] id={board_id} 요청 실패: {e}")
                         continue
@@ -6746,7 +6807,7 @@ async def crawlmazsoccer_tomorrow(update: Update, context: ContextTypes.DEFAULT_
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv3.com/analyze/overseas",
+        base_url=f"{MAZ_BASE_URL}/analyze/overseas",
         sport_label="축구",
         league_default="해외축구",
         day_key="tomorrow",
@@ -6760,7 +6821,7 @@ async def crawlmazsoccer_tomorrow(update: Update, context: ContextTypes.DEFAULT_
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv3.com/analyze/asia",
+        base_url=f"{MAZ_BASE_URL}/analyze/asia",
         sport_label="축구",
         league_default="K리그/J리그",
         day_key="tomorrow",
@@ -6783,7 +6844,7 @@ async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAUL
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv3.com/analyze/mlb",
+        base_url=f"{MAZ_BASE_URL}/analyze/mlb",
         sport_label="야구",
         league_default="해외야구",
         day_key="tomorrow",
@@ -6797,7 +6858,7 @@ async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAUL
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv3.com/analyze/baseball",
+        base_url=f"{MAZ_BASE_URL}/analyze/baseball",
         sport_label="야구",
         league_default="KBO/NPB",
         day_key="tomorrow",
@@ -6815,8 +6876,8 @@ async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAUL
 async def bvcrawl_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     mazgtv 농구/배구 분석:
-    - NBA 분석:    https://mazgtv3.com/analyze/nba
-    - 국내 농구/배구: https://mazgtv3.com/analyze/volleyball
+    - NBA 분석:    https://mazgtv1.com/analyze/nba
+    - 국내 농구/배구: https://mazgtv1.com/analyze/volleyball
     두 곳에서 '내일 경기' 분석글을 크롤링해서 tomorrow 시트에 저장한다.
     """
 
@@ -6824,7 +6885,7 @@ async def bvcrawl_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv3.com/analyze/nba",
+        base_url=f"{MAZ_BASE_URL}/analyze/nba",
         sport_label="농구",          # 시트에는 NBA/KBL/WKBL 등으로 나뉨
         league_default="NBA",
         day_key="tomorrow",
@@ -6839,7 +6900,7 @@ async def bvcrawl_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv3.com/analyze/volleyball",
+        base_url=f"{MAZ_BASE_URL}/analyze/volleyball",
         sport_label="농구/배구",     # 분류 함수에서 KBL/WKBL/V리그/배구 등으로 세분화
         league_default="국내농구/배구",
         day_key="tomorrow",
@@ -6864,7 +6925,7 @@ async def crawlmazsoccer_today(update: Update, context: ContextTypes.DEFAULT_TYP
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv3.com/analyze/overseas",
+        base_url=f"{MAZ_BASE_URL}/analyze/overseas",
         sport_label="축구",          # 안에서 '해외축구/K리그/J리그'로 다시 분류됨
         league_default="해외축구",
         day_key="today",            # ✅ today
@@ -6878,7 +6939,7 @@ async def crawlmazsoccer_today(update: Update, context: ContextTypes.DEFAULT_TYP
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv3.com/analyze/asia",
+        base_url=f"{MAZ_BASE_URL}/analyze/asia",
         sport_label="축구",
         league_default="K리그/J리그",
         day_key="today",            # ✅ today
@@ -6902,7 +6963,7 @@ async def crawlmazbaseball_today(update: Update, context: ContextTypes.DEFAULT_T
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv3.com/analyze/mlb",
+        base_url=f"{MAZ_BASE_URL}/analyze/mlb",
         sport_label="야구",          # 시트에서는 해외야구/KBO/NPB로 분리됨
         league_default="해외야구",
         day_key="today",            # 🔴 오늘
@@ -6916,7 +6977,7 @@ async def crawlmazbaseball_today(update: Update, context: ContextTypes.DEFAULT_T
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv3.com/analyze/baseball",
+        base_url=f"{MAZ_BASE_URL}/analyze/baseball",
         sport_label="야구",
         league_default="KBO/NPB",
         day_key="today",            # 🔴 오늘
@@ -6935,8 +6996,8 @@ async def crawlmazbaseball_today(update: Update, context: ContextTypes.DEFAULT_T
 async def bvcrawl_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     mazgtv 농구/배구 분석:
-    - NBA 분석:    https://mazgtv3.com/analyze/nba
-    - 국내 농구/배구: https://mazgtv3.com/analyze/volleyball
+    - NBA 분석:    https://mazgtv1.com/analyze/nba
+    - 국내 농구/배구: https://mazgtv1.com/analyze/volleyball
     두 곳에서 '오늘 경기' 분석글을 크롤링해서 today 시트에 저장한다.
     """
 
@@ -6944,7 +7005,7 @@ async def bvcrawl_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv3.com/analyze/nba",
+        base_url=f"{MAZ_BASE_URL}/analyze/nba",
         sport_label="농구",
         league_default="NBA",
         day_key="today",             # ✅ 오늘
@@ -6958,7 +7019,7 @@ async def bvcrawl_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv3.com/analyze/volleyball",
+        base_url=f"{MAZ_BASE_URL}/analyze/volleyball",
         sport_label="농구/배구",
         league_default="국내농구/배구",
         day_key="today",             # ✅ 오늘
