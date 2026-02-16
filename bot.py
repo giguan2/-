@@ -1752,7 +1752,7 @@ def _load_news_queue_urls(ws_queue) -> set[str]:
             idx_url = header.index("url")
         except ValueError:
             idx_url = 3  # 기본 4번째 컬럼 가정
-    for row_idx, r in enumerate(vals[1:], start=2):
+        for row_idx, r in enumerate(vals[1:], start=2):
             if len(r) <= idx_url:
                 continue
             u = _normalize_news_url(r[idx_url])
@@ -2021,7 +2021,7 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
         return ""
 
     to_post = []
-    for r in vals[1:]:
+    for row_idx, r in enumerate(vals[1:], start=2):
         sid = (r[i_src].strip() if len(r) > i_src else "")
         if not sid:
             continue
