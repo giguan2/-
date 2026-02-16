@@ -1140,7 +1140,7 @@ NAVER_CAFE_MENU_MAP_RAW = (os.getenv("NAVER_CAFE_MENU_MAP") or "").strip()
 NAVER_CAFE_MENU_MAP_DEEP_RAW = (os.getenv("NAVER_CAFE_MENU_MAP_DEEP") or "").strip()
 
 CAFE_LOG_SHEET_NAME = (os.getenv("CAFE_LOG_SHEET_NAME") or "cafe_log").strip()
-CAFE_LOG_HEADER = ["src_id", "day", "sport", "clubid", "menuid", "articleId", "postedAt", "status"]
+CAFE_LOG_HEADER = ["src_id", "day", "sport", "clubid", "menuid", "articleId", "postedAt", "status", "title", "url"]
 
 # ───────────────── news_cafe_queue / news_cafe_log ─────────────────
 NEWS_CAFE_QUEUE_SHEET_NAME = (os.getenv("NEWS_CAFE_QUEUE_SHEET_NAME") or "news_cafe_queue").strip()
@@ -1360,6 +1360,16 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
 
     except Exception as e:
         return False, f"EXC:{e}"
+
+
+def _naver_cafe_article_url(clubid: str, article_id: str) -> str:
+    """게시된 네이버 카페 글 URL 생성(안전한 기본 포맷)."""
+    cid = (clubid or "").strip()
+    aid = (str(article_id or "").strip())
+    if not cid or not aid:
+        return ""
+    # 구형 ArticleRead 포맷(대부분 접근 가능)
+    return f"https://cafe.naver.com/ArticleRead.nhn?clubid={cid}&articleid={aid}"
 
 def _naver_news_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tuple[bool, str]:
     """뉴스 전용 계정으로 네이버 카페에 글쓰기. (success, articleId_or_error)
@@ -1742,7 +1752,7 @@ def _load_news_queue_urls(ws_queue) -> set[str]:
             idx_url = header.index("url")
         except ValueError:
             idx_url = 3  # 기본 4번째 컬럼 가정
-        for r in vals[1:]:
+    for row_idx, r in enumerate(vals[1:], start=2):
             if len(r) <= idx_url:
                 continue
             u = _normalize_news_url(r[idx_url])
@@ -1999,6 +2009,8 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
     i_body = col("body", 4)
     i_created = col("createdAt", 5)
     i_simple = col("simple", 6)
+    i_cafe_title = col("cafe_title", -1)
+    i_cafe_url = col("cafe_url", -1)
 
     posted_keys = _load_posted_keys(ws_log)
 
@@ -2042,7 +2054,7 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
 
         # ✅ 마지막 안전 처리: 브랜드/구분자 제거(시트에 남아있어도 업로드 전에 정리)
         contentv = _postprocess_site_body_text(contentv)
-        to_post.append((sid, dayv, sportv, titlev, contentv, createdv, menuid))
+        to_post.append((row_idx, sid, dayv, sportv, titlev, contentv, createdv, menuid))
 
     if not to_post:
         await update.message.reply_text("업로드할 새 글이 없어(이미 올린 글은 제외됨).")
@@ -2061,11 +2073,11 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
         return False
 
     ok_cnt, fail_cnt = 0, 0
-    for (sid, dayv, sportv, titlev, contentv, createdv, menuid) in to_post:
+    for (row_idx, sid, dayv, sportv, titlev, contentv, createdv, menuid) in to_post:
         if not menuid:
             fail_cnt += 1
             ws_log.append_row(
-                [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), "NO_MENU_ID"],
+                [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), "NO_MENU_ID", "", ""],
                 value_input_option="RAW",
                 table_range="A1",
             )
@@ -2076,7 +2088,7 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
             fail_cnt += 1
             status = "NO_BODY" if mode == "deep" else "NO_SIMPLE"
             ws_log.append_row(
-                [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), status],
+                [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), status, "", ""],
                 value_input_option="RAW",
                 table_range="A1",
             )
@@ -2116,10 +2128,25 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
             if success:
                 ok_cnt += 1
                 ws_log.append_row(
-                    [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, info, now_kst().isoformat(), "OK"],
+                    [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, info, now_kst().isoformat(), "OK", subject, _naver_cafe_article_url(NAVER_CAFE_CLUBID, info)],
                     value_input_option="RAW",
                     table_range="A1",
                 )
+                # export 시트에도 게시된 링크/타이틀 기록(있으면)
+                try:
+                    cafe_url = _naver_cafe_article_url(NAVER_CAFE_CLUBID, info)
+                    if (i_cafe_title != -1) or (i_cafe_url != -1):
+                        updates = []
+                        if i_cafe_title != -1:
+                            updates.append((i_cafe_title, subject))
+                        if i_cafe_url != -1:
+                            updates.append((i_cafe_url, cafe_url))
+                        # 같은 행에 여러 셀 갱신
+                        for cidx, v in updates:
+                            col_letter = _col_letter(cidx + 1)
+                            ws.update(range_name=f"{col_letter}{row_idx}", values=[[v]])
+                except Exception as _e:
+                    print(f"[CAFE_LOG] export meta update fail: {_e}")
                 break
 
             # 999 내부 오류가 HTML 파싱/필터링 문제일 수도 있어서 plain 텍스트로 1회 폴백
@@ -2135,7 +2162,7 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
 
             fail_cnt += 1
             ws_log.append_row(
-                [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), info],
+                [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), info, subject, ""],
                 value_input_option="RAW",
                 table_range="A1",
             )
@@ -2737,7 +2764,7 @@ def get_site_export_ws():
 # ───────────────── site_export 저장 ─────────────────
 
 SITE_EXPORT_SHEET_NAME = os.getenv("SHEET_SITE_EXPORT_NAME", "site_export")
-SITE_EXPORT_HEADER = ["day", "sport", "src_id", "title", "body", "createdAt", "simple", "comments"]
+SITE_EXPORT_HEADER = ["day", "sport", "src_id", "title", "body", "createdAt", "simple", "comments", "cafe_title", "cafe_url"]
 # export 탭 분리: export_today / export_tomorrow
 EXPORT_TODAY_SHEET_NAME = os.getenv("SHEET_EXPORT_TODAY_NAME", "export_today")
 EXPORT_TOMORROW_SHEET_NAME = os.getenv("SHEET_EXPORT_TOMORROW_NAME", "export_tomorrow")
