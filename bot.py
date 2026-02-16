@@ -509,6 +509,10 @@ def _inject_match_keyword(text: str, matchup: str, *, keyword_word: str) -> str:
 
     # 이미 키워드가 들어가 있으면 그대로
     if re.search(rf"{re.escape(matchup)}\s*(?:경기분석|스포츠분석)", out):
+        try:
+            _EXPORT_SRC_ID_CACHE[sheet_name] = {"ts": time.time(), "ids": set(out)}
+        except Exception:
+            pass
         return out
 
     def _rewrite_first_sentence(line: str) -> str:
@@ -1007,13 +1011,29 @@ def extract_final_pick_from_body(body: str) -> str:
     return "[최종 픽]\n" + "\n".join(pick_lines)
 
 def ensure_export_header(ws) -> None:
-    """export 시트 헤더가 7컬럼으로 맞지 않으면 강제로 맞춘다."""
+    """export 시트 헤더를 EXPORT_HEADER로 맞춘다(필요시 cols 확장)."""
+    # 컬럼 수가 모자라면 먼저 확장
+    try:
+        if getattr(ws, "col_count", 0) < len(EXPORT_HEADER):
+            ws.resize(cols=len(EXPORT_HEADER))
+    except Exception:
+        pass
+
     try:
         top = ws.row_values(1)
     except Exception:
         top = []
-    if (not top) or top[: len(EXPORT_HEADER)] != EXPORT_HEADER:
-        ws.update("A1", [EXPORT_HEADER])
+
+    top = [c.strip() for c in (top or [])]
+    if top[: len(EXPORT_HEADER)] != EXPORT_HEADER:
+        try:
+            ws.update("A1", [EXPORT_HEADER])
+        except Exception:
+            try:
+                ws.update(values=[EXPORT_HEADER], range_name="A1")
+            except Exception as e:
+                print(f"[GSHEET][EXPORT] 헤더 업데이트 실패: {e}")
+
 
 
 
@@ -2171,7 +2191,7 @@ def _log_httpx_exception(prefix: str, e: Exception) -> None:
 # ----------------------------
 # HTTP helpers (Mazgtv anti-bot 대응: 브라우저 헤더 + 쿠키 워밍업)
 # ----------------------------
-MAZ_BASE_URL = os.getenv("MAZ_BASE_URL", "https://mazgtv2.com").rstrip("/")
+MAZ_BASE_URL = os.getenv("MAZ_BASE_URL", "https://mazgtv3.com").rstrip("/")
 MAZ_LIST_API = os.getenv("MAZ_LIST_API", f"{MAZ_BASE_URL}/api/board/list")
 
 
@@ -2201,6 +2221,11 @@ BROWSER_HEADERS = {
     "Origin": MAZ_BASE_URL,
     "Connection": "keep-alive",
 }
+
+# Optional: If mazgtv API requires login/session, pass browser cookies via env.
+MAZ_COOKIE = (os.getenv("MAZ_COOKIE") or "").strip()
+if MAZ_COOKIE:
+    BROWSER_HEADERS["Cookie"] = MAZ_COOKIE
 
 async def _maz_warmup(client: httpx.AsyncClient) -> None:
     """API 호출 전 1회 워밍업으로 쿠키/세션 세팅을 유도한다.
@@ -2266,79 +2291,6 @@ def is_admin(update: Update) -> bool:
     user = update.effective_user
     return bool(user and user.id in ADMIN_IDS)
 
-
-
-
-# ───────────────── 중복 실행 방지 (Webhook 재전송/중복 업데이트 대응) ─────────────────
-# Render/Telegram 환경에서 간헐적으로 동일 update 가 여러 번 전달되는 경우가 있어,
-# update_id 기준으로 중복 처리를 걸러냅니다.
-# 또한 같은 채팅에서 같은 명령어가 동시에 여러 번 실행되는 것도 방지합니다.
-DEDUP_TTL_SEC = int(os.getenv("DEDUP_TTL_SEC", "900"))  # 기본 15분
-
-# update_id -> 마지막 처리 시각(epoch)
-_PROCESSED_UPDATE_IDS: dict[int, float] = {}
-_PROCESSED_LOCK = asyncio.Lock()
-
-# (chat_id, command) 단위로 동시에 한 번만 실행되도록 락
-_RUNNING_COMMANDS: set[tuple[int, str]] = set()
-_RUNNING_LOCK = asyncio.Lock()
-
-
-async def _dedup_seen(update: Update) -> bool:
-    """이미 처리된 update면 True (중복)"""
-    uid = getattr(update, "update_id", None)
-    if uid is None:
-        return False
-
-    now = time.time()
-    async with _PROCESSED_LOCK:
-        # TTL 정리
-        if _PROCESSED_UPDATE_IDS:
-            expired = [k for k, ts in _PROCESSED_UPDATE_IDS.items() if now - ts > DEDUP_TTL_SEC]
-            for k in expired:
-                _PROCESSED_UPDATE_IDS.pop(k, None)
-
-        if uid in _PROCESSED_UPDATE_IDS:
-            print(f"[DEDUP] drop duplicate update_id={uid}")
-            return True
-
-        _PROCESSED_UPDATE_IDS[uid] = now
-        return False
-
-
-def wrap_command(func, command_name: str):
-    """CommandHandler에 붙일 중복 방지 래퍼"""
-    async def _wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        # 1) 같은 update_id 재처리 방지
-        if await _dedup_seen(update):
-            return
-
-        # 2) 같은 채팅에서 같은 명령어 동시 실행 방지
-        chat_id = 0
-        try:
-            if update.effective_chat:
-                chat_id = int(update.effective_chat.id)
-        except Exception:
-            chat_id = 0
-
-        key = (chat_id, command_name)
-        async with _RUNNING_LOCK:
-            if key in _RUNNING_COMMANDS:
-                try:
-                    if update.message:
-                        await update.message.reply_text("⏳ 이미 실행 중입니다. 완료될 때까지 잠시만 기다려 주세요.")
-                except Exception:
-                    pass
-                return
-            _RUNNING_COMMANDS.add(key)
-
-        try:
-            await func(update, context)
-        finally:
-            async with _RUNNING_LOCK:
-                _RUNNING_COMMANDS.discard(key)
-
-    return _wrapped
 
 # ───────────────── 날짜 헬퍼 ─────────────────
 
@@ -2836,7 +2788,14 @@ def _ensure_header(ws, header: list[str]) -> None:
 def append_site_export_rows(rows: list[list[str]]) -> bool:
     """
     site_export 탭에 rows를 append.
-    rows: [ [day, sport, src_id, title, body, createdAt], ... ]
+
+    ✅ 헤더 스펙:
+      ["day","sport","src_id","title","body","createdAt","simple","comments"]
+
+    rows 입력은 6/7/8컬럼 모두 허용한다.
+    - 6컬럼: simple 자동 생성, comments는 빈칸
+    - 7컬럼: simple 보정, comments는 빈칸
+    - 8컬럼: comments까지 그대로 사용
     """
     client_gs = get_gs_client()
     spreadsheet_id = os.getenv("SPREADSHEET_ID")
@@ -2847,96 +2806,56 @@ def append_site_export_rows(rows: list[list[str]]) -> bool:
     try:
         sh = client_gs.open_by_key(spreadsheet_id)
         ws = sh.worksheet(SITE_EXPORT_SHEET_NAME)
-        # ✅ 헤더 강제(댓글 컬럼 포함)
         ensure_export_header(ws)
     except Exception as e:
         print(f"[GSHEET][SITE_EXPORT] 시트 '{SITE_EXPORT_SHEET_NAME}' 열기 실패: {e}")
         return False
 
     try:
-        enable_comments = _env_bool("EXPORT_COMMENT_ENABLED", True)
-        try:
-            n_comments = int(os.getenv("EXPORT_COMMENT_COUNT") or "6")
-        except Exception:
-            n_comments = 6
-        n_comments = max(3, min(10, n_comments))
-
-        # rows는 6컬럼([day,sport,src_id,title,body,createdAt]) 또는 7/8컬럼일 수 있음.
         fixed_rows: list[list[str]] = []
-        gen_items: list[dict] = []
-
         for r in rows:
             if not r:
                 continue
             rr = list(r)
 
-            # 최소 6칸 보장
+            # 최소 6컬럼 확보
             while len(rr) < 6:
                 rr.append("")
 
-            day, sport, src_id, title, body, created_at = rr[:6]
-            day = str(day or "")
-            sport = str(sport or "")
-            src_id = str(src_id or "").strip()
-            title = str(title or "").strip()
-            body = str(body or "")
+            day, sport, src_id, title, body, createdAt = rr[:6]
 
-            # simple(7번째)
-            simple = ""
-            if len(rr) >= 7:
-                simple = str(rr[6] or "").strip()
-            if not simple:
-                simple = extract_simple_from_body(body)
+            # simple
+            simple = rr[6] if len(rr) >= 7 else ""
+            if not str(simple).strip():
+                simple = extract_simple_from_body(body or "")
 
-            # comments(8번째)
-            comments = ""
-            if len(rr) >= 8:
-                comments = str(rr[7] or "").strip()
+            # comments(있으면 사용, 없으면 빈칸)
+            comments = rr[7] if len(rr) >= 8 else ""
 
-            if enable_comments and (not comments) and src_id and title:
-                gen_items.append({"src_id": src_id, "title": title})
+            fixed_rows.append([
+                str(day),
+                str(sport),
+                str(src_id),
+                str(title),
+                str(body),
+                str(createdAt),
+                str(simple),
+                str(comments or ""),
+            ])
 
-            fixed_rows.append([day, sport, src_id, title, body, str(created_at or ""), simple, comments])
-
-        # 댓글 생성(일괄)
-        if enable_comments and gen_items:
-            mapping: dict[str, str] = {}
-            # 너무 큰 요청 방지: 10개씩 쪼개기
-            for i in range(0, len(gen_items), 10):
-                chunk = gen_items[i : i + 10]
-                m = generate_export_comment_blocks_bulk(chunk, n=n_comments) or {}
-                mapping.update(m)
-
-            # 누락분 폴백(개별)
-            if mapping:
-                for row in fixed_rows:
-                    sid = (row[2] or "").strip()
-                    if not sid:
-                        continue
-                    if row[7].strip():
-                        continue
-                    if sid in mapping and mapping[sid].strip():
-                        row[7] = mapping[sid].strip()
-
-            # 그래도 비면 개별 생성(최소 보장)
-            for row in fixed_rows:
-                if row[7].strip():
-                    continue
-                sid = (row[2] or "").strip()
-                if not sid:
-                    continue
-                t = (row[3] or "").strip()
-                if not t:
-                    continue
-                row[7] = generate_export_comment_block(t, n=n_comments)
+        if not fixed_rows:
+            return True
 
         ws.append_rows(fixed_rows, value_input_option="RAW", table_range="A1")
         print(f"[GSHEET][SITE_EXPORT] {SITE_EXPORT_SHEET_NAME} 에 {len(fixed_rows)}건 추가")
         return True
-
     except Exception as e:
         print(f"[GSHEET][SITE_EXPORT] append_rows 오류: {e}")
         return False
+
+
+
+_EXPORT_WS_CACHE = {}
 
 def get_export_ws(sheet_name: str):
     """export_today / export_tomorrow 워크시트 반환(없으면 생성 + 헤더 세팅)."""
@@ -2945,6 +2864,10 @@ def get_export_ws(sheet_name: str):
     if not (client_gs and spreadsheet_id):
         return None
 
+    # ✅ 동일 프로세스 내에서는 워크시트를 캐시해 불필요한 Read 요청을 줄인다(429 방지).
+    if sheet_name in _EXPORT_WS_CACHE:
+        return _EXPORT_WS_CACHE[sheet_name]
+
     try:
         sh = client_gs.open_by_key(spreadsheet_id)
         ws = _get_ws_by_name(sh, sheet_name)
@@ -2952,14 +2875,27 @@ def get_export_ws(sheet_name: str):
             ws = sh.add_worksheet(title=sheet_name, rows=2000, cols=10)
         ws.resize(cols=max(10, len(EXPORT_HEADER)))
         ensure_export_header(ws)
+        _EXPORT_WS_CACHE[sheet_name] = ws
         return ws
     except Exception as e:
         print(f"[GSHEET][EXPORT] 워크시트 준비 실패({sheet_name}): {e}")
         return None
 
 
+_EXPORT_SRC_ID_CACHE = {}
+_EXPORT_SRC_ID_CACHE_TTL = int(os.getenv("EXPORT_SRC_ID_CACHE_TTL", "60"))
+
 def get_existing_export_src_ids(sheet_name: str) -> set[str]:
     """지정 export 시트에서 src_id 목록을 읽어 중복 저장 방지용 set으로 반환."""
+    # ✅ 캐시(짧은 TTL): 같은 명령이 연속 호출되면 Google Sheets Read quota(429) 방지
+    try:
+        now_ts = time.time()
+        cached = _EXPORT_SRC_ID_CACHE.get(sheet_name)
+        if cached and (now_ts - cached.get("ts", 0) < _EXPORT_SRC_ID_CACHE_TTL):
+            return set(cached.get("ids", set()))
+    except Exception:
+        pass
+
     ws = get_export_ws(sheet_name)
     if not ws:
         return set()
@@ -2984,8 +2920,254 @@ def get_existing_export_src_ids(sheet_name: str) -> set[str]:
         return set()
 
 
+# ───────────────── OpenAI: export 댓글 생성(H열) ─────────────────
+
+def _export_comment_settings() -> tuple[bool, int, str, float]:
+    """export 시트 댓글 생성 설정을 환경변수로부터 읽는다."""
+    enabled_raw = (os.getenv("EXPORT_COMMENT_ENABLED") or "1").strip().lower()
+    enabled = enabled_raw not in ("0", "false", "no", "off")
+
+    try:
+        n_comments = int((os.getenv("EXPORT_COMMENT_COUNT") or "6").strip())
+    except Exception:
+        n_comments = 6
+    if n_comments < 1:
+        n_comments = 1
+    if n_comments > 8:
+        # 셀 1칸(줄바꿈 8줄)은 충분히 가능하지만, 과도한 토큰/속도 이슈 방지
+        n_comments = 8
+
+    model = (
+        (os.getenv("EXPORT_COMMENT_MODEL") or "").strip()
+        or (os.getenv("OPENAI_MODEL_COMMENT") or "").strip()
+        or (os.getenv("OPENAI_MODEL_ANALYSIS") or "").strip()
+        or "gpt-4.1-mini"
+    )
+
+    try:
+        temperature = float((os.getenv("EXPORT_COMMENT_TEMPERATURE") or "0.9").strip())
+    except Exception:
+        temperature = 0.9
+
+    # 안전 클램프
+    if temperature < 0:
+        temperature = 0.0
+    if temperature > 1.3:
+        temperature = 1.3
+
+    return enabled, n_comments, model, temperature
+
+
+def _strip_code_fences(s: str) -> str:
+    s = (s or "").strip()
+    # ```json ... ``` 제거
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", s).strip()
+        s = re.sub(r"\s*```$", "", s).strip()
+    return s
+
+
+def _extract_json_payload(s: str) -> str:
+    """텍스트에서 JSON(payload) 부분만 최대한 뽑아낸다."""
+    s = (s or "").strip()
+    if not s:
+        return ""
+    # 배열 또는 객체 시작/끝 위치로 잘라내기
+    start_candidates = [i for i in [s.find("["), s.find("{")] if i != -1]
+    if not start_candidates:
+        return ""
+    start = min(start_candidates)
+    end_bracket = s.rfind("]")
+    end_brace = s.rfind("}")
+    end = max(end_bracket, end_brace)
+    if end == -1 or end <= start:
+        return ""
+    return s[start : end + 1].strip()
+
+
+def _normalize_comment_line(line: str) -> str:
+    line = (line or "").replace("\r", " ").replace("\n", " ").strip()
+    line = re.sub(r"\s+", " ", line).strip()
+    # 양 끝 따옴표 제거
+    line = line.strip("\"' ")
+    return line
+
+
+def _openai_generate_comments_single(title: str, *, n_comments: int, model: str, temperature: float) -> list[str]:
+    """한 경기 제목 기준으로 댓글 n개 생성(줄 단위)."""
+    client_oa = get_openai_client()
+    if not client_oa:
+        return []
+
+    t = _normalize_comment_line(title)
+    if not t:
+        return []
+
+    prompt = f"""아래의 '경기 분석 제목'을 읽고, 네이버 스포츠 커뮤니티에 남길 자연스러운 한국어 댓글 {n_comments}개를 만들어줘.
+
+조건(반드시 지켜):
+- 각 댓글은 한 줄(줄바꿈 금지), 총 {n_comments}줄
+- 모든 댓글에: 리그명 + 두 팀명이 반드시 포함되어야 함(제목에 나온 표현 그대로 사용해도 됨)
+- 같은 문장 구조 반복 금지(어순/표현/어조 다양화)
+- 광고/홍보/해시태그/링크/이모지 남발 금지
+- 'AI', '챗GPT' 등 생성 주체 언급 금지
+- 제목을 그대로 복사하지 말고, 자연스럽게 말하듯 변형
+
+경기 분석 제목:
+{t}
+
+출력 형식:
+- 번호/불릿 없이, 댓글만 {n_comments}줄 그대로 출력""".strip()
+
+    try:
+        resp = client_oa.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "너는 한국 스포츠 커뮤니티에서 자연스럽게 댓글을 남기는 사용자다. 문장 톤은 사람처럼 자연스럽고 과하지 않다."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=temperature,
+            max_completion_tokens=320,
+        )
+        out = (resp.choices[0].message.content or "").strip()
+        out = _strip_code_fences(out)
+        lines = [_normalize_comment_line(x) for x in out.splitlines() if _normalize_comment_line(x)]
+        # 혹시 번호가 붙으면 제거
+        cleaned: list[str] = []
+        for ln in lines:
+            ln2 = re.sub(r"^\s*\d+\s*[\)\.]\s*", "", ln).strip()
+            ln2 = re.sub(r"^\s*[\-\•\*]\s*", "", ln2).strip()
+            ln2 = _normalize_comment_line(ln2)
+            if ln2:
+                cleaned.append(ln2)
+        # n개로 자르기/보정
+        cleaned = cleaned[:n_comments]
+        return cleaned
+    except Exception as e:
+        print(f"[OPENAI][EXPORT_COMMENT][SINGLE] 실패: {e}")
+        return []
+
+
+def generate_export_comments_openai(
+    items: list[dict],
+    *,
+    n_comments: int,
+    model: str,
+    temperature: float,
+) -> dict[str, str]:
+    """여러 경기 제목에 대해 댓글을 생성해 src_id -> '줄바꿈 문자열' 매핑으로 반환."""
+    client_oa = get_openai_client()
+    if not client_oa:
+        return {}
+
+    # dedup
+    dedup: dict[str, str] = {}
+    for it in items or []:
+        sid = str((it or {}).get("src_id") or "").strip()
+        title = str((it or {}).get("title") or "").strip()
+        if sid and title and sid not in dedup:
+            dedup[sid] = title
+
+    if not dedup:
+        return {}
+
+    pairs = [{"src_id": k, "title": v} for k, v in dedup.items()]
+    out_map: dict[str, str] = {}
+
+    # 너무 크게 한 번에 보내면 토큰/파싱 실패가 늘어서 chunk
+    chunk_size = 6
+    for i in range(0, len(pairs), chunk_size):
+        chunk = pairs[i : i + chunk_size]
+
+        prompt = f"""너는 한국 스포츠 커뮤니티에서 자연스럽게 댓글을 남기는 사용자다.
+
+아래 목록의 각 '경기 분석 제목'마다 댓글 {n_comments}개를 생성해줘.
+
+필수 조건:
+- 각 댓글은 한 줄(줄바꿈 금지)
+- 모든 댓글에: 제목에 있는 리그명 + 두 팀명이 반드시 포함되어야 함
+- 댓글끼리 서로 어투/구조가 겹치지 않게 다양하게
+- 광고/홍보/해시태그/링크/과한 이모지 금지
+- 'AI', '챗GPT' 등 생성 주체 언급 금지
+- 제목 문장을 그대로 복사하지 말고 자연스럽게 변형
+
+출력은 반드시 '순수 JSON'만. (마크다운 코드블록 금지)
+스키마:
+{{"items":[{{"src_id":"...","comments":["...", "...", ...]}}, ...]}}
+
+제목 목록(JSON):
+{json.dumps(chunk, ensure_ascii=False)}
+
+""".strip()
+
+        text_out = ""
+        try:
+            resp = client_oa.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "출력은 반드시 JSON만. 다른 텍스트는 절대 포함하지 마라."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=temperature,
+                max_completion_tokens=1400,
+            )
+            text_out = (resp.choices[0].message.content or "").strip()
+        except Exception as e:
+            print(f"[OPENAI][EXPORT_COMMENT][BATCH] 호출 실패: {e}")
+            text_out = ""
+
+        data = None
+        if text_out:
+            try:
+                raw = _strip_code_fences(text_out)
+                payload = _extract_json_payload(raw)
+                data = json.loads(payload) if payload else None
+            except Exception as e:
+                print(f"[OPENAI][EXPORT_COMMENT][BATCH] JSON 파싱 실패: {e}")
+                data = None
+
+        # 파싱 성공
+        if isinstance(data, dict) and isinstance(data.get("items"), list):
+            for obj in data.get("items") or []:
+                if not isinstance(obj, dict):
+                    continue
+                sid = str(obj.get("src_id") or "").strip()
+                comments = obj.get("comments")
+                if not sid or not isinstance(comments, list):
+                    continue
+                lines = [_normalize_comment_line(x) for x in comments if _normalize_comment_line(str(x))]
+                lines = lines[:n_comments]
+                if lines:
+                    out_map[sid] = "\n".join(lines)
+            # 누락된 sid는 single로 보정
+            for it in chunk:
+                sid = it["src_id"]
+                if sid not in out_map:
+                    lines = _openai_generate_comments_single(it["title"], n_comments=n_comments, model=model, temperature=temperature)
+                    if lines:
+                        out_map[sid] = "\n".join(lines)
+            continue
+
+        # 파싱 실패 → chunk 전체 single로 폴백
+        for it in chunk:
+            sid = it["src_id"]
+            lines = _openai_generate_comments_single(it["title"], n_comments=n_comments, model=model, temperature=temperature)
+            if lines:
+                out_map[sid] = "\n".join(lines)
+
+    return out_map
+
 def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
-    """지정 export 시트에 rows를 append."""
+    """지정 export 시트에 rows를 append.
+
+    ✅ 헤더 스펙:
+      ["day","sport","src_id","title","body","createdAt","simple","comments"]
+
+    rows 입력은 6/7/8컬럼 모두 허용한다.
+    - 6컬럼: simple 자동 생성, comments(OpenAI) 생성 시도
+    - 7컬럼: simple 보정, comments(OpenAI) 생성 시도
+    - 8컬럼: comments가 비어있으면(OpenAI) 생성 시도
+    """
     if not rows:
         return True
 
@@ -2993,95 +3175,112 @@ def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
     if not ws:
         return False
 
-    # ✅ 헤더 강제(댓글 컬럼 포함)
-    try:
-        ensure_export_header(ws)
-    except Exception:
-        pass
+    enabled, n_comments, model, temperature = _export_comment_settings()
 
-    try:
-        enable_comments = _env_bool("EXPORT_COMMENT_ENABLED", True)
+    fixed_rows: list[list[str]] = []
+    need_items: list[dict] = []
+    need_by_src: dict[str, str] = {}
+
+    for r in rows:
+        if not r:
+            continue
+
+        rr = list(r)
+        while len(rr) < 6:
+            rr.append("")
+
+        day, sport, src_id, title, body, createdAt = rr[:6]
+
+        # simple
+        simple = rr[6] if len(rr) >= 7 else ""
+        if not str(simple).strip():
+            simple = extract_simple_from_body(body or "")
+
+        # comments(있으면 사용, 없으면 빈칸)
+        comments = rr[7] if len(rr) >= 8 else ""
+        comments = str(comments or "")
+
+        # 제목이 없으면 simple 첫 줄로 대체(댓글 생성 입력용)
+        base_title = str(title or "").strip()
+        if not base_title:
+            base_title = (str(simple or "").splitlines()[0].strip() if simple else "")
+
+        sid = str(src_id or "").strip()
+        fixed_rows.append([
+            str(day),
+            str(sport),
+            sid,
+            str(title),
+            str(body),
+            str(createdAt),
+            str(simple),
+            comments,
+        ])
+
+        # 댓글 생성 대상 수집
+        if enabled and sid and (not comments.strip()) and base_title:
+            if sid not in need_by_src:
+                need_by_src[sid] = base_title
+
+    # OpenAI로 comments 생성(배치)
+    if enabled and need_by_src:
+        need_items = [{"src_id": k, "title": v} for k, v in need_by_src.items()]
         try:
-            n_comments = int(os.getenv("EXPORT_COMMENT_COUNT") or "6")
-        except Exception:
-            n_comments = 6
-        n_comments = max(3, min(10, n_comments))
+            mapping = generate_export_comments_openai(
+                need_items,
+                n_comments=n_comments,
+                model=model,
+                temperature=temperature,
+            )
+        except Exception as e:
+            print(f"[OPENAI][EXPORT_COMMENT] 배치 생성 실패: {e}")
+            mapping = {}
 
-        # rows는 6컬럼([day,sport,src_id,title,body,createdAt]) 또는 7/8컬럼일 수 있음.
-        fixed_rows: list[list[str]] = []
-        gen_items: list[dict] = []
+        if mapping:
+            for rr in fixed_rows:
+                sid = str(rr[2] or "").strip()
+                if sid and (not str(rr[7] or "").strip()) and sid in mapping:
+                    rr[7] = mapping[sid]
 
-        for r in rows:
-            if not r:
-                continue
-            rr = list(r)
-
-            # 최소 6칸 보장
-            while len(rr) < 6:
-                rr.append("")
-
-            day, sport, src_id, title, body, created_at = rr[:6]
-            day = str(day or "")
-            sport = str(sport or "")
-            src_id = str(src_id or "").strip()
-            title = str(title or "").strip()
-            body = str(body or "")
-
-            # simple(7번째)
-            simple = ""
-            if len(rr) >= 7:
-                simple = str(rr[6] or "").strip()
-            if not simple:
-                simple = extract_simple_from_body(body)
-
-            # comments(8번째)
-            comments = ""
-            if len(rr) >= 8:
-                comments = str(rr[7] or "").strip()
-
-            if enable_comments and (not comments) and src_id and title:
-                gen_items.append({"src_id": src_id, "title": title})
-
-            fixed_rows.append([day, sport, src_id, title, body, str(created_at or ""), simple, comments])
-
-        # 댓글 생성(일괄)
-        if enable_comments and gen_items:
-            mapping: dict[str, str] = {}
-            # 너무 큰 요청 방지: 10개씩 쪼개기
-            for i in range(0, len(gen_items), 10):
-                chunk = gen_items[i : i + 10]
-                m = generate_export_comment_blocks_bulk(chunk, n=n_comments) or {}
-                mapping.update(m)
-
-            if mapping:
-                for row in fixed_rows:
-                    sid = (row[2] or "").strip()
-                    if not sid:
-                        continue
-                    if row[7].strip():
-                        continue
-                    if sid in mapping and mapping[sid].strip():
-                        row[7] = mapping[sid].strip()
-
-            # 그래도 비면 개별 생성(최소 보장)
-            for row in fixed_rows:
-                if row[7].strip():
-                    continue
-                sid = (row[2] or "").strip()
-                if not sid:
-                    continue
-                t = (row[3] or "").strip()
-                if not t:
-                    continue
-                row[7] = generate_export_comment_block(t, n=n_comments)
-
+    try:
         ws.append_rows(fixed_rows, value_input_option="RAW", table_range="A1")
         return True
-
     except Exception as e:
-        print(f"[GSHEET][EXPORT] append_rows 실패({sheet_name}): {e}")
+        print(f"[GSHEET][EXPORT] append 실패({sheet_name}): {e}")
         return False
 
+
+
+
+# ───────────────── Naver Cafe → Google Sheet (youtoo 탭) ─────────────────
+# youtoo 탭: 카페 게시글 백업/수집용
+
+YOUTOO_SHEET_NAME = (os.getenv("YOUTOO_SHEET_NAME") or "youtoo").strip()
+
+# ✅ 사용자가 원하는 최종 헤더 순서(고정)
+# ✅ 사용자가 원하는 자동 수집 헤더 순서(고정)  (A~K)
+YOUTOO_AUTO_HEADER = [
+    "src_id",
+    "경기",
+    "댓글수",
+    "조회수",
+    "좋아요",
+    "본문링크",
+    "첫댓글내용",
+    "첫댓글작성자",
+    "첫댓글시간",
+    "게시시간(날짜)",
+    "별명",
+]
+
+# ✅ 수기 입력 컬럼 (L~M) - 봇이 절대 덮어쓰지 않음
+YOUTOO_MANUAL_HEADER = [
+    "적중건제출여부",
+    "지급여부",
+]
+
+# 전체 헤더(A~M)
+YOUTOO_HEADER = YOUTOO_AUTO_HEADER + YOUTOO_MANUAL_HEADER
 
 def _col_letter(n: int) -> str:
     """1-indexed column number -> A1 column letter."""
@@ -4219,250 +4418,6 @@ def get_openai_client():
         _openai_client = None
     return _openai_client
 
-# ───────────────── OpenAI: export(H열) 댓글 생성 ─────────────────
-
-def _env_bool(name: str, default: bool = True) -> bool:
-    v = (os.getenv(name) or "").strip().lower()
-    if v == "":
-        return default
-    return v not in ("0", "false", "no", "off", "none")
-
-
-def _normalize_comment_lines(text: str, n: int) -> list[str]:
-    """모델 출력에서 댓글 n줄만 깔끔하게 추출"""
-    if not text:
-        return []
-    # 코드블록 제거
-    t = re.sub(r"```.*?```", "", str(text), flags=re.S).strip()
-    lines = []
-    for raw in t.splitlines():
-        s = (raw or "").strip()
-        if not s:
-            continue
-        # 번호/불릿 제거
-        s = re.sub(r"^\s*[-•*]\s*", "", s)
-        s = re.sub(r"^\s*\d+\s*[\)\.]\s*", "", s)
-        s = s.strip()
-        if not s:
-            continue
-        # 줄바꿈/탭 제거(셀에 한 줄로 저장)
-        s = re.sub(r"[\t\r\n]+", " ", s).strip()
-        # 너무 길면 살짝 컷
-        if len(s) > 140:
-            s = s[:140].rstrip()
-        lines.append(s)
-
-    # 중복 제거(순서 유지)
-    seen = set()
-    uniq = []
-    for s in lines:
-        if s in seen:
-            continue
-        seen.add(s)
-        uniq.append(s)
-
-    return uniq[:n]
-
-
-def generate_export_comment_block(title: str, n: int = 6) -> str:
-    """제목(title) 기반으로 댓글 n개를 생성해 H열(줄바꿈 구분)로 저장할 문자열을 만든다."""
-    t = (title or "").strip()
-    if not t:
-        return ""
-
-    client_oa = get_openai_client()
-    if not client_oa:
-        return ""
-
-    try:
-        n = int(n)
-    except Exception:
-        n = 6
-    n = max(3, min(10, n))
-
-    model = (os.getenv("EXPORT_COMMENT_MODEL") or os.getenv("OPENAI_MODEL_NEWS") or "gpt-4.1-mini").strip()
-    try:
-        temperature = float(os.getenv("EXPORT_COMMENT_TEMPERATURE") or "0.9")
-    except Exception:
-        temperature = 0.9
-
-    # 다양한 어투 유도(매 호출마다 랜덤)
-    tone_pack = _random.choice([
-        "친근하지만 예의 있는 말투",
-        "짧고 담백한 말투",
-        "조금 더 공손한 말투",
-        "가벼운 감탄을 섞되 과하지 않게",
-        "경기 기대감 중심으로",
-        "분석 글 칭찬 중심으로",
-    ])
-    variation = f"v{_random.randint(1000, 9999)}"
-
-    prompt = f"""다음은 스포츠 분석글의 제목이다.
-
-제목: {t}
-
-요구사항:
-- 한국어 댓글 {n}개를 만들어라.
-- 각 댓글은 한 줄(줄바꿈 금지)로 작성하라.
-- **각 댓글에 반드시** 제목에서 추출한 '리그명'과 '두 팀명'을 포함하라. (표기/띄어쓰기 그대로)
-- {tone_pack}로 작성하되, {n}개 댓글의 문장 구조/길이/어투가 서로 겹치지 않게 다양하게 써라.
-- 과장된 홍보, 링크, 해시태그, 이모지 남발, 'AI' 언급, 동일 문장 반복 금지.
-- 출력은 댓글만 {n}줄로. (다른 설명/제목/번호/불릿 금지)
-
-variation_id: {variation}
-""".strip()
-
-    try:
-        resp = client_oa.chat.completions.create(
-            model=model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "너는 한국 스포츠 커뮤니티의 일반 회원이다. 자연스럽고 사람처럼 보이는 댓글을 작성한다.",
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=temperature,
-            max_completion_tokens=450,
-        )
-        out = (resp.choices[0].message.content or "").strip()
-        lines = _normalize_comment_lines(out, n)
-        if len(lines) < n:
-            # 부족하면 한 번 더 보완 시도(짧게)
-            resp2 = client_oa.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": "너는 한국 스포츠 커뮤니티의 일반 회원이다."},
-                    {"role": "user", "content": f"제목: {t}\n댓글 {n}줄을 번호/불릿 없이 다시 출력해."},
-                ],
-                temperature=min(1.0, temperature + 0.1),
-                max_completion_tokens=450,
-            )
-            out2 = (resp2.choices[0].message.content or "").strip()
-            lines2 = _normalize_comment_lines(out2, n)
-            if len(lines2) > len(lines):
-                lines = lines2
-
-        return "\n".join(lines[:n])
-
-    except Exception as e:
-        print(f"[OPENAI][EXPORT_COMMENT] 생성 실패: {e}")
-        return ""
-
-
-def generate_export_comment_blocks_bulk(items: list[dict], n: int = 6) -> dict[str, str]:
-    """여러 경기(title) 댓글을 한 번에 생성. 반환: {src_id: '댓글\n댓글...'}"""
-    if not items:
-        return {}
-
-    client_oa = get_openai_client()
-    if not client_oa:
-        return {}
-
-    try:
-        n = int(n)
-    except Exception:
-        n = 6
-    n = max(3, min(10, n))
-
-    model = (os.getenv("EXPORT_COMMENT_MODEL") or os.getenv("OPENAI_MODEL_NEWS") or "gpt-4.1-mini").strip()
-    try:
-        temperature = float(os.getenv("EXPORT_COMMENT_TEMPERATURE") or "0.9")
-    except Exception:
-        temperature = 0.9
-
-    # 안전: title 너무 길면 컷
-    payload = []
-    for it in items:
-        sid = str(it.get("src_id") or it.get("id") or "").strip()
-        title = str(it.get("title") or "").strip()
-        if not sid or not title:
-            continue
-        if len(title) > 160:
-            title = title[:160].rstrip()
-        payload.append({"id": sid, "title": title})
-
-    if not payload:
-        return {}
-
-    variation = f"bulk{_random.randint(1000, 9999)}"
-
-    prompt = (
-        "너는 한국 스포츠 커뮤니티의 일반 회원이다. 아래 각 항목(title)을 보고 자연스러운 댓글을 작성하라.\n"
-        f"- 각 항목마다 댓글 {n}개\n"
-        "- 각 댓글은 한 줄(줄바꿈 금지)\n"
-        "- **각 댓글에 반드시** title에서 추출한 '리그명'과 '두 팀명'을 포함(표기/띄어쓰기 그대로)\n"
-        "- 댓글끼리 문장 구조/길이/어투가 겹치지 않게 다양화\n"
-        "- 홍보/링크/해시태그/이모지 남발/AI 언급/같은 문장 반복 금지\n"
-        "- 출력은 오직 JSON만(코드블록/설명 금지).\n\n"
-        "JSON 형식(반드시 준수):\n"
-        "{\n"
-        "  \"items\": [\n"
-        "    { \"id\": \"<id>\", \"comments\": [\"...\", \"...\"] },\n"
-        "    ...\n"
-        "  ]\n"
-        "}\n\n"
-        f"variation_id: {variation}\n"
-        "inputs: " + json.dumps(payload, ensure_ascii=False)
-    )
-
-    try:
-        resp = client_oa.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": "반드시 JSON만 출력한다."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=min(0.95, max(0.4, temperature)),
-            max_completion_tokens=min(2500, 350 + len(payload) * n * 40),
-        )
-        out = (resp.choices[0].message.content or "").strip()
-
-        # JSON만 추출(앞뒤 잡문 대비)
-        s = out
-        if "{" in s and "}" in s:
-            s = s[s.find("{"): s.rfind("}") + 1]
-        data = json.loads(s)
-
-        res: dict[str, str] = {}
-        arr = data.get("items") if isinstance(data, dict) else None
-        if not isinstance(arr, list):
-            return {}
-
-        for obj in arr:
-            if not isinstance(obj, dict):
-                continue
-            sid = str(obj.get("id") or "").strip()
-            comments = obj.get("comments")
-            if not sid or not isinstance(comments, list):
-                continue
-            lines = []
-            for c in comments:
-                cc = str(c or "").strip()
-                cc = re.sub(r"[\t\r\n]+", " ", cc).strip()
-                cc = re.sub(r"^\s*[-•*]\s*", "", cc)
-                cc = re.sub(r"^\s*\d+\s*[\)\.]\s*", "", cc)
-                if not cc:
-                    continue
-                if len(cc) > 140:
-                    cc = cc[:140].rstrip()
-                lines.append(cc)
-            # 중복 제거
-            uniq = []
-            seen = set()
-            for s2 in lines:
-                if s2 in seen:
-                    continue
-                seen.add(s2)
-                uniq.append(s2)
-            if uniq:
-                res[sid] = "\n".join(uniq[:n])
-        return res
-
-    except Exception as e:
-        print(f"[OPENAI][EXPORT_COMMENT][BULK] 실패: {e}")
-        return {}
-
 # 🔹 mazgtv 홍보 문구/해시태그 공통 제거용 패턴
 MAZ_REMOVE_PATTERNS = [
     # 기본 홍보 문구
@@ -5140,8 +5095,8 @@ async def crawl_daum_news_common(
 
     try:
         async with httpx.AsyncClient(
-            headers={"User-Agent": "Mozilla/5.0"},
-            follow_redirects=True,
+            headers=BROWSER_HEADERS,
+            follow_redirects=False,
         ) as client:
             await _maz_warmup(client)
             contents = await fetch_daum_news_json(client, category_id, size=max_articles)
@@ -5297,9 +5252,7 @@ async def crawl_daum_news_common(
 # ───────────────── mazgtv 분석 공통 (내일 경기 → today/tomorrow 시트, JSON/API 버전) ─────────────────
 
 # 상세 API 실제 경로에 맞게 여기만 수정하면 됨
-MAZ_DETAIL_API_TEMPLATE = f"{MAZ_BASE_URL}/api/board/{{board_id}}"
-
-
+MAZ_DETAIL_API_TEMPLATE = os.getenv("MAZ_DETAIL_API_TEMPLATE", f"{MAZ_BASE_URL}/api/board/{{board_id}}")
 def _parse_game_start_date(game_start_at: str) -> date | None:
     """
     '2025-11-28T05:00:00' 같은 문자열에서 날짜(date)만 뽑는다.
@@ -5413,6 +5366,261 @@ def classify_basketball_volleyball_sport(league: str) -> str:
     # 정말 정보가 없으면 농구로
     return "농구"
 
+def _looks_like_html_response(text: str, content_type: str = "") -> bool:
+    """API 응답이 JSON이 아니라 HTML(홈/SPA/차단페이지)로 내려오는지 간단 판별."""
+    ct = (content_type or "").lower()
+    if "text/html" in ct or "text/plain" in ct:
+        # 일부 서버는 text/plain으로 HTML을 내려주기도 함
+        head = (text or "").lstrip()[:200].lower()
+        if head.startswith("<!doctype") or head.startswith("<html") or "<head" in head:
+            return True
+
+    head = (text or "").lstrip()[:200].lower()
+    if head.startswith("<!doctype") or head.startswith("<html") or "<head" in head:
+        return True
+
+    return False
+
+
+def _extract_int_from_text(s: str) -> int | None:
+    """문자열에서 마지막에 가까운 숫자 id를 뽑는다."""
+    if not s:
+        return None
+    m = re.search(r"(\d{3,})\D*$", s)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    m = re.search(r"\b(\d{3,})\b", s)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    return None
+
+
+def _extract_maz_board_id_from_href(href: str) -> int | None:
+    """maz 게시글 링크에서 board_id(숫자)를 최대한 뽑아본다."""
+    if not href:
+        return None
+
+    # 흔한 케이스: /board/3296, /boards/3296, /article/3296 ...
+    m = re.search(r"/(?:board|boards|article|articles|post|posts)/(\d+)", href)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+
+    # 쿼리 파라미터로 들어오는 케이스: ?id=3296, ?articleId=3296 ...
+    m = re.search(r"(?:\?|&)(?:id|articleId|boardId)=(\d+)", href)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+
+    return _extract_int_from_text(href)
+
+
+def _extract_maz_text_from_content_html(content_html: str) -> str:
+    """API detail의 content(HTML)에서 본문 텍스트만 뽑는다."""
+    if not content_html:
+        return ""
+    soup = BeautifulSoup(content_html, "html.parser")
+    try:
+        for bad in soup.select("script, style, noscript, .ad, .banner, header, footer, nav, aside"):
+            bad.decompose()
+    except Exception:
+        pass
+
+    # 1) editor 계열 우선
+    for sel in ["div.ql-editor", "div.editor", "div.content", "div[class*='content']", "article", "main"]:
+        el = soup.select_one(sel)
+        if el:
+            txt = el.get_text("\n", strip=True)
+            txt = clean_maz_text(txt)
+            if txt:
+                return txt
+
+    # 2) fallback
+    txt = soup.get_text("\n", strip=True)
+    return clean_maz_text(txt)
+
+
+def _extract_maz_text_from_article_html(page_html: str) -> str:
+    """게시글 페이지(HTML)에서 본문 텍스트 추출(SSR/SPA 대비)."""
+    if not page_html:
+        return ""
+
+    soup = BeautifulSoup(page_html, "html.parser")
+    try:
+        for bad in soup.select("script, style, noscript, header, footer, nav, aside"):
+            bad.decompose()
+    except Exception:
+        pass
+
+    # 후보 컨테이너들 중 '가장 긴 텍스트'를 선택
+    candidates = []
+
+    selectors = [
+        "div.ql-editor",
+        "div.editor",
+        "div.content",
+        "div[class*='content']",
+        "div[class*='editor']",
+        "article",
+        "main",
+        "div#__nuxt",
+        "div#__layout",
+        "div#app",
+    ]
+    for sel in selectors:
+        for el in soup.select(sel):
+            txt = el.get_text("\n", strip=True)
+            txt = clean_maz_text(txt)
+            if txt and len(txt) >= 200:  # 너무 짧은 건 네비/푸터일 확률
+                candidates.append(txt)
+
+    if candidates:
+        candidates.sort(key=len, reverse=True)
+        return candidates[0]
+
+    # 최후의 fallback
+    txt = soup.get_text("\n", strip=True)
+    return clean_maz_text(txt)
+
+
+async def _maz_fetch_board_text(
+    client: httpx.AsyncClient,
+    board_id: int,
+    *,
+    fallback_url: str | None = None,
+) -> str:
+    """board_id 기준으로 본문 텍스트를 가져온다.
+    1) API detail 시도 → 2) 게시글 페이지 HTML 파싱으로 폴백.
+    """
+    # 1) API detail
+    detail_url = MAZ_DETAIL_API_TEMPLATE.format(board_id=board_id)
+    try:
+        r = await client.get(detail_url, timeout=12.0)
+        r.raise_for_status()
+        ctype = (r.headers.get("content-type") or "").lower()
+
+        # JSON이 아니면 HTML로 간주하고 폴백
+        if _looks_like_html_response(r.text, ctype):
+            raise ValueError("detail returned HTML")
+
+        detail = r.json()
+        content_html = (detail or {}).get("content") or ""
+        txt = _extract_maz_text_from_content_html(content_html)
+        if txt:
+            return txt
+    except Exception as e:
+        # 상세 오류는 폴백으로 이어감
+        print(f"[MAZ][DETAIL_FALLBACK] id={board_id} api_fail: {e}")
+
+    # 2) 게시글 페이지 HTML
+    cand_urls: list[str] = []
+    if fallback_url:
+        cand_urls.append(fallback_url)
+
+    # 흔한 URL 패턴들(사이트가 바뀌어도 맞을 때가 있음)
+    cand_urls.extend([
+        f"{MAZ_BASE_URL}/board/{board_id}",
+        f"{MAZ_BASE_URL}/boards/{board_id}",
+        f"{MAZ_BASE_URL}/article/{board_id}",
+        f"{MAZ_BASE_URL}/articles/{board_id}",
+    ])
+
+    seen = set()
+    for url in cand_urls:
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        try:
+            rr = await client.get(url, timeout=15.0)
+            rr.raise_for_status()
+            txt = _extract_maz_text_from_article_html(rr.text)
+            if txt:
+                return txt
+        except Exception as e:
+            print(f"[MAZ][DETAIL_FALLBACK] id={board_id} html_fail url={url}: {e}")
+
+    return ""
+
+
+async def _maz_collect_items_from_analyze_page(
+    client: httpx.AsyncClient,
+    *,
+    analyze_url: str,
+    target_ymd: str,
+    league_default: str,
+) -> list[dict]:
+    """analyze 페이지(HTML)에서 target_ymd 날짜 매치 카드/링크를 찾아 item(dict) 리스트로 만든다.
+    반환 item 키는 API rows와 최대한 비슷하게 맞춘다: id, leagueName, homeTeamName, awayTeamName, link
+    """
+    if not analyze_url:
+        return []
+
+    # 도메인만 바뀐 경우(예: mazgtv1/2 → mazgtv3) 자동 보정
+    analyze_url = (
+        analyze_url
+        .replace("https://mazgtv1.com", MAZ_BASE_URL)
+        .replace("https://mazgtv2.com", MAZ_BASE_URL)
+    )
+
+    try:
+        headers = dict(BROWSER_HEADERS)
+        headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        r = await client.get(analyze_url, headers=headers, timeout=20.0)
+        r.raise_for_status()
+    except Exception as e:
+        print(f"[MAZ][HTML_LIST] analyze page fetch fail: {e} url={analyze_url}")
+        return []
+
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    cards = parse_maz_match_cards(soup, target_ymd)
+    if not cards:
+        # 2차 폴백: 'board/숫자' 링크를 전부 긁고, 링크 텍스트에서 날짜가 보이면 채택
+        cards = []
+        for a in soup.select("a[href]"):
+            href = a.get("href") or ""
+            bid = _extract_maz_board_id_from_href(href)
+            if not bid:
+                continue
+            t = clean_text(a.get_text(" ", strip=True))
+            if _normalize_match_date(target_ymd, t) != target_ymd:
+                continue
+            cards.append({"home": "", "away": "", "kickoff": t, "link": href, "league": ""})
+
+    items: list[dict] = []
+    seen_ids: set[int] = set()
+
+    for c in cards:
+        href = c.get("link") or ""
+        bid = _extract_maz_board_id_from_href(href)
+        if not bid or bid in seen_ids:
+            continue
+        seen_ids.add(bid)
+
+        abs_link = urljoin(analyze_url, href) if href else ""
+        items.append({
+            "id": bid,
+            "leagueName": (c.get("league") or league_default or "").strip(),
+            "homeTeamName": (c.get("home") or "").strip(),
+            "awayTeamName": (c.get("away") or "").strip(),
+            "link": abs_link,
+            "gameStartAtText": (c.get("kickoff") or "").strip(),
+        })
+
+    print(f"[MAZ][HTML_LIST] cards_found={len(cards)} items={len(items)} target={target_ymd} url={analyze_url}")
+    return items
+
+
 async def crawl_maz_analysis_common(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -5454,12 +5662,21 @@ async def crawl_maz_analysis_common(
     existing_export_src_ids = get_existing_export_src_ids(export_sheet_name) if export_site else set()
     site_rows_to_append: list[list[str]] = []
 
+    collected_items: list[dict] = []
+    mode: str = "api"  # "api" | "html"
+
     try:
         async with httpx.AsyncClient(
-            headers={"User-Agent": "Mozilla/5.0"},
-            follow_redirects=True,
+            headers=BROWSER_HEADERS,
+            follow_redirects=True,  # ✅ 도메인 이동/리다이렉트(mazgtv1/2→3) 대응
         ) as client:
             await _maz_warmup(client)
+
+            # -----------------------
+            # 1) API list 시도
+            # -----------------------
+            api_any_items = False
+            api_seems_broken = False
 
             for page in range(1, max_pages + 1):
                 list_url = (
@@ -5469,14 +5686,28 @@ async def crawl_maz_analysis_common(
                     f"&sort=b.game_start_at+DESC,+b.created_at+DESC"
                 )
 
-                r = await client.get(list_url, timeout=10.0)
-                r.raise_for_status()
+                try:
+                    r = await client.get(list_url, timeout=12.0)
+                    r.raise_for_status()
+                except Exception as e:
+                    print(f"[MAZ][LIST] request fail(page={page}): {e}")
+                    if page == 1:
+                        api_seems_broken = True
+                        break
+                    continue
 
+                ctype = (r.headers.get("content-type") or "").lower()
                 try:
                     data = r.json()
                 except Exception as e:
                     print(f"[MAZ][LIST] JSON 파싱 실패(page={page}): {e}")
-                    print("  응답 일부:", r.text[:200])
+                    print(f"  status={r.status_code} content-type={ctype} url={r.url}")
+                    print("  응답 일부:", (r.text or "")[:200])
+
+                    # ✅ page=1부터 HTML이면: 엔드포인트가 바뀌었거나 SPA로 라우팅된 상태 → HTML 폴백으로 전환
+                    if page == 1 and _looks_like_html_response(r.text, ctype):
+                        api_seems_broken = True
+                        break
                     continue
 
                 if isinstance(data, dict):
@@ -5493,53 +5724,86 @@ async def crawl_maz_analysis_common(
                     print(f"[MAZ][LIST] page={page} 항목 없음 → 반복 종료")
                     break
 
-                for item in items:
-                    if not isinstance(item, dict):
+                api_any_items = True
+                collected_items.extend([it for it in items if isinstance(it, dict)])
+
+            # -----------------------
+            # 2) API 결과에서 target_date 매칭 여부 판단
+            # -----------------------
+            api_any_target_match = False
+            if api_any_items:
+                for it in collected_items:
+                    try:
+                        gs = str(it.get("gameStartAt") or it.get("game_start_at") or "").strip()
+                        dt = _parse_game_start_date(gs) or detect_game_date_from_item(it, target_date)
+                        if not dt:
+                            continue
+                        if sport_label == "야구":
+                            if dt == target_date:
+                                api_any_target_match = True
+                                break
+                            delta_days = (target_date - dt).days
+                            if 0 <= delta_days < 7:
+                                api_any_target_match = True
+                                break
+                        else:
+                            if dt == target_date:
+                                api_any_target_match = True
+                                break
+                    except Exception:
                         continue
 
-                    board_id = item.get("id")
-                    if not board_id:
-                        continue
+            # -----------------------
+            # 3) 필요 시 HTML analyze 폴백
+            # -----------------------
+            need_html = (not api_any_items) or api_seems_broken or (not api_any_target_match)
+            if need_html:
+                html_items = await _maz_collect_items_from_analyze_page(
+                    client,
+                    analyze_url=base_url,
+                    target_ymd=target_ymd,
+                    league_default=league_default,
+                )
+                if html_items:
+                    collected_items = html_items
+                    mode = "html"
+                else:
+                    # HTML이 비었으면 API 결과(있다면)로 진행
+                    mode = "api"
 
-                    row_id = f"maz_{board_id}"
+            # -----------------------
+            # 4) 수집된 items 처리
+            # -----------------------
+            for item in collected_items:
+                if not isinstance(item, dict):
+                    continue
 
-                    # ✅ 중복 처리
-                    needs_analysis = row_id not in existing_ids
-                    needs_export = bool(export_site) and (row_id not in existing_export_src_ids)
-                    if (not needs_analysis) and (not needs_export):
-                        print(f"[MAZ][SKIP_DUP] already exists (analysis+export): {row_id}")
-                        continue
-                    if (not needs_analysis) and needs_export:
-                        print(f"[MAZ][BACKFILL] analysis exists but export missing: {row_id}")
+                board_id = item.get("id")
+                if not board_id:
+                    continue
+                try:
+                    board_id_int = int(board_id)
+                except Exception:
+                    continue
 
-                    game_start_at = (
-                        item.get("gameStartAt")
-                        or item.get("game_start_at")
-                        or ""
-                    )
-                    game_start_at = str(game_start_at).strip()
+                row_id = f"maz_{board_id_int}"
 
-                    game_start_at_text = str(item.get("gameStartAtText") or "").strip()
-                    print(
-                        f"[MAZ][DEBUG] page={page} id={board_id} "
-                        f"gameStartAt='{game_start_at}' gameStartAtText='{game_start_at_text}'"
-                    )
+                # ✅ 중복 처리
+                needs_analysis = row_id not in existing_ids
+                needs_export = bool(export_site) and (row_id not in existing_export_src_ids)
+                if (not needs_analysis) and (not needs_export):
+                    continue
+                if (not needs_analysis) and needs_export:
+                    print(f"[MAZ][BACKFILL] analysis exists but export missing: {row_id}")
 
-                    # 1) gameStartAt로 날짜 파싱
-                    item_date = _parse_game_start_date(game_start_at)
-
-                    # 2) 실패하면 item 전체에서 날짜 패턴 탐색 (연도 보정용)
+                # ✅ 날짜 필터(API 모드일 때만 엄격하게 적용)
+                # HTML 폴백은 parse_maz_match_cards 단계에서 이미 target_date로 1차 필터링 됨
+                if mode == "api":
+                    game_start_at = str(item.get("gameStartAt") or item.get("game_start_at") or "").strip()
+                    item_date = _parse_game_start_date(game_start_at) or detect_game_date_from_item(item, target_date)
                     if not item_date:
-                        item_date = detect_game_date_from_item(item, target_date)
-
-                    print(f"[MAZ][DEBUG_DATE] page={page} id={board_id} item_date={item_date}")
-
-                    if not item_date:
                         continue
 
-                    # ✅ 날짜 필터링
-                    # - 축구/농구/배구: target_date와 정확히 일치만
-                    # - 야구: (혹시 주간 카드로 들어오는 경우) 일치가 아니면 같은 주(0~6일)까지 허용
                     if sport_label == "야구":
                         if item_date != target_date:
                             delta_days = (target_date - item_date).days
@@ -5549,1614 +5813,148 @@ async def crawl_maz_analysis_common(
                         if item_date != target_date:
                             continue
 
-                    league = item.get("leagueName") or league_default
-                    home = item.get("homeTeamName") or ""
-                    away = item.get("awayTeamName") or ""
+                league = (item.get("leagueName") or league_default or "").strip()
+                home = (item.get("homeTeamName") or item.get("home") or "").strip()
+                away = (item.get("awayTeamName") or item.get("away") or "").strip()
 
-                    detail_url = MAZ_DETAIL_API_TEMPLATE.format(board_id=board_id)
+                fallback_link = (item.get("link") or "").strip() or None
+                full_text = await _maz_fetch_board_text(client, board_id_int, fallback_url=fallback_link)
+                if not full_text:
+                    print(f"[MAZ][DETAIL] id={board_id_int} 본문 텍스트 없음")
+                    continue
+
+                # ---- 요약/재작성 ----
+                if needs_analysis:
+                    new_title, new_body = summarize_analysis_with_gemini(
+                        full_text,
+                        league=league,
+                        home_team=home,
+                        away_team=away,
+                        max_chars=900,
+                    )
+                else:
+                    new_title, new_body = "", ""
+
+                # ✅ today/tomorrow 크롤링 제목 앞에 날짜 프리픽스 추가 (중복 방지)
+                if new_title and day_key in ("today", "tomorrow"):
+                    _dp = f"{target_date.month}월 {target_date.day}일 "
+                    if not str(new_title).startswith(_dp):
+                        new_title = _dp + str(new_title).strip()
+
+                # ✅ sport 세부 분류
+                row_sport = sport_label
+
+                if sport_label == "축구":
+                    if "K리그" in league:
+                        row_sport = "K리그"
+                    elif "J리그" in league:
+                        row_sport = "J리그"
+                    else:
+                        row_sport = "해외축구"
+
+                elif sport_label == "야구":
+                    upper_league = (league or "").upper()
+                    if "KBO" in upper_league:
+                        row_sport = "KBO"
+                    elif "NPB" in upper_league:
+                        row_sport = "NPB"
+                    elif "MLB" in upper_league:
+                        row_sport = "해외야구"
+                    else:
+                        row_sport = "해외야구"
+
+                elif sport_label in ("농구", "농구/배구"):
+                    row_sport = classify_basketball_volleyball_sport(league or "")
+
+                if needs_analysis:
+                    rows_to_append.append([row_sport, row_id, new_title, new_body])
+
+                # ✅ 사이트 업로드용(site_export)도 같이 저장
+                if export_site and needs_export:
                     try:
-                        r2 = await client.get(detail_url, timeout=10.0)
-                        r2.raise_for_status()
-                        detail = r2.json()
-                    except Exception as e:
-                        print(f"[MAZ][DETAIL] id={board_id} 요청 실패: {e}")
-                        continue
-
-                    content_html = detail.get("content") or ""
-                    if not str(content_html).strip():
-                        print(f"[MAZ][DETAIL] id={board_id} content 없음")
-                        continue
-
-                    soup = BeautifulSoup(content_html, "html.parser")
-                    try:
-                        for bad in soup.select("script, style, .ad, .banner"):
-                            bad.decompose()
-                    except Exception:
-                        pass
-
-                    full_text = soup.get_text("\n", strip=True)
-                    full_text = clean_maz_text(full_text)
-                    if not full_text:
-                        print(f"[MAZ][DETAIL] id={board_id} 본문 텍스트 없음")
-                        continue
-
-                    if needs_analysis:
-                        new_title, new_body = summarize_analysis_with_gemini(
+                        _tmp_title, site_body = rewrite_for_site_openai(
                             full_text,
                             league=league,
                             home_team=home,
                             away_team=away,
-                            max_chars=900,
                         )
+                    except Exception as e:
+                        print(f"[SITE_EXPORT][ERR] id={board_id_int}: {e}")
                     else:
-                        new_title, new_body = "", ""
+                        # ✅ 팀명/구분자 정규화 (표시용 키워드: '팀1 팀2')
+                        _norm_key = infer_norm_sport_key(sport_label, row_sport, league or "")
+                        _league_for_title = (league or league_default or "").strip()
+                        site_title = build_export_title(target_date, _league_for_title, home, away, _norm_key)
+                        # body(E열)에도 팀명/구분자 표기를 정리(FC/CF/워리어스 등 제거 + vs/대 제거)
+                        site_body = normalize_text_teamnames(site_body, sport_key=_norm_key, home_raw=home, away_raw=away)
+                        site_body = _postprocess_site_body_text(site_body)
 
-                    # ✅ today/tomorrow 크롤링 제목 앞에 날짜 프리픽스 추가 (중복 방지)
-                    if new_title and day_key in ("today", "tomorrow"):
-                        _dp = f"{target_date.month}월 {target_date.day}일 "
-                        if not str(new_title).startswith(_dp):
-                            new_title = _dp + str(new_title).strip()
-
-                    # ✅ sport 세부 분류
-                    row_sport = sport_label
-
-                    if sport_label == "축구":
-                        if "K리그" in league:
-                            row_sport = "K리그"
-                        elif "J리그" in league:
-                            row_sport = "J리그"
-                        else:
-                            row_sport = "해외축구"
-
-                    elif sport_label == "야구":
-                        upper_league = (league or "").upper()
-                        if "KBO" in upper_league:
-                            row_sport = "KBO"
-                        elif "NPB" in upper_league:
-                            row_sport = "NPB"
-                        elif "MLB" in upper_league:
-                            row_sport = "해외야구"
-                        else:
-                            row_sport = "해외야구"
-
-                    elif sport_label in ("농구", "농구/배구"):
-                        row_sport = classify_basketball_volleyball_sport(league or "")
-
-                    if needs_analysis:
-                        rows_to_append.append([row_sport, row_id, new_title, new_body])
-
-                    # ✅ 사이트 업로드용(site_export)도 같이 저장
-                    if export_site and needs_export:
-                        # export 시트에만 백필/저장
+                        # ✅ export 시트 G열(simple) 생성: 팀 태그/해시태그 유지
                         try:
-                            _tmp_title, site_body = rewrite_for_site_openai(
-                                full_text,
-                                league=league,
-                                home_team=home,
-                                away_team=away,
-                            )
-                        except Exception as e:
-                            print(f"[SITE_EXPORT][ERR] id={board_id}: {e}")
-                        else:
-                            # ✅ 팀명/구분자 정규화 (표시용 키워드: '팀1 팀2')
-                            _norm_key = infer_norm_sport_key(sport_label, row_sport, league or "")
-                            _league_for_title = (league or league_default or "").strip()
-                            site_title = build_export_title(target_date, _league_for_title, home, away, _norm_key)
-                            # body(E열)에도 팀명/구분자 표기를 정리(FC/CF/워리어스 등 제거 + vs/대 제거)
-                            site_body = normalize_text_teamnames(site_body, sport_key=_norm_key, home_raw=home, away_raw=away)
-                            site_body = _postprocess_site_body_text(site_body)
-                    
-                            # ✅ export 시트 G열(simple) 생성: 팀 태그/해시태그 유지
-                            try:
-                                _hd, _ad, _ = build_matchup_display(home, away, _norm_key)
-                                site_simple = build_dynamic_cafe_simple(
-                                    site_title,
-                                    site_body,
-                                    sport=row_sport,
-                                    seed=str(row_id),
-                                    home_team=_hd,
-                                    away_team=_ad,
-                                )
-                            except Exception:
-                                site_simple = ""
-
-                            # ✅ E열(body) 하단에 해시태그를 같이 붙이기(원하는 형식)
-                            #   - G열(simple) 마지막 줄은 해시태그 라인으로 생성됨
-                            try:
-                                _last_line = (site_simple or "").strip().splitlines()[-1].strip()
-                                if _last_line.startswith("#") and _last_line not in (site_body or ""):
-                                    site_body = (site_body or "").rstrip() + "\n\n" + _last_line
-                            except Exception:
-                                pass
-                    
-                            site_rows_to_append.append([
-                                day_key,
-                                row_sport,
-                                row_id,
+                            _hd, _ad, _ = build_matchup_display(home, away, _norm_key)
+                            site_simple = build_dynamic_cafe_simple(
                                 site_title,
                                 site_body,
-                                get_kst_now().strftime("%Y-%m-%d %H:%M:%S"),
-                                site_simple,
-                            ])
-                            existing_export_src_ids.add(row_id)
+                                sport=row_sport,
+                                seed=str(row_id),
+                                home_team=_hd,
+                                away_team=_ad,
+                            )
+                        except Exception:
+                            site_simple = ""
+
+                        # ✅ E열(body) 하단에 해시태그를 같이 붙이기(원하는 형식)
+                        #   - G열(simple) 마지막 줄은 해시태그 라인으로 생성됨
+                        try:
+                            _last_line = (site_simple or "").strip().splitlines()[-1].strip()
+                            if _last_line.startswith("#") and _last_line not in (site_body or ""):
+                                site_body = (site_body or "").rstrip() + "\n\n" + _last_line
+                        except Exception:
+                            pass
+
+                        site_rows_to_append.append([
+                            day_key,
+                            row_sport,
+                            row_id,
+                            site_title,
+                            site_body,
+                            get_kst_now().strftime("%Y-%m-%d %H:%M:%S"),
+                            site_simple,
+                        ])
+                        existing_export_src_ids.add(row_id)
 
     except Exception as e:
-        # ✅ 여기 except는 try와 같은 들여쓰기 레벨이어야 함
-        await update.message.reply_text(f"요청 오류가 발생했습니다: {e}")
+        print(f"[MAZ][ERR] crawl_maz_analysis_common 전체 오류: {e}")
+        await update.message.reply_text(f"요청 처리 중 오류가 발생했습니다: {e}")
         return
 
+    # ✅ 저장 처리
     if (not rows_to_append) and (not site_rows_to_append):
-        await update.message.reply_text(
-            f"mazgtv {sport_label} 분석에서 {target_ymd} 경기 분석글을 찾지 못했습니다."
-        )
+        await update.message.reply_text(f"mazgtv {sport_label} 분석에서 {target_ymd} 경기 분석글을 찾지 못했습니다.")
         return
 
     if rows_to_append:
         ok = append_analysis_rows(day_key, rows_to_append)
-        if not ok:
-            await update.message.reply_text("구글시트에 분석 데이터를 저장하지 못했습니다.")
-            return
-    else:
-        ok = True
+        if ok:
+            await update.message.reply_text(f"{sport_label} 분석 {len(rows_to_append)}건 저장 완료 ✅")
+        else:
+            await update.message.reply_text(f"{sport_label} 분석 저장 실패 ❌")
 
-    # ✅ site_export 시트 저장
+    # ✅ site_export 저장 처리(append)
     if export_site and site_rows_to_append:
         ok2 = append_export_rows(export_sheet_name, site_rows_to_append)
-        if not ok2:
-            await update.message.reply_text("site_export 시트 저장 중 오류가 발생했습니다.")
-            return
-
-    reload_analysis_from_sheet()
-
-    extra = ""
-    if export_site:
-        extra = f"\\nexport 시트에도 {len(site_rows_to_append)}건을 저장했습니다."
-
-    saved_analysis_cnt = len(rows_to_append)
-    saved_export_cnt = len(site_rows_to_append) if export_site else 0
-    await update.message.reply_text(
-        f"mazgtv {sport_label} 분석에서 {target_ymd} 저장 완료: "
-        f"분석시트 {saved_analysis_cnt}건, export {saved_export_cnt}건." + extra + "\n"
-        "텔레그램에서 경기 분석픽 메뉴를 열어 확인해보세요."
-    )
-
-# ───────────────── 종목별 (Daum 뉴스) 크롤링 명령어 ─────────────────
-
-# 해외축구
-async def crawlsoccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cat_id = DAUM_CATEGORY_IDS.get("world_soccer")
-    await crawl_daum_news_common(
-        update,
-        context,
-        category_id=cat_id,
-        sport_label="축구",
-        max_articles=5,
-    )
-
-
-# 국내축구 (K리그 등, 5개)
-async def crawlsoccerkr(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cat_id = DAUM_CATEGORY_IDS.get("soccer_kleague")
-    await crawl_daum_news_common(
-        update,
-        context,
-        category_id=cat_id,
-        sport_label="축구",   # 해외/국내를 한 카테고리에 묶어서 보여주기
-        max_articles=5,
-    )
-
-
-# KBO 야구
-async def crawlbaseball(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cat_id = DAUM_CATEGORY_IDS.get("baseball_kbo")
-    await crawl_daum_news_common(
-        update,
-        context,
-        category_id=cat_id,
-        sport_label="야구",
-        max_articles=5,
-    )
-
-
-# 해외야구 (MLB 등)
-async def crawloverbaseball(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cat_id = DAUM_CATEGORY_IDS.get("baseball_world")
-    await crawl_daum_news_common(
-        update,
-        context,
-        category_id=cat_id,
-        sport_label="야구",  # 필요하면 '해외야구'로 분리해서도 가능
-        max_articles=5,
-    )
-
-
-# 농구
-async def crawlbasketball(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cat_id = DAUM_CATEGORY_IDS.get("basketball")
-    await crawl_daum_news_common(
-        update,
-        context,
-        category_id=cat_id,
-        sport_label="농구",
-        max_articles=10,
-    )
-
-
-# 배구
-async def crawlvolleyball(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cat_id = DAUM_CATEGORY_IDS.get("volleyball")
-    await crawl_daum_news_common(
-        update,
-        context,
-        category_id=cat_id,
-        sport_label="배구",
-        max_articles=10,
-    )
-
-
-# ───────────────── news_cafe_queue → 네이버 카페 업로드 (/cafe_news_upload) ─────────────────
-
-def _safe_truncate(s: str, n: int = 300) -> str:
-    s = (s or "").strip()
-    return s if len(s) <= n else s[:n] + "…"
-
-
-def _news_is_rate_limited(err: str) -> bool:
-    s = (err or "").lower()
-    # 네이버 OpenAPI 쪽은 429 / rate / limit / too many 등으로 오는 경우가 많아 보수적으로 체크
-    return ("429" in s) or ("rate" in s) or ("limit" in s) or ("too many" in s)
-
-
-def fetch_daum_article_text_and_image(url: str, orig_title: str = "") -> tuple[str, str]:
-    """다음/다음스포츠/다음뉴스(v.daum.net 포함) 기사 URL에서
-    - 본문 텍스트
-    - 대표 이미지 URL(가능하면)
-    를 추출한다.
-
-    ⚠️ 주의:
-    - v.daum.net(다음뉴스) 페이지는 div#harmonyContainer가 없을 수 있어,
-      본문 컨테이너(body_el) 기준으로 첫 img를 추가로 탐색한다.
-    """
-    if not url:
-        return "", ""
-
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
-        # 일부 CDN이 referer 없는 호출을 막는 케이스가 있어 안전장치로 넣음
-        "Referer": url,
-    }
-
-    r = requests.get(url, headers=headers, timeout=25)
-    r.raise_for_status()
-
-    # requests가 간혹 encoding을 못 잡는 케이스가 있어 UTF-8로 폴백
-    try:
-        if not r.encoding:
-            r.encoding = "utf-8"
-    except Exception:
-        pass
-
-    soup = BeautifulSoup(r.text, "html.parser")
-
-    def _pick_img_attr(tag) -> str:
-        if not tag:
-            return ""
-        return (
-            (tag.get("src") or "")
-            or (tag.get("data-src") or "")
-            or (tag.get("data-original") or "")
-            or (tag.get("data-lazy-src") or "")
-            or (tag.get("data-original-src") or "")
-        ).strip()
-
-    def _norm_img(u: str) -> str:
-        from urllib.parse import urljoin
-        u = (u or "").strip()
-        u = html.unescape(u)
-        u = u.strip(" \"'")
-        if not u:
-            return ""
-        if u.startswith("data:"):
-            return ""
-        if u.startswith("//"):
-            u = "https:" + u
-        if u.startswith("/"):
-            u = urljoin(url, u)
-        return u
-
-    # 0) 본문 컨테이너 후보(텍스트/이미지 공용)
-    body_el = (
-        soup.select_one("div#harmonyContainer")
-        or soup.select_one("section#article-view-content-div")
-        or soup.select_one("div.article_view")
-        or soup.select_one("div#mArticle")
-        or soup.find("article")
-        or soup.body
-    )
-
-    # 1) 대표 이미지 URL 추출 우선순위
-    img_url = ""
-
-    # 1-a) og:image(가장 안정적)
-    for prop in ("og:image", "og:image:secure_url"):
-        try:
-            meta = soup.find("meta", attrs={"property": prop})
-            if meta and meta.get("content"):
-                img_url = _norm_img(str(meta.get("content")).strip())
-                if img_url:
-                    break
-        except Exception:
-            pass
-
-    # 1-b) twitter:image 폴백
-    if not img_url:
-        try:
-            meta = soup.find("meta", attrs={"name": "twitter:image"})
-            if meta and meta.get("content"):
-                img_url = _norm_img(str(meta.get("content")).strip())
-        except Exception:
-            pass
-
-    # 1-c) 본문 컨테이너 내 첫 img 폴백(특히 v.daum.net 대응)
-    if not img_url:
-        try:
-            if body_el:
-                img = body_el.find("img")
-                if img:
-                    img_url = _norm_img(_pick_img_attr(img))
-        except Exception:
-            pass
-
-    # 1-d) 최후 폴백: 페이지 전체에서 첫 img
-    if not img_url:
-        try:
-            img = soup.find("img")
-            if img:
-                img_url = _norm_img(_pick_img_attr(img))
-        except Exception:
-            pass
-
-    # 2) 본문 텍스트 추출(크롤링 로직 재사용)
-    raw_body = ""
-    if body_el:
-        # 이미지 설명 캡션 제거
-        try:
-            for cap in body_el.select(
-                "figcaption, .txt_caption, .photo_desc, .caption, "
-                "em.photo_desc, span.caption, p.caption"
-            ):
-                try:
-                    cap.extract()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        raw_body = body_el.get_text("\n", strip=True)
-
-    clean_text = clean_daum_body_text(raw_body)
-    if orig_title:
-        clean_text = remove_title_prefix(orig_title, clean_text)
-
-    return clean_text, img_url
-
-def _download_image_bytes(img_url: str, *, referer: str = "") -> tuple[bytes, str, str]:
-    """이미지 URL을 다운로드해서 (bytes, filename, mime_type) 반환. 실패하면 (b"", "", "").
-
-    ✅ 다운로드 안정성
-    - User-Agent/Referer 포함
-    - daumcdn thumb URL(?fname=...)이면 원본 URL을 우선 시도하고, 실패 시 thumb로 폴백
-    - Content-Type이 image/*가 아니면 '파일 시그니처'로 2차 판정(HTML 다운로드 방지)
-
-    ✅ 카페 API 업로드 호환성
-    - 일부 CDN은 Accept 헤더에 webp/avif가 포함되면 webp로 내려주는 경우가 있습니다.
-      네이버 카페 Open API multipart 이미지 첨부는 JPEG/PNG 계열이 가장 안정적이라,
-      기본 Accept는 webp/avif를 광고하지 않도록 설정합니다.
-    - 혹시 webp로 받아진 경우에는 (가능하면) JPEG로 변환해서 반환합니다.
-    """
-    if not img_url:
-        return b"", "", ""
-
-    # --- URL 후보 만들기(원본 우선) ---
-    from urllib.parse import urlparse, parse_qs, unquote, urljoin
-
-    raw = html.unescape((img_url or "").strip()).strip(" \"'")
-    if not raw or raw.startswith("data:"):
-        return b"", "", ""
-    if raw.startswith("//"):
-        raw = "https:" + raw
-    if raw.startswith("/") and referer:
-        raw = urljoin(referer, raw)
-
-    candidates: list[str] = []
-    # thumb URL이면 fname 원본 먼저
-    try:
-        pr = urlparse(raw)
-        qs = parse_qs(pr.query or "")
-        fname = (qs.get("fname", [""]) or [""])[0]
-        if fname:
-            orig = unquote(fname)
-            # fname가 2중 인코딩인 케이스가 있어 1~2회 추가 디코딩
-            for _ in range(2):
-                if "%2F" in orig or "%3A" in orig or "%3a" in orig:
-                    orig = unquote(orig)
-            if orig and orig.startswith("//"):
-                orig = "https:" + orig
-            if orig and orig.startswith("http"):
-                candidates.append(orig)
-    except Exception:
-        pass
-
-    candidates.append(raw)
-
-    # 중복 제거(순서 유지)
-    seen = set()
-    cand2 = []
-    for u in candidates:
-        u2 = (u or "").strip()
-        if not u2 or u2 in seen:
-            continue
-        seen.add(u2)
-        cand2.append(u2)
-
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        # ✅ webp/avif를 광고하지 않음(= JPG/PNG로 받게 유도)
-        "Accept": "image/jpeg,image/png,image/gif,image/*;q=0.8,*/*;q=0.5",
-        "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
-    }
-    if referer:
-        headers["Referer"] = referer
-
-    def _sniff_mime(data: bytes) -> str:
-        if not data:
-            return ""
-        if data[:3] == b"\xFF\xD8\xFF":
-            return "image/jpeg"
-        if data[:8] == b"\x89PNG\r\n\x1a\n":
-            return "image/png"
-        if data[:6] in (b"GIF87a", b"GIF89a"):
-            return "image/gif"
-        if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-            return "image/webp"
-        # AVIF/HEIC 간단 시그니처(ftyp) 탐지
-        if len(data) >= 16 and data[4:8] == b"ftyp":
-            brand = data[8:12]
-            if brand in (b"avif", b"avis"):
-                return "image/avif"
-            if brand in (b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1"):
-                return "image/heic"
-        return ""
-
-    def _convert_webp_to_jpeg(data: bytes) -> bytes:
-        """webp 등을 JPEG로 변환. Pillow가 없으면 b'' 반환."""
-        try:
-            from PIL import Image  # type: ignore
-            from io import BytesIO
-            im = Image.open(BytesIO(data))
-            # 투명도 처리
-            if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
-                im = im.convert("RGBA")
-                bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
-                bg.paste(im, mask=im.split()[-1])
-                im = bg.convert("RGB")
-            else:
-                im = im.convert("RGB")
-            out = BytesIO()
-            im.save(out, format="JPEG", quality=92, optimize=True)
-            return out.getvalue()
-        except Exception:
-            return b""
-
-    last_err = ""
-    for u in cand2:
-        try:
-            r = requests.get(u, headers=headers, timeout=25, stream=False)
-            r.raise_for_status()
-
-            data = r.content or b""
-            if not data:
-                last_err = "EMPTY_IMAGE"
-                continue
-
-            content_type = (r.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
-
-            # Content-Type이 image가 아니면 시그니처로 판정(HTML 다운로드 방지)
-            if not content_type.startswith("image/"):
-                sniff = _sniff_mime(data)
-                if not sniff:
-                    last_err = f"NOT_IMAGE:{content_type or 'unknown'}"
-                    continue
-                content_type = sniff
-
-            # ✅ webp/avif 등은 네이버 카페 업로드가 실패할 수 있어 가능하면 jpeg로 변환
-            if content_type in ("image/webp", "image/avif", "image/heic"):
-                conv = _convert_webp_to_jpeg(data)
-                if conv:
-                    data = conv
-                    content_type = "image/jpeg"
-
-            # 확장자 결정
-            ext = ".jpg"
-            if "png" in content_type:
-                ext = ".png"
-            elif "gif" in content_type:
-                ext = ".gif"
-            else:
-                ext = ".jpg"
-
-            filename = f"news_image{ext}"
-            return data, filename, content_type
-
-        except Exception as e:
-            last_err = str(e)
-
-    print(f"[NEWS_IMAGE] download 실패: {img_url} / last_err={last_err}")
-    return b"", "", ""
-
-
-def _needs_url_decode(s: str) -> bool:
-    s = s or ""
-    # %HH 형태가 있으면 URL 인코딩 문자열일 가능성이 높다.
-    return bool(re.search(r"%[0-9A-Fa-f]{2}", s))
-
-
-def _safe_url_decode(s: str) -> str:
-    """퍼센트 인코딩된 문자열(예: %ED%92%80%EB%9F%BC...)을 사람이 읽을 수 있게 복원한다.
-    - 일반 문자열은 그대로 반환한다.
-    """
-    t = (s or "").strip()
-    if not t:
-        return ""
-    if _needs_url_decode(t):
-        try:
-            return (unquote_plus(t) or t).strip()
-        except Exception:
-            return t
-    return t
-
-
-def _seo_phrase_for_sport(sport_label: str) -> str:
-    """종목 문자열을 바탕으로 본문에 자연스럽게 넣을 '종목 키워드(SEO)' 문구를 만든다."""
-    s = (sport_label or "").strip()
-    if not s:
-        return "스포츠뉴스"
-
-    sl = s.lower()
-    # 축구
-    if ("축구" in s) or ("soccer" in sl):
-        if ("해외" in s) or ("epl" in sl) or ("laliga" in sl) or ("분데스" in s) or ("챔피언스" in s):
-            return "해외축구 뉴스"
-        if ("k리그" in sl) or ("k리그" in s) or ("k-league" in sl) or ("국내" in s):
-            return "국내축구 소식"
-        return "축구 뉴스"
-
-    # 야구
-    if ("야구" in s) or ("baseball" in sl):
-        if ("kbo" in sl) or ("프로" in s) or ("국내" in s):
-            return "프로야구 소식"
-        if ("mlb" in sl) or ("해외" in s):
-            return "해외야구 소식"
-        return "야구 소식"
-
-    # 농구
-    if ("농구" in s) or ("basket" in sl):
-        if ("nba" in sl):
-            return "NBA 소식"
-        if ("kbl" in sl) or ("프로" in s) or ("국내" in s):
-            return "프로농구 소식"
-        return "농구 뉴스"
-
-    # 배구
-    if ("배구" in s) or ("volley" in sl):
-        if ("v리그" in sl) or ("v리그" in s) or ("프로" in s) or ("국내" in s):
-            return "프로배구 소식"
-        return "배구 뉴스"
-
-    return "스포츠뉴스"
-
-
-def _clean_news_rewrite_text_keep_newlines(text: str) -> str:
-    """뉴스 재작성 본문용 클리너.
-    - 줄바꿈/문단 구조는 유지
-    - 과도한 공백만 정리
-    - 해시태그(#...)는 삭제하지 않는다
-    """
-    if not text:
-        return ""
-    t = str(text)
-    t = t.replace("\r\n", "\n").replace("\r", "\n")
-
-    # 제어문자 제거
-    t = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", t)
-
-    # 라인별 앞뒤 공백 정리 + 탭/연속 공백 축소
-    lines = []
-    for ln in t.split("\n"):
-        ln2 = re.sub(r"[ \t]+", " ", ln).strip()
-        lines.append(ln2)
-
-    t = "\n".join(lines)
-
-    # 너무 많은 연속 줄바꿈은 2개로 축소
-    t = re.sub(r"\n{3,}", "\n\n", t).strip()
-    return t
-
-
-def _extract_hashtags_fallback(body: str, sport_label: str, max_tags: int = 10) -> list[str]:
-    """OpenAI 출력에 해시태그가 없을 때의 폴백 생성.
-    - 본문에서 자주 등장하는 고유명사/키워드를 단순 추출
-    - 너무 일반적인 단어는 제외
-    """
-    if max_tags < 6:
-        max_tags = 6
-    base = []
-
-    # 종목 기본 태그
-    base.append("스포츠뉴스")
-    phrase = _seo_phrase_for_sport(sport_label)
-    if phrase:
-        base.append(phrase.replace(" ", ""))
-
-    # 토큰 후보: 한글/영문/숫자 2~20자
-    tokens = re.findall(r"[가-힣A-Za-z0-9]{2,20}", body or "")
-    stop = {
-        "그리고","하지만","그러나","또한","이번","지난","오늘","내일","현재","이날","이후","관련","소식","뉴스","기사",
-        "경기","시즌","리그","구단","선수","감독","팀","상대","이적","전망","분석","스포츠","스포츠뉴스","해외축구","프로야구",
-        "등","것","수","때","더","중","대한","대한민국","한국","대한축구협회","프로야구소식","해외축구뉴스",
-    }
-
-    from collections import Counter
-    cnt = Counter()
-    for tok in tokens:
-        t = tok.strip()
-        if not t:
-            continue
-        if t in stop:
-            continue
-        if re.fullmatch(r"\d+", t):
-            continue
-        # 너무 짧은 영문 약어(예: 'vs') 제거
-        if t.lower() in {"vs","v","tv","go","or","an","as","to","in","on","at","of","is"}:
-            continue
-        cnt[t] += 1
-
-    # 빈도 상위 + 길이가 적당한 것 우선
-    extras = []
-    for w, _n in cnt.most_common(30):
-        # 너무 긴 토큰은 제외
-        if len(w) > 16:
-            continue
-        extras.append(w)
-        if len(extras) >= (max_tags - len(base)):
-            break
-
-    tags_raw = base + extras
-    # 중복 제거(순서 유지)
-    seen = set()
-    tags = []
-    for t in tags_raw:
-        k = t.strip()
-        if not k:
-            continue
-        if k in seen:
-            continue
-        seen.add(k)
-        tags.append(k)
-        if len(tags) >= max_tags:
-            break
-
-    # 최소 6개 보장
-    if len(tags) < 6:
-        for add in ["이적소식", "경기결과", "리그소식", "팀소식", "선수소식", "스포츠분석"]:
-            if add not in seen:
-                tags.append(add)
-                seen.add(add)
-            if len(tags) >= 6:
-                break
-
-    return tags[:max_tags]
-
-
-def _format_hashtags(tags: list[str], per_line: int = 4) -> str:
-    tags = [t for t in (tags or []) if (t or "").strip()]
-    if not tags:
-        return ""
-    per_line = max(3, int(per_line or 4))
-    lines = []
-    for i in range(0, len(tags), per_line):
-        chunk = tags[i:i+per_line]
-        lines.append(" ".join([f"#{t.replace(' ', '')}" for t in chunk]))
-    return "\n".join(lines).strip()
-
-
-def _has_enough_hashtags(body: str) -> bool:
-    # '#단어'가 6개 이상이면 OK로 본다.
-    tags = re.findall(r"#[^\s#]{2,}", body or "")
-    return len(tags) >= 6
-
-def _looks_too_similar_to_source(rewritten: str, source: str) -> bool:
-    """재작성 결과가 원문과 지나치게 유사한지(복붙 위험) 매우 단순하게 검사한다.
-    - 완전한 표절 판정은 아니며, '긴 구간이 그대로 남은' 케이스를 2차 방어하기 위한 휴리스틱.
-    """
-    try:
-        out = re.sub(r"\s+", " ", (rewritten or "")).strip()
-        src = re.sub(r"\s+", " ", (source or "")).strip()
-        if len(out) < 600 or len(src) < 600:
-            return False
-
-        # 해시태그 섹션은 비교에서 제외
-        if "[해시태그]" in out:
-            out = out.split("[해시태그]", 1)[0].strip()
-
-        win_len = 45
-        if len(out) <= win_len:
-            return False
-
-        step = max(40, len(out) // 8)
-        hits = 0
-        for pos in range(0, len(out) - win_len, step):
-            w = out[pos:pos + win_len]
-            if w and (w in src):
-                hits += 1
-                if hits >= 2:
-                    return True
-        return False
-    except Exception:
-        return False
-
-
-def rewrite_news_full_with_openai(
-    full_text: str,
-    *,
-    orig_title: str,
-    sport_label: str,
-    has_image: bool = False,
-) -> tuple[str, str]:
-    """원문 텍스트를 기반으로 '완전 재작성' 본문을 생성한다. (title, body_text)
-
-    목표(이미지 유무와 관계없이 공통):
-    - 문장/구조/흐름을 새로 쓰는 완전 재작성
-    - 최소 1,200자~2,500자 분량(이미지 없는 글은 더 충분히)
-    - 섹션 구조 + 키워드 자연 삽입 + 하단 해시태그 6~10개
-    """
-    client_oa = get_openai_client()
-    trimmed = (full_text or "").strip()
-    if len(trimmed) > 9000:
-        trimmed = trimmed[:9000]
-
-    # 길이 가이드(이미지 없는 글은 더 길게 유도)
-    min_chars = 1200 if has_image else 1500
-    max_chars = 2500
-
-    # 키 없으면(극히 예외) 최소 폴백: 구조만이라도 잡되, 표절 위험이 있어 운영상 OpenAI 키 설정을 권장
-    if not client_oa:
-        core = simple_summarize(trimmed, max_chars=700)
-        sport_phrase = _seo_phrase_for_sport(sport_label)
-        body_fb = (
-            "[기사 요약]\n"
-            f"{core}\n\n"
-            "[핵심 포인트]\n"
-            "- 핵심 이슈가 부각됐다\n"
-            "- 관련 팀/선수의 선택이 변수로 떠올랐다\n"
-            "- 향후 일정과 성적에 영향이 예상된다\n\n"
-            "[상세 내용 및 배경]\n"
-            "원문에서 언급된 배경을 토대로, 현재 상황이 어떤 맥락에서 등장했는지 정리했다.\n\n"
-            "[현재 상황 분석]\n"
-            f"이번 {sport_phrase} 이슈는 팬 반응과 현장 평가가 엇갈릴 수 있다. 스포츠뉴스 흐름에서 중요한 변수들을 점검할 필요가 있다.\n\n"
-            "[전망 및 의미]\n"
-            "단기적으로는 경기 운영과 로테이션에, 중장기적으로는 스쿼드 구성과 전략에 영향을 줄 수 있다.\n\n"
-            "[해시태그]\n"
-            + _format_hashtags(_extract_hashtags_fallback(core, sport_label, max_tags=8))
-        )
-        title_fb = orig_title or "스포츠 뉴스"
-        return (_safe_url_decode(title_fb), _clean_news_rewrite_text_keep_newlines(body_fb))
-
-    sport_phrase = _seo_phrase_for_sport(sport_label)
-
-    def _make_prompt(strict: bool = False) -> str:
-        strict_line = (
-            "- 특히 원문 문장을 10어절 이상 연속으로 그대로 쓰면 안 된다(표절 위험).\n"
-            if strict else
-            "- 원문 문장을 길게 그대로 복사하지 말 것(문단 단위 복사 금지).\n"
-        )
-        return (
-            "아래는 스포츠 뉴스 기사 원문이다. 원문을 그대로 베끼지 말고, 의미만 참고해서 문장/표현/구성/흐름을 "
-            "전부 새로 만들어 '완전 재작성' 기사로 써줘.\n\n"
-            "필수 요구사항:\n"
-            "- 한국어로 작성\n"
-            f"- 길이: 공백 포함 약 {min_chars}~{max_chars}자(너무 짧게 끝내지 말 것)\n"
-            "- 아래 섹션 제목을 **그대로 사용**하고, 각 섹션은 충분한 분량으로 작성\n"
-            "- 키워드는 본문 문맥 속에서 자연스럽게 1~2회씩 포함: '스포츠뉴스', '" + sport_phrase + "', '스포츠분석'\n"
-            "- 원문에 나온 선수/팀/리그/감독 등 고유명사를 적절히 활용(단, 사실을 새로 만들지 말 것)\n"
-            "- 과장/추측 최소화(원문에 근거해 서술)\n"
-            + strict_line +
-            "\n"
-            "권장 구조(형식 가이드):\n"
-            "[기사 요약]\n"
-            "- 핵심을 2~3문단으로 자연스럽게 풀어 설명\n\n"
-            "[핵심 포인트]\n"
-            "- 3~5개 불릿(각 1문장)\n\n"
-            "[상세 내용 및 배경]\n"
-            "- 배경/맥락/과거 흐름/리그·팀 상황 등을 충분히\n\n"
-            "[현재 상황 분석]\n"
-            "- 현재 시점 의미, 변수, 반응 등을 분석적으로\n\n"
-            "[전망 및 의미]\n"
-            "- 향후 전개 가능성, 팀/리그에 미칠 영향\n\n"
-            "[해시태그]\n"
-            "- 본문 기반 핵심 키워드 6~10개를 해시태그(#)로만 출력\n\n"
-            "반드시 아래 형식으로만 출력:\n"
-            "제목: (새 제목 1개)\n"
-            "본문:\n"
-            "(여기에 본문)\n\n"
-            f"===== 종목 =====\n{sport_label}\n\n"
-            f"===== 기존 제목 =====\n{orig_title}\n\n"
-            f"===== 기사 원문 =====\n{trimmed}\n"
-        )
-
-    last_exc = None
-    for attempt in range(2):
-        prompt = _make_prompt(strict=(attempt == 1))
-        try:
-            resp = client_oa.chat.completions.create(
-                model=os.getenv("OPENAI_MODEL_NEWS_LONG", os.getenv("OPENAI_MODEL_NEWS", "gpt-4.1-mini")),
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "너는 스포츠 전문 기자이자 에디터다. "
-                            "표절 위험이 없도록 완전히 새로운 문장으로 재작성하며, 문단/소제목/불릿/해시태그 구조를 지킨다."
-                        ),
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.65,
-                max_completion_tokens=2100,
-            )
-            out = (resp.choices[0].message.content or "").strip()
-            if not out:
-                raise ValueError("empty response from OpenAI (news_long)")
-
-            new_title = ""
-            body_lines: list[str] = []
-            lines = out.splitlines()
-
-            body_started = False
-            for line in lines:
-                t = line.strip()
-                if t.startswith("제목:") and not new_title:
-                    new_title = t[len("제목:"):].strip(" ：:")
-                    continue
-                if t.startswith("본문:") and not body_started:
-                    body_started = True
-                    rest = t[len("본문:"):].lstrip()
-                    if rest:
-                        body_lines.append(rest)
-                    continue
-                if body_started:
-                    body_lines.append(line)
-
-            body = "\n".join(body_lines).strip() if body_lines else out
-
-            # 제목/본문 후처리(줄바꿈 유지 + URL 인코딩 문자열 방지)
-            new_title = _safe_url_decode(new_title or orig_title or "스포츠 뉴스")
-            body = _clean_news_rewrite_text_keep_newlines(body)
-
-            # 해시태그 보강(없으면 폴백 생성해서 하단에 추가)
-            if not _has_enough_hashtags(body):
-                tags = _extract_hashtags_fallback(body, sport_label, max_tags=9)
-                # 기존 [해시태그] 섹션이 이미 있으면 제거 후 재삽입(중복 방지)
-                body_no_tags = body
-                if "[해시태그]" in body_no_tags:
-                    body_no_tags = body_no_tags.split("[해시태그]", 1)[0].rstrip()
-                body = body_no_tags.rstrip() + "\n\n[해시태그]\n" + _format_hashtags(tags, per_line=4)
-
-            # 품질 체크: 길이 / 섹션 / 불릿
-            need_sections = all(sec in body for sec in ["[기사 요약]", "[핵심 포인트]", "[상세 내용 및 배경]", "[현재 상황 분석]", "[전망 및 의미]"])
-            bullet_cnt = len([ln for ln in body.splitlines() if ln.strip().startswith("-")])
-            if _looks_too_similar_to_source(body, trimmed):
-                continue
-
-            if (len(body) >= min_chars) and need_sections and (bullet_cnt >= 3):
-                return new_title, body
-
-        except Exception as e:
-            last_exc = e
-            continue
-
-    # 최종 폴백(여기까지 오면 OpenAI가 계속 실패한 케이스)
-    print(f"[OPENAI][NEWS_LONG] 재작성 실패(2회) → 폴백: {last_exc}")
-    core = simple_summarize(trimmed, max_chars=900)
-    body_fb = (
-        "[기사 요약]\n"
-        f"{core}\n\n"
-        "[핵심 포인트]\n"
-        "- 주요 이슈가 확인됐다\n"
-        "- 핵심 인물/팀의 선택이 관전 포인트다\n"
-        "- 일정/전력 변수에 따라 흐름이 달라질 수 있다\n\n"
-        "[상세 내용 및 배경]\n"
-        "원문에서 언급된 배경과 맥락을 바탕으로 사건의 흐름을 재구성했다.\n\n"
-        "[현재 상황 분석]\n"
-        f"이번 이슈는 {sport_phrase} 관점에서 해석 포인트가 있다. 스포츠뉴스 흐름 속에서 변수와 반응을 함께 봐야 한다.\n\n"
-        "[전망 및 의미]\n"
-        "향후 결과는 성적, 전력 구성, 여론에 영향을 줄 수 있다.\n\n"
-        "[해시태그]\n"
-        + _format_hashtags(_extract_hashtags_fallback(core, sport_label, max_tags=8))
-    )
-    return (_safe_url_decode(orig_title or "스포츠 뉴스"), _clean_news_rewrite_text_keep_newlines(body_fb))
-
-
-def _make_cafe_center_html(text_body: str, raw_prefix_html: str = "") -> tuple[str, str]:
-    """카페 업로드용 HTML 생성.
-
-    - 기존 방식(줄바꿈 유지 + 깨짐 방지)을 그대로 사용하되,
-    - raw_prefix_html(예: 이미지 태그 블록)을 <center> 내부 최상단에 "그대로" 삽입할 수 있게 확장.
-      (text_body는 안전하게 escape 처리)
-    """
-    content_norm = (text_body or "").strip()
-
-    # normalize newlines + strip simple html if any
-    content_norm = content_norm.replace("\r\n", "\n").replace("\r", "\n")
-    content_norm = re.sub(r"<br\s*/?>", "\n", content_norm, flags=re.I)
-    content_norm = re.sub(r"</(p|div|li)>", "\n", content_norm, flags=re.I)
-    content_norm = re.sub(r"<[^>]+>", "", content_norm)
-    content_norm = content_norm.replace("&nbsp;", " ").strip()
-
-    safe = html.escape(content_norm)
-    lines = safe.split("\n") if safe else [""]
-    html_lines = [(ln if ln.strip() else "&nbsp;") for ln in lines]
-
-    prefix = (raw_prefix_html or "").strip()
-    if prefix:
-        # prefix가 이미 <br>로 끝나지 않으면 한 줄 띄우기
-        if not re.search(r"<br\s*/?>\s*$", prefix, flags=re.I):
-            prefix += "<br>"
-
-    content_html = "<center>" + prefix + "<br>".join(html_lines) + "</center>"
-    return content_html, content_norm
-
-
-def _queue_update_status(ws_q, row_num: int, status: str, posted_at: str = "", error: str = "") -> None:
-    """news_cafe_queue의 해당 행 상태 업데이트."""
-    try:
-        ws_q.update(range_name=f"E{row_num}:G{row_num}", values=[[status, posted_at, error]], value_input_option="RAW")
-        return
-    except Exception:
-        pass
-
-    # 헤더가 변경된 케이스 대비(느리지만 안전)
-    try:
-        header = ws_q.row_values(1)
-        def _idx(name: str, fallback: int) -> int:
-            try:
-                return header.index(name) + 1  # 1-based
-            except ValueError:
-                return fallback
-        c_status = _idx("status", 5)
-        c_posted = _idx("postedAt", 6)
-        c_error = _idx("error", 7)
-        ws_q.update_cell(row_num, c_status, status)
-        ws_q.update_cell(row_num, c_posted, posted_at)
-        ws_q.update_cell(row_num, c_error, error)
-    except Exception as e:
-        print(f"[GSHEET] queue status update error row={row_num}: {e}")
-
-
-async def cafe_news_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/cafe_news_upload [N|latest|all] : news_cafe_queue의 NEW 항목을 뉴스 전용 계정으로 menuId=31에 업로드.
-
-    추가 기능:
-    - 주제 중복 필터(제목 유사도 → 본문 첫부분 해시)
-    - 대표 이미지가 있을 경우 본문 최상단에 1장 삽입 + 가운데 정렬(#0 플레이스홀더)
-    """
-    if not is_admin(update):
-        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
-        return
-
-    if not _naver_news_have_config():
-        await update.message.reply_text(
-            "뉴스용 네이버 토큰 설정이 없습니다.\n"
-            "환경변수: NAVER_NEWS_CLIENT_ID / NAVER_NEWS_CLIENT_SECRET / NAVER_NEWS_REFRESH_TOKEN / NAVER_CAFE_CLUBID 를 확인해주세요."
-        )
-        return
-
-    ws_q = get_news_cafe_queue_ws()
-    if not ws_q:
-        await update.message.reply_text("news_cafe_queue 시트를 열지 못했습니다.")
-        return
-
-    try:
-        vals = ws_q.get_all_values()
-    except Exception as e:
-        await update.message.reply_text(f"news_cafe_queue 읽기 오류: {e}")
-        return
-
-    if not vals or len(vals) <= 1:
-        await update.message.reply_text("news_cafe_queue에 업로드할 데이터가 없습니다.")
-        return
-
-    header = vals[0]
-
-    def _hidx(name: str, fallback: int) -> int:
-        try:
-            return header.index(name)
-        except ValueError:
-            return fallback
-
-    idx_created = _hidx("createdAt", 0)
-    idx_sport = _hidx("sport", 1)
-    idx_title = _hidx("title", 2)
-    idx_url = _hidx("url", 3)
-    idx_status = _hidx("status", 4)
-    idx_error = _hidx("error", 6)
-
-    # ── args 파싱
-    n = 5
-    mode_all = False
-    if context.args:
-        arg = (context.args[0] or "").strip().lower()
-        if arg == "latest":
-            n = 1
-        elif arg == "all":
-            mode_all = True
+        if ok2:
+            await update.message.reply_text(f"📌 사이트용 export({export_sheet_name}) {len(site_rows_to_append)}건 저장 완료 ✅")
         else:
-            try:
-                n = int(arg)
-                if n <= 0:
-                    n = 5
-            except Exception:
-                n = 5
+            await update.message.reply_text(f"📌 사이트용 export({export_sheet_name}) 저장 실패 ❌")
 
-    # ── 유틸: queue error만 갱신(상태는 변경하지 않음)
-    def _queue_append_error_only(row_num: int, reason: str, current_error: str = "") -> None:
-        try:
-            old = (current_error or "").strip()
-            if reason and (reason in old):
-                return
-            new_err = reason if not old else (old + " | " + reason)
-            ws_q.update_cell(row_num, idx_error + 1, new_err)
-        except Exception as e:
-            print(f"[GSHEET] queue error update fail row={row_num}: {e}")
-
-    # ── 1차: 제목 유사도 기반 주제 중복 필터
-    STOPWORDS = {
-        "단독", "속보", "공식", "입장", "전망", "인터뷰", "전했다", "밝혔다", "밝혔다고", "말했다", "말한",
-        "알렸다", "발표", "확정", "오피셜", "논란", "충격", "반전", "단신", "기자",
-        # 자주 붙는 군더더기
-        "오늘", "어제", "내일", "이번", "최근", "최신", "현지", "보도", "소식", "이슈",
-    }
-
-    def _norm_title_for_dedup(t: str) -> str:
-        s = _safe_url_decode(t or "")
-        s = s.strip()
-        if not s:
-            return ""
-        # 괄호/대괄호/따옴표 내용 포함 통째로 제거(잡음 제거)
-        s = re.sub(r"\([^)]*\)", " ", s)
-        s = re.sub(r"\[[^\]]*\]", " ", s)
-        s = re.sub(r"[\"'“”‘’]", " ", s)
-
-        # 날짜/숫자 제거
-        s = re.sub(r"\d{1,4}[./-]\d{1,2}[./-]\d{1,2}", " ", s)  # 2026.01.28 등
-        s = re.sub(r"\d+", " ", s)
-
-        # 특수문자 제거(한글/영문/공백만 남김)
-        s = re.sub(r"[^0-9A-Za-z가-힣\s]", " ", s)
-
-        # 다중 공백 정리
-        s = re.sub(r"\s+", " ", s).strip()
-        return s
-
-    def _title_tokens(t: str) -> list[str]:
-        s = _norm_title_for_dedup(t)
-        if not s:
-            return []
-        toks = []
-        for w in s.split():
-            if w in STOPWORDS:
-                continue
-            # 너무 짧은 토큰은 잡음으로 처리
-            if len(w) <= 1:
-                continue
-            toks.append(w)
-        return toks
-
-    def _title_similarity(a: dict, b: dict) -> float:
-        """difflib + Jaccard 중 큰 값을 사용."""
-        ta = a.get("_toks") or []
-        tb = b.get("_toks") or []
-        sa = " ".join(ta)
-        sb = " ".join(tb)
-        if not sa or not sb:
-            return 0.0
-
-        try:
-            import difflib
-            seq = difflib.SequenceMatcher(None, sa, sb).ratio()
-        except Exception:
-            seq = 0.0
-
-        set_a = set(ta)
-        set_b = set(tb)
-        inter = len(set_a & set_b)
-        uni = len(set_a | set_b)
-        jac = (inter / uni) if uni else 0.0
-
-        return max(seq, jac)
-
-    title_thr = float(os.getenv("NEWS_DUP_TITLE_SIM_THRESHOLD", "0.8"))
-
-    # ── NEW 로드(이미 DUP 표시된 건은 아예 처리 대상에서 제외)
-    items = []
-    total_new = 0
-    for i, row in enumerate(vals[1:], start=2):  # row number in sheet
-        st = (row[idx_status] if len(row) > idx_status else "").strip().upper()
-        if st != "NEW":
-            continue
-        total_new += 1
-
-        url = _normalize_news_url(row[idx_url] if len(row) > idx_url else "")
-        if not url:
-            continue
-
-        created_at = (row[idx_created] if len(row) > idx_created else "").strip()
-        sport = (row[idx_sport] if len(row) > idx_sport else "").strip()
-        title_raw = (row[idx_title] if len(row) > idx_title else "").strip()
-        title = _safe_url_decode(title_raw)
-        err = (row[idx_error] if len(row) > idx_error else "").strip()
-
-        # 이미 중복(SKIP)로 표시한 항목은 재처리하지 않음(상태는 NEW 유지)
-        if err.startswith("DUP_TOPIC_TITLE") or err.startswith("DUP_TOPIC_BODY"):
-            continue
-
-        items.append(
-            {
-                "row": i,
-                "createdAt": created_at,
-                "sport": sport,
-                "title": title,
-                "url": url,
-                "error": err,
-            }
-        )
-
-    if not items:
-        await update.message.reply_text("news_cafe_queue에 처리 가능한 status=NEW 항목이 없습니다.")
-        return
-
-    def _parse_iso(s: str) -> datetime:
-        try:
-            return datetime.fromisoformat(s)
-        except Exception:
-            return datetime(1970, 1, 1, tzinfo=KST)
-
-    # 최신 우선
-    items.sort(key=lambda x: (_parse_iso(x["createdAt"]), x["row"]), reverse=True)
-
-    # 제목 토큰 준비 + 제목 기반 중복 제거
-    kept = []
-    dup_by_title = []
-    for it in items:
-        it["_toks"] = _title_tokens(it["title"])
-        is_dup = False
-        for k in kept:
-            # 종목이 다르면 비교하지 않음(오탐 방지)
-            if (k.get("sport") or "").strip() != (it.get("sport") or "").strip():
-                continue
-            if _title_similarity(it, k) >= title_thr:
-                is_dup = True
-                dup_by_title.append(it)
-                break
-        if not is_dup:
-            kept.append(it)
-
-    # ── 로그 워크시트(선택)
-    ws_log = get_news_cafe_log_ws()
-    posted_urls = _load_news_cafe_posted_urls(ws_log) if ws_log else set()
-
-    ok_cnt = 0
-    fail_cnt = 0
-    skip_cnt = 0
-
-    # ── 제목 중복은 업로드 SKIP + error/log 기록(상태는 그대로 NEW)
-    if dup_by_title:
-        now_iso = now_kst().isoformat()
-        for dup in dup_by_title:
-            _queue_append_error_only(dup["row"], "DUP_TOPIC_TITLE", dup.get("error", ""))
-            skip_cnt += 1
-            if ws_log:
-                try:
-                    ws_log.append_row([dup["url"], dup["title"], now_iso, "SKIP", "DUP_TOPIC_TITLE"], value_input_option="RAW")
-                except Exception:
-                    pass
-
-    # 처리 대상(중복 제거 후)
-    candidates = kept if mode_all else kept[:n]
-
-    await update.message.reply_text(
-        f"뉴스 카페 업로드 시작: NEW {total_new}건(중복필터 후 {len(kept)}건) 중 {len(candidates)}건 처리합니다. "
-        f"(menuId={NAVER_CAFE_NEWS_MENU_ID})"
-    )
-
-    # ── 2차: 본문 첫부분 해시 기반 중복(동일 이슈/동일 기사) 필터
-    body_hash_len = int(os.getenv("NEWS_DUP_BODY_HASH_CHARS", "550"))
-    seen_body_hash = set()
-
-    def _body_hash(text: str) -> str:
-        t = (text or "").strip()
-        if not t:
-            return ""
-        snip = t[: max(400, min(body_hash_len, 650))]  # 400~650 사이로 제한
-        snip = snip.lower()
-        snip = re.sub(r"\s+", " ", snip).strip()
-        snip = re.sub(r"\d+", " ", snip)
-        snip = re.sub(r"[^0-9A-Za-z가-힣\s]", " ", snip)
-        snip = re.sub(r"\s+", " ", snip).strip()
-        try:
-            import hashlib
-            return hashlib.sha1(snip.encode("utf-8", "ignore")).hexdigest()
-        except Exception:
-            return ""
-
-    # 이미지 삽입(가운데 정렬)용 prefix: 첫 번째 이미지(#0)를 본문 최상단에 넣는다.
-    def _image_prefix_html() -> str:
-        # style/따옴표를 최소화해 403/999(필터/일시제한) 가능성을 낮춘다.
-        # (필요하면 html을 아예 넣지 않고, 첨부 이미지가 상단에 자동 노출되는 방식만 사용해도 됨)
-        return "<img src=#0 style=display:block;margin-left:auto;margin-right:auto;max-width:100%;height:auto><br>"
-
-
-    for it in candidates:
-        row_num = it["row"]
-        url = it["url"]
-        orig_title = it["title"]
-        sport = it["sport"]
-
-        # (안전) 이미 로그에 OK로 남아있으면 중복 업로드 방지
-        if url in posted_urls:
-            posted_at = now_kst().isoformat()
-            _queue_update_status(ws_q, row_num, "POSTED", posted_at, "")
-            skip_cnt += 1
-            continue
-
-        try:
-            # 1) 원문 다시 가져오기 + 대표 이미지 추출
-            text_body, img_url = fetch_daum_article_text_and_image(url, orig_title=orig_title)
-            if not text_body:
-                raise ValueError("EMPTY_BODY")
-
-            # 2) 본문 해시 기반 중복 필터(1차 통과 항목들 사이에서만)
-            h = _body_hash(text_body)
-            if h and (h in seen_body_hash):
-                _queue_append_error_only(row_num, "DUP_TOPIC_BODY", it.get("error", ""))
-                skip_cnt += 1
-                if ws_log:
-                    try:
-                        ws_log.append_row([url, orig_title, now_kst().isoformat(), "SKIP", "DUP_TOPIC_BODY"], value_input_option="RAW")
-                    except Exception:
-                        pass
-                continue
-            if h:
-                seen_body_hash.add(h)
-
-            # 3) 완전 재작성
-            new_title, rewritten = rewrite_news_full_with_openai(
-                text_body,
-                orig_title=orig_title or "스포츠 뉴스",
-                sport_label=sport or "",
-                has_image=bool(img_url),
-            )
-
-            # 4) 카페 업로드용 HTML(기존 방식 유지)
-            content_html, content_plain = _make_cafe_center_html(rewritten)
-
-            # 5) 이미지 다운로드(가능하면 multipart 업로드) - 실패해도 글은 업로드
-            img_bytes, img_name, img_mime = _download_image_bytes(img_url, referer=url)
-
-            posted_at = now_kst().isoformat()
-            clubid = NAVER_CAFE_CLUBID
-            menuid = NAVER_CAFE_NEWS_MENU_ID  # ✅ 고정 31
-
-            success = False
-            info = ""
-
-            # 5-1) 이미지가 있으면: multipart로 여러 변형을 시도 (실패해도 글 업로드는 계속)
-            if img_bytes:
-                # 1) 가장 보수적인 본문(이미지 태그 없음)으로 multipart 시도
-                success, info = _naver_news_cafe_post_multipart(
-                    new_title,
-                    content_html,
-                    clubid,
-                    menuid,
-                    image_bytes=img_bytes,
-                    filename=img_name or "image.jpg",
-                    mime_type=img_mime or "image/jpeg",
-                )
-
-                # 2) 그래도 실패하면 plain 텍스트로 한 번 더 (필터 회피 목적)
-                if not success:
-                    print(f"[NEWS_IMAGE] multipart(본문 그대로) 실패 → plain 본문으로 1회 더: {info}")
-                    success, info = _naver_news_cafe_post_multipart(
-                        new_title,
-                        content_plain,
-                        clubid,
-                        menuid,
-                        image_bytes=img_bytes,
-                        filename=img_name or "image.jpg",
-                        mime_type=img_mime or "image/jpeg",
-                    )
-
-                # 3) (옵션) inline(#0) 태그 버전도 1회 더 시도
-                if not success:
-                    print(f"[NEWS_IMAGE] multipart(plain)도 실패 → inline(#0)로 1회 더: {info}")
-                    content_html_img, _ = _make_cafe_center_html(rewritten, raw_prefix_html=_image_prefix_html())
-                    success, info = _naver_news_cafe_post_multipart(
-                        new_title,
-                        content_html_img,
-                        clubid,
-                        menuid,
-                        image_bytes=img_bytes,
-                        filename=img_name or "image.jpg",
-                        mime_type=img_mime or "image/jpeg",
-                    )
-
-                if not success:
-                    print(f"[NEWS_IMAGE] 업로드 실패 → 이미지 없이 재시도: {info}")
-
-# 5-2) 이미지 업로드 실패/이미지 없음 → 글만 업로드
-            if not success:
-                success, info = _naver_news_cafe_post(new_title, content_html, clubid, menuid)
-
-                # HTML에서 999 등이 뜨면 plain 텍스트로 재시도
-                if (not success) and ("999" in (info or "")):
-                    success, info = _naver_news_cafe_post(new_title, content_plain, clubid, menuid)
-
-            if success:
-                _queue_update_status(ws_q, row_num, "POSTED", posted_at, "")
-                ok_cnt += 1
-
-                if ws_log:
-                    try:
-                        ws_log.append_row([url, new_title, posted_at, "OK", ""], value_input_option="RAW")
-                    except Exception:
-                        pass
-                posted_urls.add(url)
-
-            else:
-                err = _safe_truncate(info, 300)
-                _queue_update_status(ws_q, row_num, "FAIL", "", err)
-                fail_cnt += 1
-
-                if ws_log:
-                    try:
-                        ws_log.append_row([url, orig_title, "", "FAIL", err], value_input_option="RAW")
-                    except Exception:
-                        pass
-
-                # rate limit이면 잠깐 쉬었다가 계속
-                if _news_is_rate_limited(info):
-                    await asyncio.sleep(2.0)
-
-            # 요청 간 약간의 텀(과도한 호출 방지)
-            await asyncio.sleep(float(os.getenv("CAFE_NEWS_UPLOAD_DELAY_SEC", "7")))
-
-        except Exception as e:
-            err = _safe_truncate(f"EXC:{e}", 300)
-            _queue_update_status(ws_q, row_num, "FAIL", "", err)
-            fail_cnt += 1
-
-            if ws_log:
-                try:
-                    ws_log.append_row([url, orig_title, "", "FAIL", err], value_input_option="RAW")
-                except Exception:
-                    pass
-
-            await asyncio.sleep(0.5)
-
-    await update.message.reply_text(f"뉴스 카페 업로드 완료: OK {ok_cnt} / FAIL {fail_cnt} / SKIP {skip_cnt}")
-
-
-
-
-# telegram: ignore 'Message is not modified' when editing inline keyboards
-async def _safe_edit_message_reply_markup(q, *args, **kwargs):
-    if not q:
-        return
-    try:
-        await q.edit_message_reply_markup(*args, **kwargs)
-    except BadRequest as e:
-        # Happens when a user taps a button that would not change the keyboard
-        if "Message is not modified" in str(e):
-            return
-        raise
-
-# 4) 인라인 버튼 콜백 처리 (분석/뉴스 팝업)
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if q:
-        # callback query는 생성 후 짧은 시간 내에 answer 해야 오류가 안 난다.
-        try:
-            await q.answer()
-        except BadRequest as e:
-            if "Query is too old" in str(e) or "query id is invalid" in str(e):
-                pass
-            else:
-                raise
-    data = q.data or ""
-    # 아무 동작 안 하는 더미
-    if data == "noop":
-        return
-
-    # 메인 메뉴로
-    if data == "back_main":
-        await _safe_edit_message_reply_markup(q, reply_markup=build_main_inline_menu())
-        return
-
-    # 축구 하위 카테고리 (해외축구 / K리그 / J리그)
-    if data.startswith("soccer_cat:"):
-        _, key, subsport = data.split(":", 2)
-        # subsport: "해외축구", "K리그", "J리그"
-        await _safe_edit_message_reply_markup(q, 
-            reply_markup=build_analysis_match_menu(key, subsport, page=1)
-        )
-        return
-
-    # 야구 하위 카테고리 (해외야구 / KBO / NPB)
-    if data.startswith("baseball_cat:"):
-        _, key, subsport = data.split(":", 2)
-        # subsport: "해외야구", "KBO", "NPB"
-        await _safe_edit_message_reply_markup(q, 
-            reply_markup=build_analysis_match_menu(key, subsport, page=1)
-        )
-        return
-
-        # 농구 하위 카테고리 (NBA / KBL)
-    if data.startswith("basket_cat:"):
-        _, key, subsport = data.split(":", 2)
-        # subsport: "NBA", "KBL"
-        await _safe_edit_message_reply_markup(q, 
-            reply_markup=build_analysis_match_menu(key, subsport, page=1)
-        )
-        return
-
-    # 배구 하위 카테고리 (V리그)
-    if data.startswith("volley_cat:"):
-        _, key, subsport = data.split(":", 2)  # subsport == "V리그"
-        await _safe_edit_message_reply_markup(q, 
-            reply_markup=build_analysis_match_menu(key, subsport, page=1)
-        )
-        return
-  
-    # 종목 선택으로 돌아가기
-    if data.startswith("analysis_root:"):
-        _, key = data.split(":", 1)
-        await _safe_edit_message_reply_markup(q, reply_markup=build_analysis_category_menu(key))
-        return
-
-    # 종목 선택 (축구/농구/야구/배구)
-    if data.startswith("analysis_cat:"):
-        _, key, sport = data.split(":", 2)
-
-        # ⚽ 축구 → 해외축구 / K리그 / J리그 하위 메뉴
-        if sport == "축구":
-            await _safe_edit_message_reply_markup(q, 
-                reply_markup=build_soccer_subcategory_menu(key)
-            )
-            return
-
-        # ⚾ 야구 → 해외야구 / KBO / NPB 하위 메뉴
-        if sport == "야구":
-            await _safe_edit_message_reply_markup(q, 
-                reply_markup=build_baseball_subcategory_menu(key)
-            )
-            return
-
-        # 🏀 농구 → NBA / KBL 하위 메뉴
-        if sport == "농구":
-            await _safe_edit_message_reply_markup(q, 
-                reply_markup=build_basketball_subcategory_menu(key)
-            )
-            return
-
-        # 🏐 배구 → V리그 하위 메뉴
-        if sport == "배구":
-            await _safe_edit_message_reply_markup(q, 
-                reply_markup=build_volleyball_subcategory_menu(key)
-            )
-            return        
-
-        # 그 외 종목(배구 등)은 바로 경기 리스트 1페이지
-        await _safe_edit_message_reply_markup(q, 
-            reply_markup=build_analysis_match_menu(key, sport, page=1)
-        )
-        return
-        
-    # 경기 리스트 페이지 이동 (이전/다음)
-    if data.startswith("match_page:"):
-        _, key, sport, page_str = data.split(":", 3)
-        try:
-            page = int(page_str)
-        except ValueError:
-            page = 1
-
-        await _safe_edit_message_reply_markup(q, 
-            reply_markup=build_analysis_match_menu(key, sport, page=page)
-        )
-        return
-
-    # 개별 경기 선택
-    if data.startswith("match:"):
-        _, key, sport, match_id = data.split(":", 3)
-        items = ANALYSIS_DATA_MAP.get(key, {}).get(sport, [])
-
-        title = "선택한 경기"
-        summary = "해당 경기 분석을 찾을 수 없습니다."
-
-        for item in items:
-            if item["id"] == match_id:
-                title = item["title"]
-                summary = item["summary"]
-                break
-
-        text = f"📌 경기 분석 – {title}\n\n{summary}"
-
-        buttons = [
-            [InlineKeyboardButton("📺 스포츠 무료 중계", url="https://goat-tv.com")],
-            [InlineKeyboardButton("📝 분석글 더 보기", callback_data=f"analysis_root:{key}")],
-            [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
-        ]
-
-        await q.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-        return
-
-    # 뉴스 루트
-    if data == "news_root":
-        await _safe_edit_message_reply_markup(q, reply_markup=build_news_category_menu())
-        return
-
-    # 뉴스 종목 선택
-    if data.startswith("news_cat:"):
-        sport = data.split(":", 1)[1]
-        await _safe_edit_message_reply_markup(q, reply_markup=build_news_list_menu(sport))
-        return
-
-    # 뉴스 아이템 선택
-    if data.startswith("news_item:"):
-        try:
-            _, sport, news_id = data.split(":", 2)
-            items = NEWS_DATA.get(sport, [])
-            title = "뉴스 정보 없음"
-            summary = "해당 뉴스 정보를 찾을 수 없습니다."
-
-            for item in items:
-                if item["id"] == news_id:
-                    title = item["title"]
-                    summary = item["summary"]
-                    break
-        except Exception:
-            title = "뉴스 정보 없음"
-            summary = "해당 뉴스 정보를 찾을 수 없습니다."
-
-        text = f"📰 뉴스 요약 – {title}\n\n{summary}"
-
-        buttons = [
-            [InlineKeyboardButton("📺 스포츠무료중계", url="https://goat-tv.com")],
-            [InlineKeyboardButton("📰 다른 뉴스 보기", callback_data="news_root")],
-            [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
-        ]
-
-        await q.message.reply_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
-        return
 
 async def crawlmazsoccer_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 1) 해외축구
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv1.com/analyze/overseas",
+        base_url=f"{MAZ_BASE_URL}/analyze/overseas",
         sport_label="축구",
         league_default="해외축구",
         day_key="tomorrow",
@@ -7170,7 +5968,7 @@ async def crawlmazsoccer_tomorrow(update: Update, context: ContextTypes.DEFAULT_
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv1.com/analyze/asia",
+        base_url=f"{MAZ_BASE_URL}/analyze/asia",
         sport_label="축구",
         league_default="K리그/J리그",
         day_key="tomorrow",
@@ -7193,7 +5991,7 @@ async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAUL
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv1.com/analyze/mlb",
+        base_url=f"{MAZ_BASE_URL}/analyze/mlb",
         sport_label="야구",
         league_default="해외야구",
         day_key="tomorrow",
@@ -7207,7 +6005,7 @@ async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAUL
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv1.com/analyze/baseball",
+        base_url=f"{MAZ_BASE_URL}/analyze/baseball",
         sport_label="야구",
         league_default="KBO/NPB",
         day_key="tomorrow",
@@ -7234,7 +6032,7 @@ async def bvcrawl_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv1.com/analyze/nba",
+        base_url=f"{MAZ_BASE_URL}/analyze/nba",
         sport_label="농구",          # 시트에는 NBA/KBL/WKBL 등으로 나뉨
         league_default="NBA",
         day_key="tomorrow",
@@ -7249,7 +6047,7 @@ async def bvcrawl_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv1.com/analyze/volleyball",
+        base_url=f"{MAZ_BASE_URL}/analyze/volleyball",
         sport_label="농구/배구",     # 분류 함수에서 KBL/WKBL/V리그/배구 등으로 세분화
         league_default="국내농구/배구",
         day_key="tomorrow",
@@ -7274,7 +6072,7 @@ async def crawlmazsoccer_today(update: Update, context: ContextTypes.DEFAULT_TYP
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv1.com/analyze/overseas",
+        base_url=f"{MAZ_BASE_URL}/analyze/overseas",
         sport_label="축구",          # 안에서 '해외축구/K리그/J리그'로 다시 분류됨
         league_default="해외축구",
         day_key="today",            # ✅ today
@@ -7288,7 +6086,7 @@ async def crawlmazsoccer_today(update: Update, context: ContextTypes.DEFAULT_TYP
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv1.com/analyze/asia",
+        base_url=f"{MAZ_BASE_URL}/analyze/asia",
         sport_label="축구",
         league_default="K리그/J리그",
         day_key="today",            # ✅ today
@@ -7312,7 +6110,7 @@ async def crawlmazbaseball_today(update: Update, context: ContextTypes.DEFAULT_T
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv1.com/analyze/mlb",
+        base_url=f"{MAZ_BASE_URL}/analyze/mlb",
         sport_label="야구",          # 시트에서는 해외야구/KBO/NPB로 분리됨
         league_default="해외야구",
         day_key="today",            # 🔴 오늘
@@ -7326,7 +6124,7 @@ async def crawlmazbaseball_today(update: Update, context: ContextTypes.DEFAULT_T
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv1.com/analyze/baseball",
+        base_url=f"{MAZ_BASE_URL}/analyze/baseball",
         sport_label="야구",
         league_default="KBO/NPB",
         day_key="today",            # 🔴 오늘
@@ -7354,7 +6152,7 @@ async def bvcrawl_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv1.com/analyze/nba",
+        base_url=f"{MAZ_BASE_URL}/analyze/nba",
         sport_label="농구",
         league_default="NBA",
         day_key="today",             # ✅ 오늘
@@ -7368,7 +6166,7 @@ async def bvcrawl_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await crawl_maz_analysis_common(
         update,
         context,
-        base_url="https://mazgtv1.com/analyze/volleyball",
+        base_url=f"{MAZ_BASE_URL}/analyze/volleyball",
         sport_label="농구/배구",
         league_default="국내농구/배구",
         day_key="today",             # ✅ 오늘
@@ -7449,81 +6247,99 @@ async def export_rollover(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
-async def export_comment_fill(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """기존 export 시트(내일/오늘)에 이미 저장된 경기들에 대해 H열(comments)을 채운다.
+# ───────────────── export 시트 H열(comments) 채우기 ─────────────────
 
-사용:
-- /export_comment_fill                -> 기본: export_tomorrow, 빈 H열 최대 30건 채움
-- /export_comment_fill today          -> export_today
-- /export_comment_fill all            -> export_today + export_tomorrow
-- /export_comment_fill tomorrow 50    -> tomorrow에서 최대 50건
-- /export_comment_fill tomorrow 50 force -> 기존 값이 있어도 덮어쓰기
+async def export_comment_fill(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """export_today / export_tomorrow 시트의 H열(comments)을 채운다.
+
+    기본 동작:
+    - export_tomorrow에서 comments가 비어있는 '최신' 행부터 최대 30개를 채움
+
+    사용 예:
+    - /export_comment_fill
+    - /export_comment_fill today 30
+    - /export_comment_fill all 50 force
     """
     if not is_admin(update):
         await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
         return
 
-    # 기본값
-    target = "tomorrow"
+    args = [str(a).strip() for a in (context.args or []) if str(a).strip()]
+    mode = (args[0].lower() if args else "tomorrow")
     limit = 30
     force = False
 
-    raw_args = list(context.args or [])
-    if raw_args:
-        target = str(raw_args[0] or "").strip().lower() or target
-    if len(raw_args) >= 2 and str(raw_args[1]).strip().isdigit():
-        limit = int(str(raw_args[1]).strip())
-    if any(str(a).strip().lower() in ("force", "overwrite", "1") for a in raw_args[2:]):
-        force = True
+    for a in args[1:]:
+        al = a.lower()
+        if al.isdigit():
+            try:
+                limit = int(al)
+            except Exception:
+                pass
+        elif al in ("force", "overwrite", "덮어쓰기", "덮", "f"):
+            force = True
 
-    limit = max(1, min(200, limit))
+    if limit < 1:
+        limit = 1
+    if limit > 200:
+        limit = 200
 
-    sheet_names: list[str] = []
-    if target in ("today", "export_today"):
-        sheet_names = [EXPORT_TODAY_SHEET_NAME]
-    elif target in ("tomorrow", "export_tomorrow", "tomo"):
-        sheet_names = [EXPORT_TOMORROW_SHEET_NAME]
-    elif target in ("all", "both"):
-        sheet_names = [EXPORT_TODAY_SHEET_NAME, EXPORT_TOMORROW_SHEET_NAME]
+    # 대상 시트 선택
+    targets: list[str] = []
+    if mode in ("today", "t"):
+        targets = [EXPORT_TODAY_SHEET_NAME]
+    elif mode in ("tomorrow", "tm", "to", "내일"):
+        targets = [EXPORT_TOMORROW_SHEET_NAME]
+    elif mode in ("all", "both", "a"):
+        targets = [EXPORT_TODAY_SHEET_NAME, EXPORT_TOMORROW_SHEET_NAME]
     else:
-        # 알 수 없는 값이면 안전하게 tomorrow로
-        sheet_names = [EXPORT_TOMORROW_SHEET_NAME]
+        # 직접 시트명 지정
+        targets = [mode]
 
-    try:
-        n_comments = int(os.getenv("EXPORT_COMMENT_COUNT") or "6")
-    except Exception:
-        n_comments = 6
-    n_comments = max(3, min(10, n_comments))
+    enabled, n_comments, model, temperature = _export_comment_settings()
+    if not enabled:
+        await update.message.reply_text("EXPORT_COMMENT_ENABLED=0 상태라 댓글 생성이 비활성화되어 있습니다.")
+        return
 
     total_filled = 0
-    total_target = 0
-    errs: list[str] = []
 
-    for sheet in sheet_names:
-        ws = get_export_ws(sheet)
+    for sheet_name in targets:
+        ws = get_export_ws(sheet_name)
         if not ws:
-            errs.append(f"{sheet}: 워크시트 준비 실패")
+            await update.message.reply_text(f"시트 준비 실패: {sheet_name}")
             continue
 
-        try:
-            ensure_export_header(ws)
-        except Exception:
-            pass
+        ensure_export_header(ws)
 
         try:
             values = ws.get_all_values()
         except Exception as e:
-            errs.append(f"{sheet}: 읽기 실패({e})")
+            await update.message.reply_text(f"{sheet_name} 읽기 실패: {e}")
             continue
 
         if not values or len(values) <= 1:
+            await update.message.reply_text(f"{sheet_name}: 데이터가 없습니다.")
             continue
 
-        header = [str(c or "").strip() for c in values[0]]
-        # 헤더가 비정상이면 기본 인덱스로 처리
-        def _idx(col: str, default: int) -> int:
+        header = [c.strip() for c in (values[0] or [])]
+        if header[: len(EXPORT_HEADER)] != EXPORT_HEADER:
+            # 헤더 강제 동기화 후 다시 읽기
             try:
-                return header.index(col)
+                ws.update("A1", [EXPORT_HEADER])
+            except Exception:
+                try:
+                    ws.update(values=[EXPORT_HEADER], range_name="A1")
+                except Exception:
+                    pass
+            try:
+                values = ws.get_all_values()
+            except Exception:
+                pass
+            header = [c.strip() for c in ((values[0] if values else []) or [])]
+
+        def _idx(name: str, default: int) -> int:
+            try:
+                return header.index(name)
             except Exception:
                 return default
 
@@ -7532,82 +6348,74 @@ async def export_comment_fill(update: Update, context: ContextTypes.DEFAULT_TYPE
         idx_simple = _idx("simple", 6)
         idx_comments = _idx("comments", 7)
 
-        # 대상 찾기(위에서부터)
-        targets: list[dict] = []   # {"row": row_num, "src_id":..., "title":...}
-        for i, row in enumerate(values[1:], start=2):
+        items: list[dict] = []
+        row_nums: list[int] = []
+
+        # 최신 행부터(아래 → 위) 채우기
+        for r_i in range(len(values) - 1, 0, -1):
+            row = values[r_i] or []
+            row_num = r_i + 1  # 시트는 1-index
+
             sid = (row[idx_src].strip() if len(row) > idx_src else "")
             if not sid:
                 continue
 
-            cur = (row[idx_comments].strip() if len(row) > idx_comments else "")
-            if cur and not force:
+            existing = (row[idx_comments].strip() if len(row) > idx_comments else "")
+            if existing and (not force):
                 continue
 
-            title = (row[idx_title].strip() if len(row) > idx_title else "")
+            title = (row[idx_title] if len(row) > idx_title else "")
+            title = str(title or "").strip()
             if not title:
-                # title이 비면 simple 첫 문장으로 대체
                 s = (row[idx_simple] if len(row) > idx_simple else "")
-                title = (str(s).splitlines()[0].strip() if s else "")
+                title = str(s or "").splitlines()[0].strip() if s else ""
             if not title:
                 continue
 
-            targets.append({"row": i, "src_id": sid, "title": title})
-            if len(targets) >= limit:
+            items.append({"src_id": sid, "title": title})
+            row_nums.append(row_num)
+
+            if len(items) >= limit:
                 break
 
-        if not targets:
+        if not items:
+            await update.message.reply_text(f"{sheet_name}: 채울 대상이 없습니다. (이미 작성됨)")
             continue
 
-        total_target += len(targets)
-
-        # OpenAI 일괄 생성(10개씩)
-        mapping: dict[str, str] = {}
-        for i in range(0, len(targets), 10):
-            chunk = targets[i : i + 10]
-            m = generate_export_comment_blocks_bulk(chunk, n=n_comments) or {}
-            mapping.update(m)
-
-        # 매핑이 비어있으면 개별 폴백
-        if not mapping:
-            for it in targets:
-                mapping[it["src_id"]] = generate_export_comment_block(it["title"], n=n_comments)
-
-        # 시트 업데이트
-        updates = []
-        col_letter = _col_letter(idx_comments + 1)  # 1-indexed
-        for it in targets:
-            sid = it["src_id"]
-            block = (mapping.get(sid) or "").strip()
-            if not block:
-                block = generate_export_comment_block(it["title"], n=n_comments)
-            if not block:
-                continue
-            updates.append({"range": f"{col_letter}{it['row']}", "values": [[block]]})
-
-        if not updates:
-            continue
-
-        try:
-            ws.batch_update(updates, value_input_option="RAW")
-            total_filled += len(updates)
-        except Exception:
-            # batch_update가 안 되면 개별 update로 폴백
-            ok_cnt = 0
-            for u in updates:
-                try:
-                    ws.update(u["range"], u["values"], value_input_option="RAW")
-                    ok_cnt += 1
-                except Exception as e:
-                    errs.append(f"{sheet}: {u['range']} 업데이트 실패({e})")
-            total_filled += ok_cnt
-
-    if errs:
         await update.message.reply_text(
-            f"✅ export 댓글 채우기 완료: {total_filled}/{total_target}건\n"
-            + "\n".join(errs[:8])
+            f"{sheet_name}: 댓글 {n_comments}개씩 {len(items)}건 생성 중...\n"
+            f"(model={model}, temp={temperature}, force={force})"
         )
-    else:
-        await update.message.reply_text(f"✅ export 댓글 채우기 완료: {total_filled}/{total_target}건")
+
+        mapping = generate_export_comments_openai(items, n_comments=n_comments, model=model, temperature=temperature)
+
+        col_letter = _col_letter(idx_comments + 1)
+        updates = []
+        filled = 0
+        for it, rn in zip(items, row_nums):
+            sid = it["src_id"]
+            txt = (mapping.get(sid) or "").strip()
+            if not txt:
+                continue
+            updates.append({"range": f"{col_letter}{rn}", "values": [[txt]]})
+            filled += 1
+
+        if updates:
+            try:
+                ws.batch_update(updates, value_input_option="RAW")
+            except Exception as e:
+                print(f"[GSHEET][EXPORT_COMMENT] batch_update 실패({sheet_name}): {e}")
+                for u in updates:
+                    try:
+                        ws.update(u["range"], u["values"], value_input_option="RAW")
+                    except Exception:
+                        pass
+
+        total_filled += filled
+        await update.message.reply_text(f"{sheet_name}: 완료 ✅ ({filled}/{len(items)}건 작성)")
+
+    await update.message.reply_text(f"전체 완료 ✅ 총 {total_filled}건 comments(H열) 작성")
+
 
 
 # ───────────────── 네이버 카페(웹 API) 게시글 수집 → youtoo 시트 저장 ─────────────────
@@ -8102,66 +6910,66 @@ def main():
 
     app = ApplicationBuilder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("start", wrap_command(start, "start")))
-    app.add_handler(CommandHandler("myid", wrap_command(myid, "myid")))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("myid", myid))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    app.add_handler(CommandHandler("publish", wrap_command(publish, "publish")))
-    app.add_handler(CommandHandler("syncsheet", wrap_command(syncsheet, "syncsheet")))
+    app.add_handler(CommandHandler("publish", publish))
+    app.add_handler(CommandHandler("syncsheet", syncsheet))
     # 뉴스 시트 전체 초기화
-    app.add_handler(CommandHandler("newsclean", wrap_command(newsclean, "newsclean")))
+    app.add_handler(CommandHandler("newsclean", newsclean))
     # today / tomorrow / news 전체 초기화
-    app.add_handler(CommandHandler("allclean", wrap_command(allclean, "allclean")))
+    app.add_handler(CommandHandler("allclean", allclean))
 
     # export_tomorrow → export_today 롤오버
-    app.add_handler(CommandHandler("export_rollover", wrap_command(export_rollover, "export_rollover")))
-    app.add_handler(CommandHandler("export_comment_fill", wrap_command(export_comment_fill, "export_comment_fill")))    
-    app.add_handler(CommandHandler("youtoo", wrap_command(youtoo, "youtoo")))  # 네이버 카페 메뉴 글 수집 → youtoo 시트
+    app.add_handler(CommandHandler("export_rollover", export_rollover))
+    app.add_handler(CommandHandler("export_comment_fill", export_comment_fill))  # export H열(comments) 채우기    
+    app.add_handler(CommandHandler("youtoo", youtoo))  # 네이버 카페 메뉴 글 수집 → youtoo 시트
 
     # 네이버 카페 자동 글쓰기(종목별 게시판)  ※ /cafe_soccer [tomorrow] 처럼 사용
-    app.add_handler(CommandHandler("cafe_soccer", wrap_command(cafe_soccer, "cafe_soccer")))
-    app.add_handler(CommandHandler("cafe_baseball", wrap_command(cafe_baseball, "cafe_baseball")))
-    app.add_handler(CommandHandler("cafe_basketball", wrap_command(cafe_basketball, "cafe_basketball")))
-    app.add_handler(CommandHandler("cafe_volleyball", wrap_command(cafe_volleyball, "cafe_volleyball")))
+    app.add_handler(CommandHandler("cafe_soccer", cafe_soccer))
+    app.add_handler(CommandHandler("cafe_baseball", cafe_baseball))
+    app.add_handler(CommandHandler("cafe_basketball", cafe_basketball))
+    app.add_handler(CommandHandler("cafe_volleyball", cafe_volleyball))
 
     # 네이버 카페 자동 글쓰기(심층 분석 게시판)  ※ /cafe_soccer_deep [tomorrow]
-    app.add_handler(CommandHandler("cafe_soccer_deep", wrap_command(cafe_soccer_deep, "cafe_soccer_deep")))
-    app.add_handler(CommandHandler("cafe_baseball_deep", wrap_command(cafe_baseball_deep, "cafe_baseball_deep")))
-    app.add_handler(CommandHandler("cafe_basketball_deep", wrap_command(cafe_basketball_deep, "cafe_basketball_deep")))
-    app.add_handler(CommandHandler("cafe_volleyball_deep", wrap_command(cafe_volleyball_deep, "cafe_volleyball_deep")))
+    app.add_handler(CommandHandler("cafe_soccer_deep", cafe_soccer_deep))
+    app.add_handler(CommandHandler("cafe_baseball_deep", cafe_baseball_deep))
+    app.add_handler(CommandHandler("cafe_basketball_deep", cafe_basketball_deep))
+    app.add_handler(CommandHandler("cafe_volleyball_deep", cafe_volleyball_deep))
 
     # 뉴스 큐 → 네이버 카페 업로드 (menuId=31, 뉴스용 토큰)
-    app.add_handler(CommandHandler("cafe_news_upload", wrap_command(cafe_news_upload, "cafe_news_upload")))
+    app.add_handler(CommandHandler("cafe_news_upload", cafe_news_upload))
 
     # 네이버 카페 자동 글쓰기    # 분석 시트 부분 초기화 명령어들 (모두 tomorrow 시트 기준)
-    app.add_handler(CommandHandler("soccerclean", wrap_command(soccerclean, "soccerclean")))
-    app.add_handler(CommandHandler("baseballclean", wrap_command(baseballclean, "baseballclean")))
-    app.add_handler(CommandHandler("basketclean", wrap_command(basketclean, "basketclean")))
-    app.add_handler(CommandHandler("volleyclean", wrap_command(volleyclean, "volleyclean")))
-    app.add_handler(CommandHandler("etcclean", wrap_command(etcclean, "etcclean")))
-    app.add_handler(CommandHandler("analysisclean", wrap_command(analysisclean, "analysisclean")))
+    app.add_handler(CommandHandler("soccerclean", soccerclean))
+    app.add_handler(CommandHandler("baseballclean", baseballclean))
+    app.add_handler(CommandHandler("basketclean", basketclean))
+    app.add_handler(CommandHandler("volleyclean", volleyclean))
+    app.add_handler(CommandHandler("etcclean", etcclean))
+    app.add_handler(CommandHandler("analysisclean", analysisclean))
 
-    app.add_handler(CommandHandler("rollover", wrap_command(rollover, "rollover")))
+    app.add_handler(CommandHandler("rollover", rollover))
 
     # 뉴스 크롤링 명령어들 (Daum)
-    app.add_handler(CommandHandler("crawlsoccer", wrap_command(crawlsoccer, "crawlsoccer")))             # 해외축구
-    app.add_handler(CommandHandler("crawlsoccerkr", wrap_command(crawlsoccerkr, "crawlsoccerkr")))         # 국내축구
-    app.add_handler(CommandHandler("crawlbaseball", wrap_command(crawlbaseball, "crawlbaseball")))         # KBO
-    app.add_handler(CommandHandler("crawloverbaseball", wrap_command(crawloverbaseball, "crawloverbaseball"))) # 해외야구
-    app.add_handler(CommandHandler("crawlbasketball", wrap_command(crawlbasketball, "crawlbasketball")))     # 농구
-    app.add_handler(CommandHandler("crawlvolleyball", wrap_command(crawlvolleyball, "crawlvolleyball")))     # 배구
+    app.add_handler(CommandHandler("crawlsoccer", crawlsoccer))             # 해외축구
+    app.add_handler(CommandHandler("crawlsoccerkr", crawlsoccerkr))         # 국내축구
+    app.add_handler(CommandHandler("crawlbaseball", crawlbaseball))         # KBO
+    app.add_handler(CommandHandler("crawloverbaseball", crawloverbaseball)) # 해외야구
+    app.add_handler(CommandHandler("crawlbasketball", crawlbasketball))     # 농구
+    app.add_handler(CommandHandler("crawlvolleyball", crawlvolleyball))     # 배구
 
     # mazgtv 해외축구 분석 (오늘 / 내일 경기 → today / tomorrow 시트)
-    app.add_handler(CommandHandler("crawlmazsoccer_today", wrap_command(crawlmazsoccer_today, "crawlmazsoccer_today")))
-    app.add_handler(CommandHandler("crawlmazsoccer_tomorrow", wrap_command(crawlmazsoccer_tomorrow, "crawlmazsoccer_tomorrow")))
+    app.add_handler(CommandHandler("crawlmazsoccer_today", crawlmazsoccer_today))
+    app.add_handler(CommandHandler("crawlmazsoccer_tomorrow", crawlmazsoccer_tomorrow))
 
     # mazgtv 야구 분석 (오늘 / 내일)
-    app.add_handler(CommandHandler("crawlmazbaseball_today", wrap_command(crawlmazbaseball_today, "crawlmazbaseball_today")))
-    app.add_handler(CommandHandler("crawlmazbaseball_tomorrow", wrap_command(crawlmazbaseball_tomorrow, "crawlmazbaseball_tomorrow")))
+    app.add_handler(CommandHandler("crawlmazbaseball_today", crawlmazbaseball_today))
+    app.add_handler(CommandHandler("crawlmazbaseball_tomorrow", crawlmazbaseball_tomorrow))
 
     # mazgtv 농구 + 배구 분석 (오늘 / 내일)
-    app.add_handler(CommandHandler("bvcrawl_today", wrap_command(bvcrawl_today, "bvcrawl_today")))
-    app.add_handler(CommandHandler("bvcrawl_tomorrow", wrap_command(bvcrawl_tomorrow, "bvcrawl_tomorrow")))
+    app.add_handler(CommandHandler("bvcrawl_today", bvcrawl_today))
+    app.add_handler(CommandHandler("bvcrawl_tomorrow", bvcrawl_tomorrow))
 
 
 
