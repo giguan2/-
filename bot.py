@@ -1094,6 +1094,7 @@ import os
 import json
 import time
 import asyncio
+import io
 import re
 import requests
 import httpx
@@ -1140,7 +1141,7 @@ NAVER_CAFE_MENU_MAP_RAW = (os.getenv("NAVER_CAFE_MENU_MAP") or "").strip()
 NAVER_CAFE_MENU_MAP_DEEP_RAW = (os.getenv("NAVER_CAFE_MENU_MAP_DEEP") or "").strip()
 
 CAFE_LOG_SHEET_NAME = (os.getenv("CAFE_LOG_SHEET_NAME") or "cafe_log").strip()
-CAFE_LOG_HEADER = ["src_id", "day", "sport", "clubid", "menuid", "articleId", "postedAt", "status", "title", "url"]
+CAFE_LOG_HEADER = ["src_id", "day", "sport", "clubid", "menuid", "articleId", "postedAt", "status"]
 
 # ───────────────── news_cafe_queue / news_cafe_log ─────────────────
 NEWS_CAFE_QUEUE_SHEET_NAME = (os.getenv("NEWS_CAFE_QUEUE_SHEET_NAME") or "news_cafe_queue").strip()
@@ -1360,16 +1361,6 @@ def _naver_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tu
 
     except Exception as e:
         return False, f"EXC:{e}"
-
-
-def _naver_cafe_article_url(clubid: str, article_id: str) -> str:
-    """게시된 네이버 카페 글 URL 생성(안전한 기본 포맷)."""
-    cid = (clubid or "").strip()
-    aid = (str(article_id or "").strip())
-    if not cid or not aid:
-        return ""
-    # 구형 ArticleRead 포맷(대부분 접근 가능)
-    return f"https://cafe.naver.com/ArticleRead.nhn?clubid={cid}&articleid={aid}"
 
 def _naver_news_cafe_post(subject: str, content: str, clubid: str, menuid: str) -> tuple[bool, str]:
     """뉴스 전용 계정으로 네이버 카페에 글쓰기. (success, articleId_or_error)
@@ -1752,7 +1743,7 @@ def _load_news_queue_urls(ws_queue) -> set[str]:
             idx_url = header.index("url")
         except ValueError:
             idx_url = 3  # 기본 4번째 컬럼 가정
-        for row_idx, r in enumerate(vals[1:], start=2):
+        for r in vals[1:]:
             if len(r) <= idx_url:
                 continue
             u = _normalize_news_url(r[idx_url])
@@ -2009,8 +2000,6 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
     i_body = col("body", 4)
     i_created = col("createdAt", 5)
     i_simple = col("simple", 6)
-    i_cafe_title = col("cafe_title", -1)
-    i_cafe_url = col("cafe_url", -1)
 
     posted_keys = _load_posted_keys(ws_log)
 
@@ -2021,7 +2010,7 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
         return ""
 
     to_post = []
-    for row_idx, r in enumerate(vals[1:], start=2):
+    for r in vals[1:]:
         sid = (r[i_src].strip() if len(r) > i_src else "")
         if not sid:
             continue
@@ -2054,7 +2043,7 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
 
         # ✅ 마지막 안전 처리: 브랜드/구분자 제거(시트에 남아있어도 업로드 전에 정리)
         contentv = _postprocess_site_body_text(contentv)
-        to_post.append((row_idx, sid, dayv, sportv, titlev, contentv, createdv, menuid))
+        to_post.append((sid, dayv, sportv, titlev, contentv, createdv, menuid))
 
     if not to_post:
         await update.message.reply_text("업로드할 새 글이 없어(이미 올린 글은 제외됨).")
@@ -2073,11 +2062,11 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
         return False
 
     ok_cnt, fail_cnt = 0, 0
-    for (row_idx, sid, dayv, sportv, titlev, contentv, createdv, menuid) in to_post:
+    for (sid, dayv, sportv, titlev, contentv, createdv, menuid) in to_post:
         if not menuid:
             fail_cnt += 1
             ws_log.append_row(
-                [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), "NO_MENU_ID", "", ""],
+                [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), "NO_MENU_ID"],
                 value_input_option="RAW",
                 table_range="A1",
             )
@@ -2088,7 +2077,7 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
             fail_cnt += 1
             status = "NO_BODY" if mode == "deep" else "NO_SIMPLE"
             ws_log.append_row(
-                [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), status, "", ""],
+                [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), status],
                 value_input_option="RAW",
                 table_range="A1",
             )
@@ -2128,25 +2117,10 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
             if success:
                 ok_cnt += 1
                 ws_log.append_row(
-                    [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, info, now_kst().isoformat(), "OK", subject, _naver_cafe_article_url(NAVER_CAFE_CLUBID, info)],
+                    [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, info, now_kst().isoformat(), "OK"],
                     value_input_option="RAW",
                     table_range="A1",
                 )
-                # export 시트에도 게시된 링크/타이틀 기록(있으면)
-                try:
-                    cafe_url = _naver_cafe_article_url(NAVER_CAFE_CLUBID, info)
-                    if (i_cafe_title != -1) or (i_cafe_url != -1):
-                        updates = []
-                        if i_cafe_title != -1:
-                            updates.append((i_cafe_title, subject))
-                        if i_cafe_url != -1:
-                            updates.append((i_cafe_url, cafe_url))
-                        # 같은 행에 여러 셀 갱신
-                        for cidx, v in updates:
-                            col_letter = _col_letter(cidx + 1)
-                            ws.update(range_name=f"{col_letter}{row_idx}", values=[[v]])
-                except Exception as _e:
-                    print(f"[CAFE_LOG] export meta update fail: {_e}")
                 break
 
             # 999 내부 오류가 HTML 파싱/필터링 문제일 수도 있어서 plain 텍스트로 1회 폴백
@@ -2162,7 +2136,7 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
 
             fail_cnt += 1
             ws_log.append_row(
-                [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), info, subject, ""],
+                [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), info],
                 value_input_option="RAW",
                 table_range="A1",
             )
@@ -2248,6 +2222,7 @@ from telegram import (
     ReplyKeyboardMarkup,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputFile,
 )
 
 from datetime import datetime, timedelta, date
@@ -2764,7 +2739,7 @@ def get_site_export_ws():
 # ───────────────── site_export 저장 ─────────────────
 
 SITE_EXPORT_SHEET_NAME = os.getenv("SHEET_SITE_EXPORT_NAME", "site_export")
-SITE_EXPORT_HEADER = ["day", "sport", "src_id", "title", "body", "createdAt", "simple", "comments", "cafe_title", "cafe_url"]
+SITE_EXPORT_HEADER = ["day", "sport", "src_id", "title", "body", "createdAt", "simple", "comments"]
 # export 탭 분리: export_today / export_tomorrow
 EXPORT_TODAY_SHEET_NAME = os.getenv("SHEET_EXPORT_TODAY_NAME", "export_today")
 EXPORT_TOMORROW_SHEET_NAME = os.getenv("SHEET_EXPORT_TOMORROW_NAME", "export_tomorrow")
@@ -3315,6 +3290,251 @@ async def export_comment_fill(update: Update, context: ContextTypes.DEFAULT_TYPE
             extra = '\n\n⚠️ 댓글을 생성할 대상 행은 있었지만 생성 결과가 비어있습니다. Render 로그에서 [OPENAI][EXPORT_COMMENT]를 확인해 주세요.'
 
     await update.message.reply_text("✅ export 댓글 생성 완료\n" + "\n".join(reports) + f"\n총 {total}건" + extra)
+
+
+
+# ───────────────── Export 댓글 → TXT 다운로드(버튼/명령어) ─────────────────
+# - export_today/export_tomorrow의 H열(comments)에 있는 줄바꿈 댓글을
+#   "한 줄 = 한 txt 파일"로 분리해 텔레그램으로 전송한다.
+
+EXPORT_COMMENT_TXT_DEFAULT_MATCHES = int((os.getenv("EXPORT_COMMENT_TXT_MATCHES") or "10").strip() or "10")
+EXPORT_COMMENT_TXT_MAX_FILES = int((os.getenv("EXPORT_COMMENT_TXT_MAX_FILES") or "120").strip() or "120")
+
+
+def _export_sport_group_to_allowed(group: str) -> set[str] | None:
+    """sport_group 문자열을 export 시트 sport 컬럼 값 집합으로 매핑한다."""
+    if not group:
+        return None
+    g = str(group).strip()
+    gl = g.lower()
+
+    # high-level groups
+    if gl in ("all", "전체", "*"):
+        return None
+    if gl in ("soccer", "축구"):
+        return {"해외축구", "K리그", "J리그", "축구"}
+    if gl in ("baseball", "야구"):
+        return {"해외야구", "KBO", "NPB", "야구"}
+    if gl in ("basketball", "농구"):
+        return {"NBA", "KBL", "WKBL", "농구"}
+    if gl in ("volleyball", "배구"):
+        return {"V리그", "배구"}
+    if gl in ("bv", "농구/배구", "농구배구"):
+        return {"NBA", "KBL", "WKBL", "V리그", "농구", "배구", "농구/배구"}
+
+    # allow direct match (e.g., "K리그", "NBA")
+    return {g}
+
+
+def _safe_filename_part(s: str, max_len: int = 32) -> str:
+    """파일명에 넣기 안전하게 정리(너무 길면 자름)."""
+    s = (s or "").strip()
+    if not s:
+        return "comment"
+    # 공백 -> 언더스코어
+    s = re.sub(r"\s+", "_", s)
+    # 파일명 위험 문자 제거(한글 유지)
+    s = re.sub(r"[^\w가-힣\-\._]+", "", s)
+    s = s.strip("._-")
+    if not s:
+        s = "comment"
+    return s[:max_len]
+
+
+def build_export_comment_txt_keyboard(*, day_key: str, sport_group: str, matches: int | None = None) -> InlineKeyboardMarkup:
+    """크롤링 완료 메시지 아래에 붙일 버튼(댓글 TXT 전송)."""
+    m = int(matches or EXPORT_COMMENT_TXT_DEFAULT_MATCHES)
+    m = max(1, min(m, 50))
+    cb = f"exptxt:{day_key}:{sport_group}:{m}"
+    buttons = [[InlineKeyboardButton(f"📄 댓글 TXT 받기 ({m}경기)", callback_data=cb)]]
+    return InlineKeyboardMarkup(buttons)
+
+
+async def _export_send_comment_txts(
+    *,
+    message,
+    day_key: str,
+    sport_group: str = "all",
+    matches: int | None = None,
+    max_files: int | None = None,
+):
+    """export 시트에서 comments(H열)을 읽어 한 줄씩 txt 파일로 전송한다."""
+    matches_n = int(matches or EXPORT_COMMENT_TXT_DEFAULT_MATCHES)
+    matches_n = max(1, min(matches_n, 200))
+    max_files_n = int(max_files or EXPORT_COMMENT_TXT_MAX_FILES)
+    max_files_n = max(10, min(max_files_n, 500))
+
+    # sheet 결정
+    if day_key == "all":
+        sheet_names = [EXPORT_TODAY_SHEET_NAME, EXPORT_TOMORROW_SHEET_NAME]
+    elif day_key == "today":
+        sheet_names = [EXPORT_TODAY_SHEET_NAME]
+    else:
+        sheet_names = [EXPORT_TOMORROW_SHEET_NAME]
+
+    allowed = _export_sport_group_to_allowed(sport_group)
+
+    total_docs = 0
+    total_matches = 0
+
+    for sheet_name in sheet_names:
+        ws = get_export_ws(sheet_name)
+        if not ws:
+            await message.reply_text(f"❌ 시트 열기 실패: {sheet_name}")
+            continue
+
+        # 헤더 보정
+        _ensure_header(ws, EXPORT_HEADER)
+
+        try:
+            values = ws.get_all_values()
+        except Exception as e:
+            await message.reply_text(f"❌ 시트 읽기 실패({sheet_name}): {e}")
+            continue
+
+        if not values or len(values) <= 1:
+            await message.reply_text(f"ℹ️ {sheet_name}: 데이터가 없습니다.")
+            continue
+
+        header = [str(c).strip() for c in (values[0] or [])]
+        # 인덱스 확보(없으면 skip)
+        try:
+            idx_comments = header.index("comments")
+        except ValueError:
+            await message.reply_text(f"❌ {sheet_name}: comments(H열) 컬럼을 찾지 못했습니다.")
+            continue
+        idx_src = header.index("src_id") if "src_id" in header else None
+        idx_title = header.index("title") if "title" in header else None
+        idx_simple = header.index("simple") if "simple" in header else None
+        idx_sport = header.index("sport") if "sport" in header else None
+
+        # 최신 행부터 matches_n개 선택
+        picked_rows: list[list[str]] = []
+        for i in range(len(values) - 1, 0, -1):
+            if len(picked_rows) >= matches_n:
+                break
+            row = values[i] or []
+            sport_val = (row[idx_sport] if (idx_sport is not None and len(row) > idx_sport) else "").strip()
+            if allowed and sport_val and (sport_val not in allowed):
+                continue
+
+            comments = (row[idx_comments] if len(row) > idx_comments else "").strip()
+            if not comments:
+                continue
+
+            picked_rows.append(row)
+
+        if not picked_rows:
+            await message.reply_text(f"ℹ️ {sheet_name}: 조건에 맞는 댓글(H열) 데이터가 없습니다.")
+            continue
+
+        # 전송 시작 안내
+        scope_txt = f"{sport_group}" if sport_group else "all"
+        await message.reply_text(
+            f"📄 {sheet_name} 댓글 TXT 전송 시작\n"
+            f"- 범위: {scope_txt}\n"
+            f"- 경기 수: {len(picked_rows)}\n"
+            f"- 최대 파일 수: {max_files_n}\n\n"
+            "⚠️ 텔레그램 전송 제한 때문에 파일 수가 많으면 일부만 전송될 수 있습니다."
+        )
+
+        # 실제 전송
+        for row in picked_rows:
+            if total_docs >= max_files_n:
+                break
+
+            src_id = (row[idx_src] if (idx_src is not None and len(row) > idx_src) else "").strip()
+            title = (row[idx_title] if (idx_title is not None and len(row) > idx_title) else "").strip()
+            base_title = title
+            if not base_title and idx_simple is not None and len(row) > idx_simple:
+                simple_txt = (row[idx_simple] or "").strip()
+                base_title = (simple_txt.splitlines()[0] if simple_txt else "").strip()
+
+            name_part = _safe_filename_part(base_title or src_id or "comment", max_len=32)
+            src_part = _safe_filename_part(src_id or "src", max_len=24)
+
+            comments = (row[idx_comments] if len(row) > idx_comments else "").strip()
+            lines = [ln.strip() for ln in comments.splitlines() if ln and ln.strip()]
+
+            if not lines:
+                continue
+
+            total_matches += 1
+
+            for j, line in enumerate(lines, start=1):
+                if total_docs >= max_files_n:
+                    break
+
+                fn = f"{name_part}_{src_part}_{j:02d}.txt"
+                bio = io.BytesIO(line.encode("utf-8"))
+                # PTB가 파일명을 인식할 수 있도록 name 세팅
+                bio.name = fn
+
+                try:
+                    await message.reply_document(document=InputFile(bio, filename=fn))
+                    total_docs += 1
+                except Exception as e:
+                    await message.reply_text(f"❌ 파일 전송 실패({fn}): {e}")
+                    # 너무 자주 실패하면 중단
+                    if total_docs == 0:
+                        return
+
+                # 속도 제한(가끔 Flood 방지)
+                if total_docs % 20 == 0:
+                    await asyncio.sleep(0.4)
+
+    await message.reply_text(f"✅ TXT 전송 완료: {total_matches}경기 / {total_docs}개 파일")
+
+
+async def export_comment_txt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """export 시트 H열(comments)을 한 줄=한 txt 파일로 전송한다.
+
+    사용:
+      /export_comment_txt
+      /export_comment_txt tomorrow 10 soccer
+      /export_comment_txt today 15 baseball
+      /export_comment_txt all 5 bv
+
+    - day: today|tomorrow|all (기본 tomorrow)
+    - matches: 경기 수(기본 환경변수 EXPORT_COMMENT_TXT_MATCHES 또는 10)
+    - sport_group: soccer|baseball|bv|all 또는 'K리그'처럼 직접 지정 가능
+    """
+    if not is_admin(update):
+        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+
+    args = [a.strip() for a in (context.args or []) if a and a.strip()]
+    day_key = "tomorrow"
+    matches = None
+    sport_group = "all"
+    max_files = None
+
+    for a in args:
+        al = a.lower()
+        if al in ("today", "tomorrow", "all"):
+            day_key = al
+            continue
+        if al.isdigit():
+            matches = int(al)
+            continue
+        if al.startswith("max=") or al.startswith("maxfiles=") or al.startswith("files="):
+            try:
+                max_files = int(al.split("=", 1)[1])
+            except Exception:
+                pass
+            continue
+        # 마지막은 sport_group으로
+        sport_group = a
+
+    await _export_send_comment_txts(
+        message=update.message,
+        day_key=day_key,
+        sport_group=sport_group,
+        matches=matches,
+        max_files=max_files,
+    )
+
+
 
 # ───────────────── Naver Cafe → Google Sheet (youtoo 탭) ─────────────────
 # youtoo 탭: 카페 게시글 백업/수집용
@@ -7023,6 +7243,38 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "noop":
         return
 
+    # export 댓글 TXT 다운로드 버튼
+    if data.startswith("exptxt:"):
+        if not is_admin(update):
+            try:
+                await q.message.reply_text("이 기능은 관리자만 사용할 수 있습니다.")
+            except Exception:
+                pass
+            return
+
+        parts = (data.split(":") + ["", "", "", ""])[:4]
+        # parts: ["exptxt", day_key, sport_group, matches]
+        day_key = parts[1] or "tomorrow"
+        sport_group = parts[2] or "all"
+        try:
+            matches = int(parts[3]) if (parts[3] and parts[3].isdigit()) else None
+        except Exception:
+            matches = None
+
+        try:
+            await q.message.reply_text("📄 댓글 TXT 파일을 준비합니다...")
+        except Exception:
+            pass
+
+        await _export_send_comment_txts(
+            message=q.message,
+            day_key=day_key,
+            sport_group=sport_group,
+            matches=matches,
+        )
+        return
+
+
     # 메인 메뉴로
     if data == "back_main":
         await _safe_edit_message_reply_markup(q, reply_markup=build_main_inline_menu())
@@ -7216,7 +7468,10 @@ async def crawlmazsoccer_tomorrow(update: Update, context: ContextTypes.DEFAULT_
         export_site=True,   # ✅ 추가
     )
 
-    await update.message.reply_text("⚽ 텔레그램용 + 사이트용(내일) 분석 크롤링을 모두 저장했습니다.")
+    await update.message.reply_text(
+        "⚽ 텔레그램용 + 사이트용(내일) 분석 크롤링을 모두 저장했습니다.",
+        reply_markup=build_export_comment_txt_keyboard(day_key="tomorrow", sport_group="soccer"),
+    )
 
 
 # 야구(MLB · KBO · NPB) 분석 (내일 경기 → tomorrow 시트)
@@ -7254,7 +7509,8 @@ async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAUL
     )
 
     await update.message.reply_text(
-        "⚾ 야구(MLB · KBO · NPB) 내일 경기 분석 크롤링 명령을 모두 실행했습니다."
+        "⚾ 야구(MLB · KBO · NPB) 내일 경기 분석 크롤링 명령을 모두 실행했습니다.",
+        reply_markup=build_export_comment_txt_keyboard(day_key="tomorrow", sport_group="baseball"),
     )
 
 # 🔹 NBA + 국내 농구/배구 (내일 경기) 크롤링
@@ -7297,7 +7553,8 @@ async def bvcrawl_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "NBA + 국내 농구/배구(내일 경기) 분석 크롤링을 모두 실행했습니다.\n"
-        "/syncsheet 로 텔레그램 메뉴 데이터를 갱신할 수 있습니다."
+        "/syncsheet 로 텔레그램 메뉴 데이터를 갱신할 수 있습니다.",
+        reply_markup=build_export_comment_txt_keyboard(day_key="tomorrow", sport_group="bv"),
     )
 
 async def crawlmazsoccer_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7335,7 +7592,8 @@ async def crawlmazsoccer_today(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
     await update.message.reply_text(
-        "⚽ 해외축구 + K리그/J리그 오늘 경기 분석 크롤링을 모두 실행했습니다."
+        "⚽ 해외축구 + K리그/J리그 오늘 경기 분석 크롤링을 모두 실행했습니다.",
+        reply_markup=build_export_comment_txt_keyboard(day_key="today", sport_group="soccer"),
     )
 
 async def crawlmazbaseball_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7374,7 +7632,8 @@ async def crawlmazbaseball_today(update: Update, context: ContextTypes.DEFAULT_T
 
     await update.message.reply_text(
         "⚾ mazgtv 야구(MLB · KBO · NPB) '오늘 경기' 분석 크롤링을 완료했습니다.\n"
-        "today 시트에서 내용을 확인할 수 있습니다."
+        "today 시트에서 내용을 확인할 수 있습니다.",
+        reply_markup=build_export_comment_txt_keyboard(day_key="today", sport_group="baseball"),
     )
 
 # 🔹 NBA + 국내 농구/배구 (오늘 경기) 크롤링
@@ -7416,7 +7675,8 @@ async def bvcrawl_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "NBA + 국내 농구/배구(오늘 경기) 분석 크롤링을 모두 실행했습니다.\n"
-        "today 시트에서 내용을 확인할 수 있습니다."
+        "today 시트에서 내용을 확인할 수 있습니다.",
+        reply_markup=build_export_comment_txt_keyboard(day_key="today", sport_group="bv"),
     )
 
 
@@ -7989,6 +8249,7 @@ def main():
     # export_tomorrow → export_today 롤오버
     app.add_handler(CommandHandler("export_rollover", export_rollover))
     app.add_handler(CommandHandler("export_comment_fill", export_comment_fill))    
+    app.add_handler(CommandHandler("export_comment_txt", export_comment_txt))
     app.add_handler(CommandHandler("youtoo", youtoo))  # 네이버 카페 메뉴 글 수집 → youtoo 시트
 
     # 네이버 카페 자동 글쓰기(종목별 게시판)  ※ /cafe_soccer [tomorrow] 처럼 사용
