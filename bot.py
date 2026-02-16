@@ -2888,8 +2888,99 @@ def _parse_export_title_parts(title: str) -> dict:
     return out
 
 
+
+# ───────────────── Export H열(OpenAI 댓글) 생성 ─────────────────
+
+EXPORT_COMMENT_LAST_ERROR = ""
+
+
+def _set_export_comment_last_error(msg: str) -> None:
+    global EXPORT_COMMENT_LAST_ERROR
+    EXPORT_COMMENT_LAST_ERROR = (msg or "").strip()[:600]
+
+
+def _extract_text_from_responses_obj(resp) -> str:
+    """OpenAI Responses API 응답에서 텍스트를 최대한 안전하게 추출."""
+    if resp is None:
+        return ""
+    # 1) SDK가 제공하는 output_text
+    t = getattr(resp, "output_text", None)
+    if isinstance(t, str) and t.strip():
+        return t.strip()
+
+    # 2) output 구조를 직접 훑기
+    out = getattr(resp, "output", None)
+    if isinstance(out, list):
+        parts = []
+        for item in out:
+            content = getattr(item, "content", None)
+            if not isinstance(content, list):
+                continue
+            for c in content:
+                # common: {type:"output_text", text:"..."}
+                ctype = getattr(c, "type", None)
+                ctext = getattr(c, "text", None)
+                if ctype in ("output_text", "text") and isinstance(ctext, str) and ctext.strip():
+                    parts.append(ctext.strip())
+        if parts:
+            return "\n".join(parts).strip()
+
+    return ""
+
+
+def _openai_generate_text_any(prompt: str, system: str, model: str, temperature: float) -> str:
+    """가능하면 Responses, 아니면 ChatCompletions로 텍스트 생성.
+
+    - 키 권한이 Responses만/ChatCompletions만 허용된 경우 모두 대응
+    - 실패 시 EXPORT_COMMENT_LAST_ERROR에 마지막 에러를 기록
+    """
+    client = get_openai_client()
+    if not client:
+        _set_export_comment_last_error("OPENAI_API_KEY 미설정 또는 클라이언트 초기화 실패")
+        return ""
+
+    # 1) Responses API 먼저 시도 (권한이 더 타이트한 키에서도 자주 허용)
+    try:
+        if hasattr(client, "responses") and hasattr(client.responses, "create"):
+            # 시스템+유저 프롬프트를 한 문자열로 합쳐 전달 (SDK 버전 차이에 덜 민감)
+            combined = (system or "").strip() + "\n\n" + (prompt or "").strip()
+            resp = client.responses.create(
+                model=model,
+                input=combined,
+                temperature=temperature,
+            )
+            txt = _extract_text_from_responses_obj(resp)
+            if txt:
+                return txt
+    except Exception as e:
+        _set_export_comment_last_error(f"Responses 실패: {e}")
+
+    # 2) Chat Completions 시도
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system or ""},
+                {"role": "user", "content": prompt or ""},
+            ],
+            temperature=temperature,
+        )
+        content = (resp.choices[0].message.content or "").strip()
+        if content:
+            return content
+    except Exception as e:
+        _set_export_comment_last_error(f"ChatCompletions 실패: {e}")
+
+    return ""
+
+
 def generate_export_comments(title: str, sport_label: str = "", count: int | None = None) -> str:
-    """OpenAI로 '인간 댓글' 5~6개(기본 6개)를 생성해서 줄바꿈 문자열로 반환."""
+    """OpenAI로 '인간 댓글' 5~6개(기본 6개)를 생성해서 줄바꿈 문자열로 반환.
+
+    ⚠️ 중요한 설계:
+    - 실패해도 봇이 죽지 않도록 예외는 내부에서 처리
+    - 실패 원인은 EXPORT_COMMENT_LAST_ERROR에 남김
+    """
     enabled = (os.getenv("EXPORT_COMMENT_ENABLED", "1").strip().lower() not in ("0", "false", "no"))
     if not enabled:
         return ""
@@ -2899,6 +2990,7 @@ def generate_export_comments(title: str, sport_label: str = "", count: int | Non
             count = int((os.getenv("EXPORT_COMMENT_COUNT", "") or "6").strip())
         except Exception:
             count = 6
+
     # 안전 범위
     count = max(1, min(int(count), 8))
 
@@ -2906,23 +2998,23 @@ def generate_export_comments(title: str, sport_label: str = "", count: int | Non
     if not t:
         return ""
 
-    client_oa = get_openai_client()
-    if not client_oa:
-        return ""
+    # 모델: env 우선 + 안전 폴백
+    primary_model = (os.getenv("EXPORT_COMMENT_MODEL") or os.getenv("SIMPLE_REWRITE_MODEL") or os.getenv("OPENAI_MODEL") or "").strip()
+    model_candidates = [m for m in [primary_model, "gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"] if m]
+    # 중복 제거
+    seen = set(); model_candidates = [m for m in model_candidates if (m not in seen and not seen.add(m))]
 
-    parts = _parse_export_title_parts(t)
-    league = parts.get("league", "")
-    teams = parts.get("teams", "")
-    date_s = parts.get("date", "")
-
-    model = (os.getenv("EXPORT_COMMENT_MODEL") or os.getenv("SIMPLE_REWRITE_MODEL") or "gpt-4.1-mini").strip()
     try:
         temperature = float((os.getenv("EXPORT_COMMENT_TEMPERATURE", "0.95") or "0.95").strip())
     except Exception:
         temperature = 0.95
     temperature = max(0.2, min(1.2, temperature))
 
-    # 프롬프트: '리그명/팀명 포함'을 강하게 요구하되, 자연스러운 변형(챔스/챔피언스리그 등)도 허용
+    parts = _parse_export_title_parts(t)
+    league = parts.get("league", "")
+    teams = parts.get("teams", "")
+    date_s = parts.get("date", "")
+
     prompt = f"""아래 제목을 바탕으로 네이버 카페에 달기 좋은 한국어 댓글을 {count}개 만들어줘.
 
 제목:
@@ -2943,18 +3035,21 @@ def generate_export_comments(title: str, sport_label: str = "", count: int | Non
 - 종목 라벨: {sport_label or "(없음)"}
 """
 
-    try:
-        resp = client_oa.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": "You write natural Korean comments for sports community posts."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=temperature,
-        )
-        content = (resp.choices[0].message.content or "").strip()
-    except Exception as e:
-        print(f"[OPENAI][EXPORT_COMMENT] 생성 실패: {e}")
+    system = "You write natural Korean comments for sports community posts."
+
+    # 모델 후보 순서대로 시도
+    content = ""
+    last_err = ""
+    for m in (model_candidates or ["gpt-4o-mini"]):
+        _set_export_comment_last_error("")
+        content = _openai_generate_text_any(prompt=prompt, system=system, model=m, temperature=temperature)
+        if content:
+            break
+        last_err = EXPORT_COMMENT_LAST_ERROR or last_err
+
+    if not content:
+        if last_err:
+            print(f"[OPENAI][EXPORT_COMMENT] 생성 실패: {last_err}")
         return ""
 
     # 파싱/정리
@@ -2976,10 +3071,9 @@ def generate_export_comments(title: str, sport_label: str = "", count: int | Non
     seen = set()
     uniq = []
     for s in lines:
-        key = s
-        if key in seen:
+        if s in seen:
             continue
-        seen.add(key)
+        seen.add(s)
         uniq.append(s)
 
     if not uniq:
@@ -2988,7 +3082,6 @@ def generate_export_comments(title: str, sport_label: str = "", count: int | Non
     # count 맞추기
     uniq = uniq[:count]
     return "\n".join(uniq).strip()
-
 
 def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
     """지정 export 시트에 rows를 append.
@@ -3103,6 +3196,7 @@ async def export_comment_fill(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     total = 0
+    candidates = 0
     reports = []
 
     for sheet_name in sheet_names:
@@ -3168,6 +3262,8 @@ async def export_comment_fill(update: Update, context: ContextTypes.DEFAULT_TYPE
             if not base_title:
                 continue
 
+            candidates += 1
+
             comments = generate_export_comments(base_title, sport_label=sport_label)
             if not comments:
                 continue
@@ -3183,7 +3279,15 @@ async def export_comment_fill(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         reports.append(f"- {sheet_name}: {filled}건 {'(덮어쓰기)' if force else ''}".rstrip())
 
-    await update.message.reply_text("✅ export 댓글 생성 완료\n" + "\n".join(reports) + f"\n총 {total}건")
+    extra = ''
+    if total == 0 and candidates > 0:
+        # OpenAI 생성 실패 가능성 안내
+        if EXPORT_COMMENT_LAST_ERROR:
+            extra = f"\n\n⚠️ OpenAI 댓글 생성이 실패한 것 같습니다.\n- 마지막 오류: {EXPORT_COMMENT_LAST_ERROR}"
+        else:
+            extra = '\n\n⚠️ 댓글을 생성할 대상 행은 있었지만 생성 결과가 비어있습니다. Render 로그에서 [OPENAI][EXPORT_COMMENT]를 확인해 주세요.'
+
+    await update.message.reply_text("✅ export 댓글 생성 완료\n" + "\n".join(reports) + f"\n총 {total}건" + extra)
 
 # ───────────────── Naver Cafe → Google Sheet (youtoo 탭) ─────────────────
 # youtoo 탭: 카페 게시글 백업/수집용
