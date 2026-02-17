@@ -2244,6 +2244,7 @@ async def _maz_warmup(client: httpx.AsyncClient) -> None:
 
 import math
 import io
+import zipfile
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, quote_plus, unquote_plus
 from openai import OpenAI
@@ -4216,6 +4217,218 @@ async def _send_export_comment_txt_files(
 
     return total_files, total_matches
 
+
+def _safe_zip_basename(s: str) -> str:
+    s = (s or "").strip()
+    if not s:
+        return "item"
+    s = re.sub(r"[^0-9A-Za-z_\-]+", "_", s)
+    s = s.strip("_")
+    return s[:60] if s else "item"
+
+
+def _default_zip_matches() -> int:
+    # zip 기본 경기수: EXPORT_COMMENT_ZIP_MATCHES > EXPORT_COMMENT_TXT_MATCHES > 10
+    try:
+        return int(os.getenv("EXPORT_COMMENT_ZIP_MATCHES") or os.getenv("EXPORT_COMMENT_TXT_MATCHES") or "10")
+    except Exception:
+        return 10
+
+
+def _build_export_comment_zip_markup(which: str, sport_filter: str, limit_matches: int | None = None) -> InlineKeyboardMarkup:
+    n = limit_matches or _default_zip_matches()
+    cb = f"zip:{which}:{sport_filter}:{n}"
+    label = f"📦 댓글 ZIP 받기 ({n}경기)"
+    if sport_filter:
+        label = f"📦 {sport_filter} ZIP ({n}경기)"
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=cb)]])
+
+
+def _build_export_comment_zip_markup_bv(which: str, limit_matches: int | None = None) -> InlineKeyboardMarkup:
+    n = limit_matches or _default_zip_matches()
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(f"📦 basketball ZIP ({n}경기)", callback_data=f"zip:{which}:basketball:{n}"),
+            InlineKeyboardButton(f"📦 volleyball ZIP ({n}경기)", callback_data=f"zip:{which}:volleyball:{n}"),
+        ]
+    ])
+
+
+def _build_export_comment_zip_markup_all(which: str, limit_matches: int | None = None) -> InlineKeyboardMarkup:
+    # 4종목 버튼 한번에
+    n = limit_matches or _default_zip_matches()
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(f"📦 soccer ZIP ({n})", callback_data=f"zip:{which}:soccer:{n}"),
+            InlineKeyboardButton(f"📦 baseball ZIP ({n})", callback_data=f"zip:{which}:baseball:{n}"),
+        ],
+        [
+            InlineKeyboardButton(f"📦 basketball ZIP ({n})", callback_data=f"zip:{which}:basketball:{n}"),
+            InlineKeyboardButton(f"📦 volleyball ZIP ({n})", callback_data=f"zip:{which}:volleyball:{n}"),
+        ],
+    ])
+
+
+async def _send_export_comment_zip_file(
+    chat_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    which: str,
+    limit_matches: int,
+    sport_filter: str = "",
+) -> tuple[int, int, str]:
+    """export_* 시트의 comments(H) 줄바꿈을 ZIP(내부: 한 줄당 txt 1개)로 묶어 전송.
+    반환: (zip에 담긴 txt 파일 수, 처리한 경기 수, zip 파일명)
+    """
+    which = (which or "tomorrow").strip().lower()
+    if which not in ("today", "tomorrow"):
+        which = "tomorrow"
+
+    max_files = int(os.getenv("EXPORT_COMMENT_ZIP_MAX_FILES", os.getenv("EXPORT_COMMENT_TXT_MAX_FILES", "600")))
+
+    sheet_name = EXPORT_TODAY_SHEET_NAME if which == "today" else EXPORT_TOMORROW_SHEET_NAME
+    ws = get_export_ws(sheet_name)
+    if not ws:
+        await context.bot.send_message(chat_id=chat_id, text=f"{sheet_name} 시트를 못 찾았어.")
+        return 0, 0, ""
+
+    vals = ws.get_all_values()
+    if not vals or len(vals) <= 1:
+        await context.bot.send_message(chat_id=chat_id, text=f"{sheet_name}에 데이터가 없어.")
+        return 0, 0, ""
+
+    header = vals[0]
+
+    def _idx(name: str, fallback: int) -> int:
+        try:
+            return header.index(name)
+        except ValueError:
+            return fallback
+
+    i_sport = _idx("sport", 1)
+    i_src = _idx("src_id", 2)
+    i_title = _idx("title", 3)
+    i_comments = _idx("comments", 7)
+
+    selected: list[tuple[str, str, list[str]]] = []  # (sid, title, comment_lines)
+    for r in reversed(vals[1:]):
+        sportv = (r[i_sport] if len(r) > i_sport else "").strip()
+        if sport_filter and (not _cafe_sport_match(sportv, sport_filter)):
+            continue
+
+        sid = (r[i_src] if len(r) > i_src else "").strip()
+        title = (r[i_title] if len(r) > i_title else "").strip()
+        comments_raw = (r[i_comments] if len(r) > i_comments else "")
+        comment_lines = _split_comment_lines(comments_raw)
+
+        if not comment_lines:
+            continue
+
+        selected.append((sid, title, comment_lines))
+        if len(selected) >= limit_matches:
+            break
+
+    if not selected:
+        msg = "ZIP으로 보낼 댓글이 없어. export 시트 H열(comments)을 먼저 채워줘."
+        if sport_filter:
+            msg = f"ZIP으로 보낼 댓글이 없어({sport_filter}). export 시트 H열(comments)을 먼저 채워줘."
+        await context.bot.send_message(chat_id=chat_id, text=msg)
+        return 0, 0, ""
+
+    ts = now_kst().strftime("%Y%m%d_%H%M%S")
+    sport_tag = sport_filter or "all"
+    zip_filename = f"comments_{which}_{sport_tag}_{ts}.zip"
+
+    bio = io.BytesIO()
+    total_files = 0
+    total_matches = 0
+
+    try:
+        with zipfile.ZipFile(bio, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for (sid, title, comment_lines) in selected:
+                base = _safe_zip_basename(sid) if sid else _safe_zip_basename(title) or "item"
+                total_matches += 1
+                for idx, line in enumerate(comment_lines, start=1):
+                    if total_files >= max_files:
+                        break
+                    fname = f"{base}_{idx:02d}.txt"
+                    zf.writestr(fname, (line.strip() + "\n").encode("utf-8"))
+                    total_files += 1
+                if total_files >= max_files:
+                    break
+
+        bio.seek(0)
+        doc = InputFile(bio, filename=zip_filename)
+        await context.bot.send_document(chat_id=chat_id, document=doc)
+        return total_files, total_matches, zip_filename
+
+    except Exception as e:
+        print(f"[EXPORT][ZIP] zip 생성/전송 실패: {e}")
+        await context.bot.send_message(chat_id=chat_id, text=f"ZIP 생성/전송 중 오류: {e}")
+        return 0, 0, ""
+
+
+async def export_comment_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """export 시트 H열(comments) → 한 줄당 txt를 ZIP으로 묶어 전송.
+    - /export_comment_zip [today|tomorrow] [경기수] [soccer|baseball|basketball|volleyball]
+    """
+    if not is_admin(update):
+        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+
+    which, limit_matches, sport_filter = _parse_export_comment_txt_args(getattr(context, "args", []) or [])
+    await update.message.reply_text(f"📦 댓글 ZIP 생성/전송 시작: {which}, {limit_matches}경기, sport={sport_filter or 'ALL'}")
+
+    files_cnt, matches_cnt, zip_name = await _send_export_comment_zip_file(
+        chat_id=update.effective_chat.id,
+        context=context,
+        which=which,
+        limit_matches=limit_matches,
+        sport_filter=sport_filter,
+    )
+
+    if files_cnt and matches_cnt:
+        await update.message.reply_text(f"✅ ZIP 전송 완료: {matches_cnt}경기 / {files_cnt}개 파일 (1 zip: {zip_name})")
+    else:
+        await update.message.reply_text("ZIP 전송할 댓글이 없거나 실패했습니다.")
+
+
+async def export_comment_zip_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """댓글 ZIP 받기 버튼을 다시 소환하는 명령어.
+    사용 예)
+      /export_comment_zip_buttons
+      /export_comment_zip_buttons tomorrow 10 soccer
+      /export_comment_zip_buttons today 30
+      /export_comment_zip_buttons tomorrow 50 (전체 종목 버튼)
+    """
+    if not is_admin(update):
+        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+
+    which, limit_matches, sport_filter = _parse_export_comment_txt_args(getattr(context, "args", []) or [])
+    which = which or "tomorrow"
+    limit_matches = limit_matches or _default_zip_matches()
+
+    if not sport_filter:
+        markup = _build_export_comment_zip_markup_all(which, limit_matches)
+        await update.message.reply_text(
+            f"📦 댓글 ZIP 받기 버튼입니다: {which}, {limit_matches}경기 (종목 선택)",
+            reply_markup=markup,
+        )
+        return
+
+    if sport_filter in ("bv", "basketvolley", "basket_volley"):
+        markup = _build_export_comment_zip_markup_bv(which, limit_matches)
+        await update.message.reply_text(
+            f"📦 댓글 ZIP 받기 버튼입니다: {which}, {limit_matches}경기 (농구/배구)",
+            reply_markup=markup,
+        )
+        return
+
+    markup = _build_export_comment_zip_markup(which, sport_filter, limit_matches)
+    await update.message.reply_text(
+        f"📦 댓글 ZIP 받기 버튼입니다: {which}, {limit_matches}경기, sport={sport_filter}",
+        reply_markup=markup,
+    )
 
 async def export_comment_txt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """export 시트 H열(comments) → 한 줄당 1개 TXT 파일로 보내기.
@@ -7267,6 +7480,31 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 아무 동작 안 하는 더미
     if data == "noop":
         return
+
+    # export 댓글 ZIP 버튼 (1 zip 파일로 전송)
+    if data.startswith("zip:"):
+        try:
+            _, which, sport_key, n = data.split(":", 3)
+            which = (which or "tomorrow").strip().lower()
+            sport_key = (sport_key or "").strip().lower()
+            limit_matches = int(n) if str(n).isdigit() else _default_zip_matches()
+        except Exception:
+            which, limit_matches, sport_key = "tomorrow", _default_zip_matches(), ""
+
+        await q.message.reply_text(f"📦 댓글 ZIP 생성/전송 시작: {which}, {limit_matches}경기, sport={sport_key or 'ALL'}")
+        files_cnt, matches_cnt, zip_name = await _send_export_comment_zip_file(
+            chat_id=q.message.chat_id,
+            context=context,
+            which=which,
+            limit_matches=limit_matches,
+            sport_filter=sport_key,
+        )
+        if files_cnt and matches_cnt:
+            await q.message.reply_text(f"✅ ZIP 전송 완료: {matches_cnt}경기 / {files_cnt}개 파일 (1 zip)")
+        else:
+            await q.message.reply_text("ZIP 전송할 댓글이 없거나 실패했습니다.")
+        return
+
     # export 댓글 TXT 버튼
     if data.startswith("txt:"):
         try:
@@ -7484,7 +7722,7 @@ async def crawlmazsoccer_tomorrow(update: Update, context: ContextTypes.DEFAULT_
 
     await update.message.reply_text(
         "⚽ 텔레그램용 + 사이트용(내일) 분석 크롤링을 모두 저장했습니다.",
-        reply_markup=_build_export_comment_txt_markup("tomorrow", "soccer"),
+        reply_markup=_build_export_comment_zip_markup("tomorrow", "soccer"),
     )
 
 
@@ -7524,7 +7762,7 @@ async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAUL
 
     await update.message.reply_text(
         "⚾ 야구(MLB · KBO · NPB) 내일 경기 분석 크롤링 명령을 모두 실행했습니다.",
-        reply_markup=_build_export_comment_txt_markup("tomorrow", "baseball"),
+        reply_markup=_build_export_comment_zip_markup("tomorrow", "baseball"),
     )
 
 # 🔹 NBA + 국내 농구/배구 (내일 경기) 크롤링
@@ -7568,7 +7806,7 @@ async def bvcrawl_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "NBA + 국내 농구/배구(내일 경기) 분석 크롤링을 모두 실행했습니다.\n"
         "/syncsheet 로 텔레그램 메뉴 데이터를 갱신할 수 있습니다.",
-        reply_markup=_build_export_comment_txt_markup_bv("tomorrow"),
+        reply_markup=_build_export_comment_zip_markup_bv("tomorrow"),
     )
 
 async def crawlmazsoccer_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7607,7 +7845,7 @@ async def crawlmazsoccer_today(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await update.message.reply_text(
         "⚽ 해외축구 + K리그/J리그 오늘 경기 분석 크롤링을 모두 실행했습니다.",
-        reply_markup=_build_export_comment_txt_markup("today", "soccer"),
+        reply_markup=_build_export_comment_zip_markup("today", "soccer"),
     )
 
 async def crawlmazbaseball_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7647,7 +7885,7 @@ async def crawlmazbaseball_today(update: Update, context: ContextTypes.DEFAULT_T
     await update.message.reply_text(
         "⚾ mazgtv 야구(MLB · KBO · NPB) '오늘 경기' 분석 크롤링을 완료했습니다.\n"
         "today 시트에서 내용을 확인할 수 있습니다.",
-        reply_markup=_build_export_comment_txt_markup("today", "baseball"),
+        reply_markup=_build_export_comment_zip_markup("today", "baseball"),
     )
 
 # 🔹 NBA + 국내 농구/배구 (오늘 경기) 크롤링
@@ -7690,7 +7928,7 @@ async def bvcrawl_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "NBA + 국내 농구/배구(오늘 경기) 분석 크롤링을 모두 실행했습니다.\n"
         "today 시트에서 내용을 확인할 수 있습니다.",
-        reply_markup=_build_export_comment_txt_markup_bv("today"),
+        reply_markup=_build_export_comment_zip_markup_bv("today"),
     )
 
 
@@ -8267,6 +8505,8 @@ def main():
     app.add_handler(CommandHandler("export_rollover", export_rollover))
     app.add_handler(CommandHandler("export_comment_fill", export_comment_fill))    
     app.add_handler(CommandHandler("export_comment_txt", export_comment_txt))
+    app.add_handler(CommandHandler("export_comment_zip", export_comment_zip))
+    app.add_handler(CommandHandler("export_comment_zip_buttons", export_comment_zip_buttons))
     app.add_handler(CommandHandler("youtoo", youtoo))  # 네이버 카페 메뉴 글 수집 → youtoo 시트
 
     # 네이버 카페 자동 글쓰기(종목별 게시판)  ※ /cafe_soccer [tomorrow] 처럼 사용
@@ -8330,8 +8570,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
 
 
 
