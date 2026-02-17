@@ -1981,7 +1981,7 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
 
     # export 헤더 확장(구버전이면 cafe_url 컬럼 등 추가)
     try:
-        _ensure_header(ws, EXPORT_HEADER)
+        ensure_export_schema(ws, EXPORT_HEADER)
     except Exception:
         pass
 
@@ -2816,7 +2816,7 @@ def get_site_export_ws():
 # ───────────────── site_export 저장 ─────────────────
 
 SITE_EXPORT_SHEET_NAME = os.getenv("SHEET_SITE_EXPORT_NAME", "site_export")
-SITE_EXPORT_HEADER = ["day", "sport", "src_id", "title", "body", "createdAt", "simple", "comments", "cafe_title", "cafe_url", "cafe_url_deep"]
+SITE_EXPORT_HEADER = ["day", "sport", "src_id", "title", "body", "createdAt", "simple", "cafe_title", "cafe_url", "comments", "cafe_url_deep", "deep_comments"]
 # export 탭 분리: export_today / export_tomorrow
 EXPORT_TODAY_SHEET_NAME = os.getenv("SHEET_EXPORT_TODAY_NAME", "export_today")
 EXPORT_TOMORROW_SHEET_NAME = os.getenv("SHEET_EXPORT_TOMORROW_NAME", "export_tomorrow")
@@ -2853,6 +2853,71 @@ def _ensure_header(ws, header: list[str]) -> None:
     except Exception as e:
         print(f"[GSHEET][EXPORT] 헤더 확인/보정 실패: {e}")
         return
+
+
+def ensure_export_schema(ws, header: list[str]) -> None:
+    """export 계열 시트의 헤더/컬럼 순서를 보정한다.
+
+    - 헤더가 비어있으면 최신 header로 세팅
+    - 헤더에 필요한 컬럼들이 존재하지만 순서가 다르면: **데이터를 컬럼명 기준으로 재배치**하여 header 순서로 맞춤
+    - 그 외(전혀 다른 시트 등)는 헤더만 최신으로 갱신
+    """
+    try:
+        first = ws.row_values(1)
+    except Exception:
+        first = []
+
+    # 1) 비어있으면 헤더만 세팅
+    first_norm = [str(c).strip() for c in (first or []) if str(c).strip() != ""]
+    if not first_norm:
+        try:
+            ws.update(range_name="A1", values=[header])
+        except Exception:
+            ws.update("A1", [header])
+        return
+
+    # 2) 이미 최신이면 OK
+    if first_norm[: len(header)] == header:
+        return
+
+    # 3) 순서가 다르면 "컬럼명 기준"으로 재배치 (안전한 경우만)
+    # - src_id가 있어야 export 시트로 간주
+    if "src_id" in first_norm:
+        try:
+            values = ws.get_all_values()
+            if not values:
+                ws.update(range_name="A1", values=[header])
+                return
+            old_header = [str(c).strip() for c in (values[0] or [])]
+            old_map = {name: idx for idx, name in enumerate(old_header) if name}
+
+            # header에 있는 컬럼 중 old_header에 최소한 절반 이상이 존재하면 "같은 시트"로 보고 재배치
+            overlap = sum(1 for k in header if k in old_map)
+            if overlap >= max(3, int(len(header) * 0.5)):
+                new_values = [header]
+                for row in values[1:]:
+                    new_row = []
+                    for col_name in header:
+                        oi = old_map.get(col_name, -1)
+                        new_row.append(row[oi] if (oi != -1 and oi < len(row)) else "")
+                    new_values.append(new_row)
+
+                end_col = _col_letter(len(header))
+                rng = f"A1:{end_col}{len(new_values)}"
+                try:
+                    ws.update(range_name=rng, values=new_values)
+                except Exception:
+                    ws.update(rng, new_values)
+                return
+        except Exception as e:
+            print(f"[GSHEET][EXPORT] 헤더/컬럼 재배치 실패: {e}")
+
+    # 4) 마지막 fallback: 헤더만 최신으로 갱신
+    try:
+        ws.update(range_name="A1", values=[header])
+    except Exception:
+        ws.update("A1", [header])
+
 
 def append_site_export_rows(rows: list[list[str]]) -> bool:
     """
@@ -3053,8 +3118,19 @@ def _openai_generate_text_any(prompt: str, system: str, model: str, temperature:
     return ""
 
 
-def generate_export_comments(title: str, sport_label: str = "", count: int | None = None) -> str:
-    """OpenAI로 '인간 댓글' 5~6개(기본 6개)를 생성해서 줄바꿈 문자열로 반환.
+def generate_export_comments(
+    title: str,
+    sport_label: str = "",
+    count: int | None = None,
+    mode: str = "simple",
+    body_hint: str = "",
+    avoid_text: str = "",
+) -> str:
+    """OpenAI로 '인간 댓글'을 생성해서 줄바꿈 문자열로 반환한다.
+
+    mode:
+      - "simple": 일반(심플) 게시글용 댓글
+      - "deep":   심층 게시글용 댓글(더 디테일/심층 뉘앙스)
 
     ⚠️ 중요한 설계:
     - 실패해도 봇이 죽지 않도록 예외는 내부에서 처리
@@ -3063,6 +3139,10 @@ def generate_export_comments(title: str, sport_label: str = "", count: int | Non
     enabled = (os.getenv("EXPORT_COMMENT_ENABLED", "1").strip().lower() not in ("0", "false", "no"))
     if not enabled:
         return ""
+
+    mode = (mode or "simple").strip().lower()
+    if mode not in ("simple", "deep"):
+        mode = "simple"
 
     if count is None:
         try:
@@ -3081,7 +3161,8 @@ def generate_export_comments(title: str, sport_label: str = "", count: int | Non
     primary_model = (os.getenv("EXPORT_COMMENT_MODEL") or os.getenv("SIMPLE_REWRITE_MODEL") or os.getenv("OPENAI_MODEL") or "").strip()
     model_candidates = [m for m in [primary_model, "gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"] if m]
     # 중복 제거
-    seen = set(); model_candidates = [m for m in model_candidates if (m not in seen and not seen.add(m))]
+    seen = set()
+    model_candidates = [m for m in model_candidates if (m not in seen and not seen.add(m))]
 
     try:
         temperature = float((os.getenv("EXPORT_COMMENT_TEMPERATURE", "0.95") or "0.95").strip())
@@ -3094,11 +3175,37 @@ def generate_export_comments(title: str, sport_label: str = "", count: int | Non
     teams = parts.get("teams", "")
     date_s = parts.get("date", "")
 
+    body_hint = (body_hint or "").strip()
+    if body_hint:
+        # 프롬프트 폭주 방지(토큰/비용보다 안정성 우선)
+        if len(body_hint) > 1200:
+            body_hint = body_hint[:1200].rstrip() + "…"
+
+    avoid_text = (avoid_text or "").strip()
+    if avoid_text and len(avoid_text) > 600:
+        avoid_text = avoid_text[:600].rstrip() + "…"
+
+    # 모드별 요구사항 차등
+    extra_rules = ""
+    if mode == "deep":
+        extra_rules = (
+            "- '심층' 또는 '디테일' 또는 '전술' 중 1개 표현을 자연스럽게 포함(각 댓글마다 꼭 동일 단어일 필요는 없음)\n"
+            "- 너무 일반적인 칭찬만 하지 말고, 본문 힌트가 있으면 구체적인 포인트(예: 운영/압박/세트피스/매치업/로테이션 등)를 살짝 언급\n"
+        )
+
+    avoid_block = ""
+    if avoid_text:
+        avoid_block = f"\n중복 금지(아래 문장/표현을 그대로 따라하지 말 것):\n{avoid_text}\n"
+
+    body_block = ""
+    if mode == "deep" and body_hint:
+        body_block = f"\n본문 힌트(일부):\n{body_hint}\n"
+
     prompt = f"""아래 제목을 바탕으로 네이버 카페에 달기 좋은 한국어 댓글을 {count}개 만들어줘.
 
 제목:
 {t}
-
+{body_block}{avoid_block}
 요구사항(중요):
 - 출력은 댓글만. 번호/불릿/따옴표/머리말 금지.
 - 댓글은 각 1줄, 줄바꿈으로 구분.
@@ -3106,7 +3213,7 @@ def generate_export_comments(title: str, sport_label: str = "", count: int | Non
 - 제목에서 유추되는 '리그/대회명'과 '두 팀명'이 각 댓글에 반드시 들어가야 함.
 - 과장 광고, 도박/베팅 유도, 링크, 해시태그, 이모지, "AI"라는 단어 금지.
 - 너무 로봇처럼 반복하지 말고, 실제 사람이 분석글 읽고 남기는 자연스러운 톤.
-
+{extra_rules}
 참고 정보(있으면 반영):
 - 날짜: {date_s or "(없음)"}
 - 리그/대회: {league or "(없음)"}
@@ -3132,7 +3239,7 @@ def generate_export_comments(title: str, sport_label: str = "", count: int | Non
         return ""
 
     # 파싱/정리
-    lines = []
+    out_lines: list[str] = []
     for line in (content or "").splitlines():
         s = (line or "").strip()
         if not s:
@@ -3142,31 +3249,42 @@ def generate_export_comments(title: str, sport_label: str = "", count: int | Non
         if not s:
             continue
         # 너무 길면 살짝 컷(셀 가독성)
-        if len(s) > 160:
-            s = s[:160].rstrip() + "…"
-        lines.append(s)
+        if len(s) > 170:
+            s = s[:170].rstrip() + "…"
+        out_lines.append(s)
 
     # 중복 제거(순서 유지)
-    seen = set()
-    uniq = []
-    for s in lines:
-        if s in seen:
+    seen2 = set()
+    uniq: list[str] = []
+    for s in out_lines:
+        if s in seen2:
             continue
-        seen.add(s)
+        seen2.add(s)
         uniq.append(s)
 
     if not uniq:
         return ""
 
-    # count 맞추기
     uniq = uniq[:count]
     return "\n".join(uniq).strip()
 
+
+def generate_export_comments_pair(title: str, sport_label: str = "", body_hint: str = "", count: int | None = None) -> tuple[str, str]:
+    """(comments, deep_comments) 쌍을 생성한다. deep 쪽은 simple 쪽과 중복을 피하도록 유도한다."""
+    comments = generate_export_comments(title=title, sport_label=sport_label, count=count, mode="simple")
+    deep_comments = generate_export_comments(title=title, sport_label=sport_label, count=count, mode="deep", body_hint=body_hint, avoid_text=comments)
+    return (comments or "").strip(), (deep_comments or "").strip()
+
 def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
     """지정 export 시트에 rows를 append.
-    row 포맷:
+
+    입력 row 포맷(호환):
       - 기본: [day, sport, src_id, title, body, createdAt]
-      - 확장: [.., simple] 또는 [.., simple, comments]
+      - 확장(구버전): [.., simple, comments, cafe_title, cafe_url, cafe_url_deep]
+      - 확장(신버전): EXPORT_HEADER 길이만큼
+
+    저장 포맷(항상 EXPORT_HEADER 순서):
+      day, sport, src_id, title, body, createdAt, simple, cafe_title, cafe_url, comments, cafe_url_deep, deep_comments
     """
     if not rows:
         return True
@@ -3175,49 +3293,104 @@ def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
     if not ws:
         return False
 
+    # 컬럼 인덱스(헤더명 기반)
+    def _h(name: str, fallback: int) -> int:
+        try:
+            return EXPORT_HEADER.index(name)
+        except ValueError:
+            return fallback
+
+    i_day = _h("day", 0)
+    i_sport = _h("sport", 1)
+    i_src = _h("src_id", 2)
+    i_title = _h("title", 3)
+    i_body = _h("body", 4)
+    i_created = _h("createdAt", 5)
+    i_simple = _h("simple", 6)
+    i_cafe_title = _h("cafe_title", 7)
+    i_cafe_url = _h("cafe_url", 8)
+    i_comments = _h("comments", 9)
+    i_cafe_url_deep = _h("cafe_url_deep", 10)
+    i_deep_comments = _h("deep_comments", 11)
+
     fixed_rows: list[list[str]] = []
     for r in rows:
         if not r:
             continue
-        rr = list(r)
+        legacy = list(r)
 
-        # 최소 6컬럼 맞춤
-        while len(rr) < 6:
-            rr.append("")
+        # 최소 6컬럼 맞춤(기본 필드)
+        while len(legacy) < 6:
+            legacy.append("")
 
-        day = rr[0] if len(rr) > 0 else ""
-        sport_label = rr[1] if len(rr) > 1 else ""
-        title = rr[3] if len(rr) > 3 else ""
+        # 신버전(이미 EXPORT_HEADER 길이 이상)이면 우선 그대로 사용
+        if len(legacy) >= len(EXPORT_HEADER):
+            rr = legacy[: len(EXPORT_HEADER)]
+        else:
+            # 구버전/기본 포맷 → 신 헤더로 매핑
+            rr = [""] * len(EXPORT_HEADER)
+            rr[i_day] = legacy[0]
+            rr[i_sport] = legacy[1]
+            rr[i_src] = legacy[2]
+            rr[i_title] = legacy[3]
+            rr[i_body] = legacy[4]
+            rr[i_created] = legacy[5]
 
-        # simple (G) 보정
-        if len(rr) == 6:
-            rr.append(extract_simple_from_body(rr[4] if len(rr) > 4 else ""))
-        elif len(rr) >= 7:
-            # 7+인 경우 G가 비어있으면 만들어줌
-            if not str(rr[6]).strip():
-                rr[6] = extract_simple_from_body(rr[4] if len(rr) > 4 else "")
-            rr = rr[: max(7, len(rr))]  # keep
+            # simple(구버전: index 6)
+            if len(legacy) > 6:
+                rr[i_simple] = legacy[6]
 
-        # comments (H) 보정/생성
-        # - 새 행이 6~7컬럼만 들어오면 simple(G)/comments(H)를 생성해 채움
-        # - EXPORT_HEADER 확장(cafe_* 컬럼 등)이 있어도 길이를 맞춰 append
-        if len(rr) < 8 or not str(rr[7]).strip():
-            base_title = (title or "").strip()
-            if not base_title:
-                # simple 첫 줄을 사용(사용자 설명: simple 첫문장이 제목 역할)
-                simple_txt = (rr[6] if len(rr) > 6 else "") or ""
-                base_title = (simple_txt.splitlines()[0] if simple_txt else "").strip()
-            comments = generate_export_comments(base_title, sport_label=sport_label)
-            # rr 길이에 상관없이 H(7) 위치에 반영
-            while len(rr) < 8:
-                rr.append("")
-            rr[7] = (comments or "").strip()
+            # comments/cafe_*(구버전 헤더: simple 다음에 comments, cafe_title, cafe_url, cafe_url_deep)
+            if len(legacy) > 7:
+                rr[i_comments] = legacy[7]
+            if len(legacy) > 8:
+                rr[i_cafe_title] = legacy[8]
+            if len(legacy) > 9:
+                rr[i_cafe_url] = legacy[9]
+            if len(legacy) > 10:
+                rr[i_cafe_url_deep] = legacy[10]
 
-        # 확장 컬럼(cafe_title/cafe_url/cafe_url_deep)까지 길이 맞추기
-        while len(rr) < len(EXPORT_HEADER):
-            rr.append("")
+        day = rr[i_day] if i_day < len(rr) else ""
+        sport_label = rr[i_sport] if i_sport < len(rr) else ""
+        title = rr[i_title] if i_title < len(rr) else ""
+        body = rr[i_body] if i_body < len(rr) else ""
 
-        # 초과 컬럼은 버림
+        # simple 보정(비어있으면 body에서 추출)
+        if i_simple < len(rr) and not str(rr[i_simple]).strip():
+            rr[i_simple] = extract_simple_from_body(body)
+
+        # base_title: 우선 title, 없으면 simple 첫 줄
+        base_title = (title or "").strip()
+        if not base_title:
+            simple_txt = (rr[i_simple] if i_simple < len(rr) else "") or ""
+            base_title = (simple_txt.splitlines()[0] if simple_txt else "").strip()
+
+        # comments(심플용) 생성/보정
+        if i_comments < len(rr) and (not str(rr[i_comments]).strip()):
+            comments, deep_comments = generate_export_comments_pair(
+                title=base_title,
+                sport_label=str(sport_label or "").strip(),
+                body_hint=str(body or "").strip(),
+            )
+            rr[i_comments] = (comments or "").strip()
+            # deep_comments도 동시에 채워주되, 이미 값이 있으면 유지
+            if i_deep_comments < len(rr) and (not str(rr[i_deep_comments]).strip()):
+                rr[i_deep_comments] = (deep_comments or "").strip()
+        else:
+            # comments가 이미 있고 deep_comments만 비어있으면 deep만 생성
+            if i_deep_comments < len(rr) and (not str(rr[i_deep_comments]).strip()):
+                deep_comments = generate_export_comments(
+                    title=base_title,
+                    sport_label=str(sport_label or "").strip(),
+                    mode="deep",
+                    body_hint=str(body or "").strip(),
+                    avoid_text=str(rr[i_comments] if i_comments < len(rr) else ""),
+                )
+                rr[i_deep_comments] = (deep_comments or "").strip()
+
+        # rr 길이 보정
+        if len(rr) < len(EXPORT_HEADER):
+            rr += [""] * (len(EXPORT_HEADER) - len(rr))
         if len(rr) > len(EXPORT_HEADER):
             rr = rr[: len(EXPORT_HEADER)]
 
@@ -3233,21 +3406,22 @@ def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
         print(f"[GSHEET][EXPORT] append 실패({sheet_name}): {e}")
         return False
 
-
-
-
-
-# ───────────────── Export H열(OpenAI 댓글) 채우기 ─────────────────
+# ───────────────── Export 댓글 채우기(OpenAI) ─────────────────
 
 async def export_comment_fill(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """기존 export 시트의 H열(comments)을 채운다.
+    """기존 export 시트의 comments / deep_comments 컬럼을 채운다.
 
     사용:
       /export_comment_fill
-      /export_comment_fill today|tomorrow|all [limit] [force]
+      /export_comment_fill today|tomorrow|all [limit] [force] [deep|both]
 
-    - 기본: tomorrow 시트에서 H열이 비어있는 행을 최신순으로 최대 30개 채움
-    - force: 이미 값이 있어도 덮어쓰기
+    기본 동작:
+      - tomorrow 시트에서 comments(심플용)가 비어있는 행을 최신순으로 최대 30개 채움
+
+    옵션:
+      - deep : deep_comments(심층용)만 채움
+      - both : comments + deep_comments를 함께 채움(비어있는 것만)
+      - force: 이미 값이 있어도 덮어쓰기
     """
     if not is_admin(update):
         await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
@@ -3257,6 +3431,7 @@ async def export_comment_fill(update: Update, context: ContextTypes.DEFAULT_TYPE
     target = "tomorrow"
     limit = 30
     force = False
+    mode = "simple"  # simple | deep | both
 
     for a in args:
         al = a.lower()
@@ -3269,6 +3444,10 @@ async def export_comment_fill(update: Update, context: ContextTypes.DEFAULT_TYPE
                 pass
         elif al in ("force", "overwrite"):
             force = True
+        elif al in ("deep", "deep_comments", "deepcomment", "deepcomments"):
+            mode = "deep"
+        elif al in ("both", "allcols", "allcol", "bothcols"):
+            mode = "both"
 
     limit = max(1, min(int(limit), 200))
 
@@ -3284,780 +3463,135 @@ async def export_comment_fill(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("EXPORT_COMMENT_ENABLED=0 상태라 댓글 생성이 비활성화되어 있습니다.")
         return
 
-    total = 0
-    candidates = 0
-    reports = []
+    total_updated_simple = 0
+    total_updated_deep = 0
 
     for sheet_name in sheet_names:
         ws = get_export_ws(sheet_name)
         if not ws:
-            reports.append(f"- {sheet_name}: 워크시트 열기 실패")
+            await update.message.reply_text(f"{sheet_name} 시트를 찾을 수 없습니다.")
             continue
 
-        # 헤더 보정(구버전 7컬럼 → 8컬럼)
-        _ensure_header(ws, EXPORT_HEADER)
-
         try:
-            values = ws.get_all_values()
+            vals = ws.get_all_values()
         except Exception as e:
-            reports.append(f"- {sheet_name}: 시트 읽기 실패({e})")
+            await update.message.reply_text(f"{sheet_name} 읽기 실패: {e}")
             continue
 
-        if not values or len(values) <= 1:
-            reports.append(f"- {sheet_name}: 데이터 없음")
+        if not vals or len(vals) <= 1:
             continue
 
-        header = [c.strip() for c in (values[0] or [])]
-        if "comments" not in header:
-            # header가 prefix였는데도 남아있으면 강제로 최신 헤더 1회 반영
+        header = vals[0]
+
+        def _idx(name: str, fallback: int) -> int:
             try:
-                ws.update(range_name="A1", values=[EXPORT_HEADER])
-                header = EXPORT_HEADER[:]
-                # values도 헤더만 바뀐거라 그대로 사용 가능
-            except Exception as e:
-                reports.append(f"- {sheet_name}: 헤더 업데이트 실패({e})")
-                continue
+                return header.index(name)
+            except ValueError:
+                return fallback
 
-        # 인덱스 확보
-        try:
-            idx_comments = header.index("comments")
-        except ValueError:
-            reports.append(f"- {sheet_name}: comments 컬럼 없음")
-            continue
+        i_sport = _idx("sport", 1)
+        i_title = _idx("title", 3)
+        i_body = _idx("body", 4)
+        i_simple = _idx("simple", 6)
+        i_comments = _idx("comments", 9)
+        i_deep = _idx("deep_comments", 11)
 
-        idx_title = header.index("title") if "title" in header else None
-        idx_simple = header.index("simple") if "simple" in header else None
-        idx_sport = header.index("sport") if "sport" in header else None
+        # deep_comments 컬럼이 없는 상태면 알려주기
+        if mode in ("deep", "both") and ("deep_comments" not in header):
+            await update.message.reply_text(f"{sheet_name} 시트에 deep_comments 컬럼이 없습니다. 헤더 보정이 필요합니다.")
+            # 계속 진행(헤더 재배치가 실패했거나 수동 수정 중일 수 있음)
 
-        filled = 0
+        updates: list[dict] = []
+        updated_simple = 0
+        updated_deep = 0
 
-        # 최신 행부터(append 구조라 bottom이 최신)
-        for i in range(len(values) - 1, 0, -1):
-            if filled >= limit:
-                break
-            row = values[i] or []
-            cur = (row[idx_comments] if len(row) > idx_comments else "").strip()
-            if cur and not force:
-                continue
+        # 최신순(아래쪽)부터 채우기
+        for row_idx, r in enumerate(reversed(vals[1:]), start=2):
+            # reversed에서 row_idx 계산은 실제 행번호와 다르므로 재계산
+            real_row_idx = len(vals) - (row_idx - 2)
 
-            sport_label = (row[idx_sport] if (idx_sport is not None and len(row) > idx_sport) else "").strip()
+            sportv = (r[i_sport] if len(r) > i_sport else "").strip()
+            titlev = (r[i_title] if len(r) > i_title else "").strip()
+            bodyv = (r[i_body] if len(r) > i_body else "").strip()
+            simplev = (r[i_simple] if len(r) > i_simple else "").strip()
+            comments_raw = (r[i_comments] if len(r) > i_comments else "").strip() if i_comments >= 0 else ""
+            deep_raw = (r[i_deep] if len(r) > i_deep else "").strip() if i_deep >= 0 else ""
 
-            title = (row[idx_title] if (idx_title is not None and len(row) > idx_title) else "").strip()
-            base_title = title
-            if not base_title and idx_simple is not None and len(row) > idx_simple:
-                simple_txt = (row[idx_simple] or "").strip()
-                base_title = (simple_txt.splitlines()[0] if simple_txt else "").strip()
-
+            base_title = titlev or (simplev.splitlines()[0].strip() if simplev else "")
             if not base_title:
                 continue
 
-            candidates += 1
+            need_simple = (mode in ("simple", "both")) and (force or not comments_raw)
+            need_deep = (mode in ("deep", "both")) and (force or not deep_raw)
 
-            comments = generate_export_comments(base_title, sport_label=sport_label)
-            if not comments:
+            if not (need_simple or need_deep):
                 continue
 
-            row_num = i + 1  # sheet row number
+            # limit 적용: "생성 작업 수" 기준(경기 기준)
+            if (updated_simple + updated_deep) >= limit:
+                break
+
+            # 생성
+            new_comments = comments_raw
+            new_deep = deep_raw
+
             try:
-                ws.update_cell(row_num, idx_comments + 1, comments)
-                filled += 1
-                total += 1
-            except Exception as e:
-                print(f"[GSHEET][EXPORT_COMMENT] update_cell 실패 row={row_num}: {e}")
-                continue
-
-        reports.append(f"- {sheet_name}: {filled}건 {'(덮어쓰기)' if force else ''}".rstrip())
-
-    extra = ''
-    if total == 0 and candidates > 0:
-        # OpenAI 생성 실패 가능성 안내
-        if EXPORT_COMMENT_LAST_ERROR:
-            extra = f"\n\n⚠️ OpenAI 댓글 생성이 실패한 것 같습니다.\n- 마지막 오류: {EXPORT_COMMENT_LAST_ERROR}"
-        else:
-            extra = '\n\n⚠️ 댓글을 생성할 대상 행은 있었지만 생성 결과가 비어있습니다. Render 로그에서 [OPENAI][EXPORT_COMMENT]를 확인해 주세요.'
-
-    await update.message.reply_text("✅ export 댓글 생성 완료\n" + "\n".join(reports) + f"\n총 {total}건" + extra)
-
-# ───────────────── Naver Cafe → Google Sheet (youtoo 탭) ─────────────────
-# youtoo 탭: 카페 게시글 백업/수집용
-
-YOUTOO_SHEET_NAME = (os.getenv("YOUTOO_SHEET_NAME") or "youtoo").strip()
-
-# ✅ 사용자가 원하는 최종 헤더 순서(고정)
-# ✅ 사용자가 원하는 자동 수집 헤더 순서(고정)  (A~K)
-YOUTOO_AUTO_HEADER = [
-    "src_id",
-    "경기",
-    "댓글수",
-    "조회수",
-    "좋아요",
-    "본문링크",
-    "첫댓글내용",
-    "첫댓글작성자",
-    "첫댓글시간",
-    "게시시간(날짜)",
-    "별명",
-]
-
-# ✅ 수기 입력 컬럼 (L~M) - 봇이 절대 덮어쓰지 않음
-YOUTOO_MANUAL_HEADER = [
-    "실벳",
-    "지급여부",
-]
-
-# 전체 헤더(A~M)
-YOUTOO_HEADER = YOUTOO_AUTO_HEADER + YOUTOO_MANUAL_HEADER
-
-def _col_letter(n: int) -> str:
-    """1-indexed column number -> A1 column letter."""
-    s = ""
-    x = int(n)
-    while x > 0:
-        x, r = divmod(x - 1, 26)
-        s = chr(65 + r) + s
-    return s
-
-# 자동 갱신 범위(A~K)의 끝 컬럼(기본: K)
-YOUTOO_AUTO_END_COL = _col_letter(len(YOUTOO_AUTO_HEADER))
-
-# 과거 버전/표기 차이 호환(자동 마이그레이션용)
-_YOUTOO_COL_ALIASES: dict[str, list[str]] = {
-    "첫댓글내용": ["첫댓글"],
-    "첫댓글작성자": ["첫댓글별명", "첫댓글닉네임"],
-    "실벳": ["실제 베팅", "실제배팅", "실뱃"],
-    "지급여부": ["지급 여부"],
-}
-
-def _youtoo_find_header_index(old_header: list[str], col: str) -> int | None:
-    """old_header에서 col(또는 별칭)의 위치를 찾는다."""
-    try:
-        return old_header.index(col)
-    except ValueError:
-        pass
-    for alt in _YOUTOO_COL_ALIASES.get(col, []):
-        try:
-            return old_header.index(alt)
-        except ValueError:
-            continue
-    return None
-
-
-def ensure_youtoo_header(ws) -> None:
-    """youtoo 시트 헤더를 최신 스펙으로 맞춘다.
-
-    - A~K: 봇이 자동 수집/갱신하는 컬럼
-    - L~M: 사람이 수기로 입력하는 컬럼(실벳/지급여부) → ✅ 봇이 절대 덮어쓰지 않음
-
-    헤더가 어긋난 과거 버전(구/신 헤더 혼재)도 가능한 범위 내에서 자동 마이그레이션한다.
-    """
-    try:
-        values = ws.get_all_values()
-    except Exception:
-        values = []
-
-    # 시트가 비어있으면 헤더부터 세팅
-    if not values:
-        try:
-            if getattr(ws, "col_count", 0) < len(YOUTOO_HEADER):
-                ws.resize(cols=len(YOUTOO_HEADER))
-        except Exception:
-            pass
-        ws.update(range_name="A1", values=[YOUTOO_HEADER])
-        return
-
-    # get_all_values()는 "헤더 행의 빈 셀"을 끝까지 반환하지 않을 수 있으므로,
-    # 전체 데이터에서 가장 긴 열 길이를 기준으로 헤더를 패딩한다.
-    max_cols = max([len(r) for r in values] + [len(YOUTOO_HEADER)])
-    raw_header = list(values[0] or [])
-    header = [str(c).strip() for c in raw_header] + [""] * (max_cols - len(raw_header))
-
-    # 필요한 경우에만 cols 확장(절대 축소 금지)
-    try:
-        desired_cols = max(len(YOUTOO_HEADER), max_cols)
-        if getattr(ws, "col_count", 0) < desired_cols:
-            ws.resize(cols=desired_cols)
-    except Exception:
-        pass
-
-    auto_len = len(YOUTOO_AUTO_HEADER)
-    auto_match = [str(c).strip() for c in header[:auto_len]] == YOUTOO_AUTO_HEADER
-
-    # ✅ A~K 헤더가 이미 맞으면: L/M 헤더만 보정하고(필요 시) 끝낸다. (수기 데이터 보호)
-    if auto_match:
-        # 헤더 배열 길이 보정
-        if len(header) < len(YOUTOO_HEADER):
-            header += [""] * (len(YOUTOO_HEADER) - len(header))
-
-        for i, name in enumerate(YOUTOO_MANUAL_HEADER):
-            col_idx_1based = auto_len + 1 + i  # L=12, M=13
-            cur = str(header[auto_len + i] or "").strip()
-            if cur == name:
-                continue
-            # 헤더 셀만 업데이트 (데이터 행은 건드리지 않음)
-            try:
-                ws.update_cell(1, col_idx_1based, name)
-            except Exception:
-                try:
-                    ws.update(f"{_col_letter(col_idx_1based)}1", [[name]])
-                except Exception:
-                    pass
-        return
-
-    # ✅ 헤더가 과거 버전이면: 가능한 범위에서 전체 마이그레이션(수기 L/M도 보존)
-    old_header = header  # 패딩된 헤더
-
-    new_rows: list[list[str]] = []
-    for row in values[1:]:
-        rp = list(row) + [""] * (max_cols - len(row))
-        nr: list[str] = []
-        for col_name in YOUTOO_HEADER:
-            idx = _youtoo_find_header_index(old_header, col_name)
-            if idx is None:
-                # 헤더명이 비어있던 경우를 대비해, L/M은 "위치 기반"으로도 복원 시도
-                if col_name in YOUTOO_MANUAL_HEADER:
-                    pos = YOUTOO_HEADER.index(col_name)
-                    nr.append(rp[pos] if pos < len(rp) else "")
+                if need_simple and need_deep and (not comments_raw) and (not deep_raw):
+                    # 둘 다 비어있으면 pair 생성(중복 회피 유도)
+                    new_comments, new_deep = generate_export_comments_pair(
+                        title=base_title,
+                        sport_label=sportv,
+                        body_hint=bodyv,
+                    )
                 else:
-                    nr.append("")
-            else:
-                nr.append(rp[idx] if idx < len(rp) else "")
-
-        # 완전 빈 행은 건너뛰기(공백 공간 누적 방지)
-        if any((x or "").strip() for x in nr):
-            new_rows.append(nr)
-
-    try:
-        ws.clear()
-    except Exception:
-        pass
-
-    try:
-        if getattr(ws, "col_count", 0) < len(YOUTOO_HEADER):
-            ws.resize(cols=len(YOUTOO_HEADER))
-    except Exception:
-        pass
-
-    ws.update(range_name="A1", values=[YOUTOO_HEADER] + new_rows, value_input_option="RAW")
-
-def get_youtoo_ws():
-    """youtoo 탭 워크시트 반환(없으면 생성 + 헤더 세팅)."""
-    client_gs = get_gs_client()
-    spreadsheet_id = os.getenv("SPREADSHEET_ID")
-    if not (client_gs and spreadsheet_id):
-        return None
-
-    try:
-        sh = client_gs.open_by_key(spreadsheet_id)
-        ws = _get_ws_by_name(sh, YOUTOO_SHEET_NAME)
-        if not ws:
-            ws = sh.add_worksheet(title=YOUTOO_SHEET_NAME, rows=2000, cols=max(10, len(YOUTOO_HEADER)))
-
-        # ✅ cols는 "필요할 때만 확장" (절대 축소 금지: 수기 L/M 보호)
-        try:
-            if getattr(ws, "col_count", 0) < len(YOUTOO_HEADER):
-                ws.resize(cols=len(YOUTOO_HEADER))
-        except Exception:
-            pass
-
-        ensure_youtoo_header(ws)
-        return ws
-    except Exception as e:
-        print(f"[GSHEET][YOUTOO] 워크시트 준비 실패({YOUTOO_SHEET_NAME}): {e}")
-        return None
-
-
-def get_existing_youtoo_src_ids() -> set[str]:
-    """youtoo 시트에서 src_id 목록을 읽어 중복/업데이트 판단용 set으로 반환."""
-    ws = get_youtoo_ws()
-    if not ws:
-        return set()
-
-    try:
-        values = ws.get_all_values()
-        if not values:
-            return set()
-
-        header = [c.strip() for c in values[0]]
-        try:
-            idx = header.index("src_id")
-        except ValueError:
-            return set()
-
-        out: set[str] = set()
-        for row in values[1:]:
-            if len(row) > idx:
-                v = (row[idx] or "").strip()
-                if v:
-                    out.add(v)
-        return out
-    except Exception as e:
-        print(f"[GSHEET][YOUTOO] 기존 src_id 로딩 실패: {e}")
-        return set()
-
-
-def upsert_youtoo_rows_top(rows: list[list[str]]) -> tuple[bool, int, int]:
-    """youtoo 시트에 rows를 upsert 하되, ✅ 신규는 2행(헤더 아래)에 삽입해서 '위로 업데이트'되게 만든다.
-
-    반환: (ok, inserted_count, updated_count)
-
-    - src_id 기준으로 중복을 판단한다.
-    - 이미 존재하면 해당 행을 덮어쓴다(댓글수/조회수/좋아요 등이 갱신될 수 있으므로).
-    - 신규는 insert_rows(row=2)로 상단에 붙인다.
-    """
-    if not rows:
-        return True, 0, 0
-
-    ws = get_youtoo_ws()
-    if not ws:
-        return False, 0, 0
-
-    # 헤더 보정/마이그레이션
-    ensure_youtoo_header(ws)
-
-    try:
-        values = ws.get_all_values()
-    except Exception:
-        values = []
-
-    if not values:
-        ws.update(range_name="A1", values=[YOUTOO_HEADER])
-        values = [YOUTOO_HEADER]
-
-    header = [c.strip() for c in values[0]]
-    try:
-        idx_src = header.index("src_id")
-    except ValueError:
-        idx_src = 0
-
-    # src_id -> row_number(1-indexed)
-    existing_map: dict[str, int] = {}
-    for i, row in enumerate(values[1:], start=2):
-        if len(row) > idx_src:
-            sid = (row[idx_src] or "").strip()
-            if sid and sid not in existing_map:
-                existing_map[sid] = i
-
-    updated = 0
-    to_insert: list[list[str]] = []
-    seen: set[str] = set()
-
-    # 1) 기존 행 업데이트(삽입 전에 수행해야 row index가 흔들리지 않음)
-    for r in rows:
-        if not r:
-            continue
-        rr = list(r)
-        if len(rr) < len(YOUTOO_HEADER):
-            rr += [""] * (len(YOUTOO_HEADER) - len(rr))
-        elif len(rr) > len(YOUTOO_HEADER):
-            rr = rr[: len(YOUTOO_HEADER)]
-
-        sid = (rr[idx_src] or "").strip()
-        if (not sid) or (sid in seen):
-            continue
-        seen.add(sid)
-
-        if sid in existing_map:
-            row_num = existing_map[sid]
-            try:
-                rr_auto = rr[: len(YOUTOO_AUTO_HEADER)]
-                ws.update(f"A{row_num}:{YOUTOO_AUTO_END_COL}{row_num}", [rr_auto], value_input_option="RAW")
-                updated += 1
+                    if need_simple:
+                        new_comments = generate_export_comments(
+                            title=base_title,
+                            sport_label=sportv,
+                            mode="simple",
+                        )
+                    if need_deep:
+                        new_deep = generate_export_comments(
+                            title=base_title,
+                            sport_label=sportv,
+                            mode="deep",
+                            body_hint=bodyv,
+                            avoid_text=new_comments if new_comments else comments_raw,
+                        )
             except Exception as e:
-                print(f"[GSHEET][YOUTOO] update 실패(src_id={sid}): {e}")
-        else:
-            to_insert.append(rr)
-
-    inserted = 0
-    if to_insert:
-        try:
-            # ✅ 신규는 맨 위(2행)에 넣어서 최신이 위로 오게 한다.
-            ws.insert_rows(to_insert, row=2, value_input_option="RAW")
-            inserted = len(to_insert)
-        except Exception as e:
-            print(f"[GSHEET][YOUTOO] insert_rows 오류: {e}")
-            return False, inserted, updated
-
-    print(f"[GSHEET][YOUTOO] {YOUTOO_SHEET_NAME}: inserted={inserted}, updated={updated}")
-    return True, inserted, updated
-
-
-def get_existing_site_src_ids(day_str: str) -> set[str]:
-    """site_export 탭에서 day가 같은 행들의 src_id를 set으로 가져와 중복 저장 방지."""
-    client_gs = get_gs_client()
-    spreadsheet_id = os.getenv("SPREADSHEET_ID")
-    if not (client_gs and spreadsheet_id):
-        return set()
-
-    try:
-        sh = client_gs.open_by_key(spreadsheet_id)
-        ws = sh.worksheet(SITE_EXPORT_SHEET_NAME)
-        values = ws.get_all_values()
-        if not values or len(values) < 2:
-            return set()
-
-        header = values[0]
-        idx_day = header.index("day") if "day" in header else 0
-        idx_src = header.index("src_id") if "src_id" in header else 2
-
-        out = set()
-        for r in values[1:]:
-            if len(r) <= max(idx_day, idx_src):
+                print(f"[OPENAI][EXPORT_COMMENT] 생성 예외: {e}")
                 continue
-            if (r[idx_day] or "").strip() == day_str:
-                sid = (r[idx_src] or "").strip()
-                if sid:
-                    out.add(sid)
-        return out
-    except Exception as e:
-        print(f"[GSHEET][SITE_EXPORT] 기존 src_id 로딩 실패: {e}")
-        return set()
 
-def get_existing_analysis_ids(day_key: str) -> set[str]:
-    """
-    today / tomorrow 시트에서 이미 저장된 id 값들을 set으로 가져온다.
-    (중복 크롤링 방지용)
-    """
-    client_gs = get_gs_client()
-    spreadsheet_id = os.getenv("SPREADSHEET_ID")
-
-    if not (client_gs and spreadsheet_id):
-        return set()
-
-    sheet_today_name = os.getenv("SHEET_TODAY_NAME", "today")
-    sheet_tomorrow_name = os.getenv("SHEET_TOMORROW_NAME", "tomorrow")
-    sheet_name = sheet_today_name if day_key == "today" else sheet_tomorrow_name
-
-    try:
-        sh = client_gs.open_by_key(spreadsheet_id)
-        ws = sh.worksheet(sheet_name)
-    except Exception:
-        return set()
-
-    rows = ws.get_all_values()
-    if not rows:
-        return set()
-
-    header = rows[0]
-
-    def safe_index(name, default):
-        try:
-            return header.index(name)
-        except ValueError:
-            return default
-
-    idx_sport = safe_index("sport", 0)
-    idx_id = safe_index("id", 1)
-
-    existing: set[str] = set()
-    for row in rows[1:]:
-        if len(row) <= idx_id:
-            continue
-        row_id = (row[idx_id] if len(row) > idx_id else "").strip()
-        if row_id:
-            existing.add(row_id)
-
-    return existing
-
-NEWS_DATA = {}
-
-
-def _load_news_sheet(sh, sheet_name: str) -> dict:
-    """
-    구글시트에서 뉴스 탭을 읽어서
-    {
-        sport: [ {id,title,summary}, ... ]
-    } 구조로 변환
-    """
-    try:
-        ws = sh.worksheet(sheet_name)
-    except Exception as e:
-        print(f"[GSHEET] 뉴스 시트 '{sheet_name}' 열기 실패: {e}")
-        return {}
-
-    rows = ws.get_all_values()
-    if not rows:
-        return {}
-
-    header = rows[0]
-
-    idx_sport = 0
-    idx_id = 1
-    idx_title = 2
-    idx_summary = 3
-
-    def safe_index(name, default):
-        try:
-            return header.index(name)
-        except ValueError:
-            return default
-
-    idx_sport = safe_index("sport", idx_sport)
-    idx_id = safe_index("id", idx_id)
-    idx_title = safe_index("title", idx_title)
-    idx_summary = safe_index("summary", idx_summary)
-
-    data: dict[str, list[dict]] = {}
-
-    for row in rows[1:]:
-        if len(row) <= idx_title:
-            continue
-
-        sport = (row[idx_sport] if len(row) > idx_sport else "").strip()
-        if not sport:
-            continue
-
-        item_id = (row[idx_id] if len(row) > idx_id else "").strip()
-        title = (row[idx_title] if len(row) > idx_title else "").strip()
-        summary = (row[idx_summary] if len(row) > idx_summary else "").strip()
-
-        if not title:
-            continue
-
-        if not item_id:
-            cur_len = len(data.get(sport, []))
-            item_id = f"{sport}_news_{cur_len + 1}"
-
-        entry = {
-            "id": item_id,
-            "title": title,
-            "summary": summary,
-        }
-        data.setdefault(sport, []).append(entry)
-
-    return data
-
-
-def reload_news_from_sheet():
-    """구글시트에서 뉴스 탭을 읽어서 NEWS_DATA 갱신"""
-    global NEWS_DATA
-    client = get_gs_client()
-    spreadsheet_id = os.getenv("SPREADSHEET_ID")
-
-    if not client or not spreadsheet_id:
-        print("[GSHEET] 뉴스용 SPREADSHEET 연동 실패 → 기존 하드코딩 NEWS_DATA 사용.")
-        return
-
-    try:
-        sh = client.open_by_key(spreadsheet_id)
-    except Exception as e:
-        print(f"[GSHEET] 뉴스 스프레드시트 열기 실패: {e}")
-        return
-
-    sheet_news_name = os.getenv("SHEET_NEWS_NAME", "news")
-    print(f"[GSHEET] '{sheet_news_name}' 탭에서 뉴스 데이터 로딩 시도")
-
-    try:
-        news_data = _load_news_sheet(sh, sheet_news_name)
-    except Exception as e:
-        print(f"[GSHEET] 뉴스 시트 데이터 로딩 중 오류: {e}")
-        return
-
-    NEWS_DATA = news_data
-    print("[GSHEET] NEWS_DATA 갱신 완료")
-
-
-# ───────────────── 키보드/메뉴 구성 ─────────────────
-
-def build_reply_keyboard() -> ReplyKeyboardMarkup:
-    """봇 1:1 테스트용 간단 하단 키보드"""
-    menu = [
-        ["메뉴 미리보기", "도움말"],
-    ]
-    return ReplyKeyboardMarkup(menu, resize_keyboard=True)
-
-
-def build_main_inline_menu() -> InlineKeyboardMarkup:
-    """
-    메인 인라인 메뉴 (채널/미리보기 공통)
-    채널에서는 이 버튼을 눌러 각자 봇 DM으로 이동하게 함.
-    """
-    today_str, tomorrow_str = get_date_labels()
-
-    buttons = [
-        [InlineKeyboardButton("실시간 무료 중계", url="https://goat-tv.com")],
-        [
-            InlineKeyboardButton(
-                f"{today_str} 경기 분석픽",
-                url=f"https://t.me/{BOT_USERNAME}?start=today",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                f"{tomorrow_str} 경기 분석픽",
-                url=f"https://t.me/{BOT_USERNAME}?start=tomorrow",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "스포츠 뉴스 요약",
-                url=f"https://t.me/{BOT_USERNAME}?start=news",
-            )
-        ],
-    ]
-    return InlineKeyboardMarkup(buttons)
-
-
-def build_analysis_category_menu(key: str) -> InlineKeyboardMarkup:
-    # key = "today" or "tomorrow"
-    buttons = [
-        [InlineKeyboardButton("⚽️축구⚽️", callback_data=f"analysis_cat:{key}:축구")],
-        [InlineKeyboardButton("🏀농구🏀", callback_data=f"analysis_cat:{key}:농구")],
-        [InlineKeyboardButton("⚾️야구⚾️", callback_data=f"analysis_cat:{key}:야구")],
-        [InlineKeyboardButton("🏐배구🏐", callback_data=f"analysis_cat:{key}:배구")],
-        [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
-    ]
-    return InlineKeyboardMarkup(buttons)
-
-def build_soccer_subcategory_menu(key: str) -> InlineKeyboardMarkup:
-    """
-    축구 선택 후 나오는 2단계 메뉴:
-    해외축구 / K리그 / J리그
-    key = "today" 또는 "tomorrow"
-    """
-    buttons = [
-        [InlineKeyboardButton("해외축구", callback_data=f"soccer_cat:{key}:해외축구")],
-        [InlineKeyboardButton("K리그", callback_data=f"soccer_cat:{key}:K리그")],
-        [InlineKeyboardButton("J리그", callback_data=f"soccer_cat:{key}:J리그")],
-        [InlineKeyboardButton("◀ 종목 선택으로", callback_data=f"analysis_root:{key}")],
-        [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
-    ]
-    return InlineKeyboardMarkup(buttons)
-
-def build_basketball_subcategory_menu(key: str) -> InlineKeyboardMarkup:
-    """
-    농구 선택 후 나오는 2단계 메뉴:
-    NBA / KBL
-    key = "today" 또는 "tomorrow"
-    """
-    buttons = [
-        [InlineKeyboardButton("NBA", callback_data=f"basket_cat:{key}:NBA")],
-        [InlineKeyboardButton("KBL", callback_data=f"basket_cat:{key}:KBL")],
-        [InlineKeyboardButton("◀ 종목 선택으로", callback_data=f"analysis_root:{key}")],
-        [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
-    ]
-    return InlineKeyboardMarkup(buttons)
-
-def build_baseball_subcategory_menu(key: str) -> InlineKeyboardMarkup:
-    """
-    야구 선택 시 나오는 하위 카테고리 메뉴:
-    - 해외야구
-    - KBO
-    - NPB
-    """
-    buttons = [
-        [InlineKeyboardButton("⚾ 해외야구", callback_data=f"baseball_cat:{key}:해외야구")],
-        [InlineKeyboardButton("⚾ KBO", callback_data=f"baseball_cat:{key}:KBO")],
-        [InlineKeyboardButton("⚾ NPB", callback_data=f"baseball_cat:{key}:NPB")],
-        [InlineKeyboardButton("◀ 종목 선택으로", callback_data=f"analysis_root:{key}")],
-        [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
-    ]
-    return InlineKeyboardMarkup(buttons)
-
-def build_volleyball_subcategory_menu(key: str) -> InlineKeyboardMarkup:
-    """
-    배구 선택 시 나오는 하위 카테고리 메뉴
-    (현재는 V리그만 있지만, 나중에 해외배구 등을 늘릴 수 있음)
-    """
-    buttons = [
-        [InlineKeyboardButton("V리그", callback_data=f"volley_cat:{key}:V리그")],
-        [InlineKeyboardButton("◀ 종목 선택으로", callback_data=f"analysis_root:{key}")],
-        [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
-    ]
-    return InlineKeyboardMarkup(buttons)
-
-
-def build_analysis_match_menu(key: str, sport: str, page: int = 1) -> InlineKeyboardMarkup:
-    """종목 선택 후 → 해당 종목 경기 리스트 메뉴 (10개씩 페이지 나누기)"""
-    items = ANALYSIS_DATA_MAP.get(key, {}).get(sport, [])
-    per_page = 10
-
-    if page < 1:
-        page = 1
-
-    total = len(items)
-    total_pages = max(1, math.ceil(total / per_page))
-
-    if page > total_pages:
-        page = total_pages
-
-    start = (page - 1) * per_page
-    end = start + per_page
-    page_items = items[start:end]
-
-    buttons: list[list[InlineKeyboardButton]] = []
-
-    # 현재 페이지의 경기들만 버튼으로
-    for item in page_items:
-        cb = f"match:{key}:{sport}:{item['id']}"
-        buttons.append([InlineKeyboardButton(item["title"], callback_data=cb)])
-
-    # 페이지 이동 버튼 (이전 / 현재페이지 / 다음)
-    if total_pages > 1:
-        nav_row: list[InlineKeyboardButton] = []
-
-        if page > 1:
-            nav_row.append(
-                InlineKeyboardButton(
-                    "◀ 이전",
-                    callback_data=f"match_page:{key}:{sport}:{page-1}",
-                )
-            )
-
-        nav_row.append(
-            InlineKeyboardButton(
-                f"{page}/{total_pages}",
-                callback_data="noop",  # 눌러도 아무 동작 안 하는 용도
-            )
-        )
-
-        if page < total_pages:
-            nav_row.append(
-                InlineKeyboardButton(
-                    "다음 ▶",
-                    callback_data=f"match_page:{key}:{sport}:{page+1}",
-                )
-            )
-
-        buttons.append(nav_row)
-
-    # 공통 하단 버튼
-    buttons.append(
-        [InlineKeyboardButton("◀ 종목 선택으로", callback_data=f"analysis_root:{key}")]
-    )
-    buttons.append([InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")])
-
-    return InlineKeyboardMarkup(buttons)
-
-def build_news_category_menu() -> InlineKeyboardMarkup:
-    """스포츠 뉴스 요약 → 종목 선택 메뉴"""
-    buttons = [
-        [InlineKeyboardButton("⚽️축구 뉴스⚽️", callback_data="news_cat:축구")],
-        [InlineKeyboardButton("🏀농구 뉴스🏀", callback_data="news_cat:농구")],
-        [InlineKeyboardButton("⚾️야구 뉴스⚾️", callback_data="news_cat:야구")],
-        [InlineKeyboardButton("🏐배구 뉴스🏐", callback_data="news_cat:배구")],
-        [InlineKeyboardButton("기타종목 뉴스", callback_data="news_cat:기타종")],
-        [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
-    ]
-    return InlineKeyboardMarkup(buttons)
-
-
-def build_news_list_menu(sport: str) -> InlineKeyboardMarkup:
-    """종목 선택 후 → 해당 종목 뉴스 제목 리스트 메뉴"""
-    items = NEWS_DATA.get(sport, [])
-    buttons = []
-    for item in items:
-        cb = f"news_item:{sport}:{item['id']}"
-        buttons.append([InlineKeyboardButton(item["title"], callback_data=cb)])
-
-    buttons.append([InlineKeyboardButton("◀ 종목 선택으로", callback_data="news_root")])
-    buttons.append([InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")])
-    return InlineKeyboardMarkup(buttons)
-
-
-# ───────────────── 공통: 메인 메뉴 보내는 함수 ─────────────────
-
-
-# ───────────────── Export(H열 comments) → TXT 파일로 받기 ─────────────────
+            # 업데이트 예약
+            if need_simple and i_comments >= 0:
+                col = _col_letter(i_comments + 1)
+                updates.append({"range": f"{col}{real_row_idx}", "values": [[(new_comments or "").strip()]]})
+                updated_simple += 1
+
+            if need_deep and i_deep >= 0:
+                col = _col_letter(i_deep + 1)
+                updates.append({"range": f"{col}{real_row_idx}", "values": [[(new_deep or "").strip()]]})
+                updated_deep += 1
+
+        if updates:
+            try:
+                ws.batch_update(updates, value_input_option="RAW")
+            except Exception as e:
+                # batch_update 실패 시 단건 update로 폴백
+                print(f"[GSHEET][EXPORT] batch_update 실패 → 폴백: {e}")
+                for u in updates:
+                    try:
+                        ws.update(range_name=u["range"], values=u["values"])
+                    except Exception as e2:
+                        print(f"[GSHEET][EXPORT] 단건 update 실패({sheet_name} {u.get('range')}): {e2}")
+
+        total_updated_simple += updated_simple
+        total_updated_deep += updated_deep
+
+    msg = "✅ export 댓글 채우기 완료\n"
+    msg += f"- comments(심플): {total_updated_simple}개\n"
+    msg += f"- deep_comments(심층): {total_updated_deep}개\n"
+    await update.message.reply_text(msg)
 
 def _parse_export_comment_txt_args(args: list[str]) -> tuple[str, int, str]:
     """TXT 생성 옵션 파싱.
