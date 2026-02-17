@@ -2432,6 +2432,17 @@ ANALYSIS_DATA_MAP = {
     "tomorrow": ANALYSIS_TOMORROW,
 }
 
+
+
+# ───────────────── 뉴스 데이터 ─────────────────
+# 'news' 시트에서 로딩되며, 인라인 메뉴(뉴스 요약)에 사용됩니다.
+NEWS_DATA = {
+    "축구": [],
+    "농구": [],
+    "야구": [],
+    "배구": [],
+}
+
 # ───────────────── 다음 스포츠 카테고리 ID 설정 ─────────────────
 # DevTools > Network 에서 harmony contents.json 요청 확인 후
 # defaultCategoryId3 의 value 를 환경변수에 세팅.
@@ -2745,6 +2756,50 @@ def reload_analysis_from_sheet():
     }
 
     print("[GSHEET] ANALYSIS_TODAY / ANALYSIS_TOMORROW 갱신 완료")
+
+
+
+def reload_news_from_sheet():
+    """구글시트 'news' 탭을 읽어 NEWS_DATA 전역을 갱신한다.
+
+    - /syncsheet, /reloadsheet, main() 시작 시 호출됨
+    - news 시트 포맷: [sport, id, title, summary]
+    """
+    global NEWS_DATA
+
+    client_gs = get_gs_client()
+    spreadsheet_id = os.getenv("SPREADSHEET_ID")
+
+    if not (client_gs and spreadsheet_id):
+        print("[GSHEET] 구글시트 설정(GOOGLE_SERVICE_KEY 또는 SPREADSHEET_ID)이 없어 NEWS_DATA 로딩 생략")
+        return
+
+    sheet_news_name = os.getenv("SHEET_NEWS_NAME", "news")
+
+    try:
+        sh = client_gs.open_by_key(spreadsheet_id)
+    except Exception as e:
+        print(f"[GSHEET] 스프레드시트를 열지 못했습니다 (NEWS): {e}")
+        return
+
+    try:
+        print(f"[GSHEET] '{sheet_news_name}' 탭에서 뉴스 데이터 로딩 시도")
+        news_data = _load_analysis_sheet(sh, sheet_news_name)
+
+        if isinstance(news_data, dict):
+            NEWS_DATA = news_data
+        else:
+            NEWS_DATA = {
+                "축구": [],
+                "농구": [],
+                "야구": [],
+                "배구": [],
+            }
+
+        print("[GSHEET] NEWS_DATA 갱신 완료")
+    except Exception as e:
+        print(f"[GSHEET] NEWS_DATA 로딩 실패: {e}")
+        # 실패 시에도 기존 값 유지
 
 def append_analysis_rows(day_key: str, rows: list[list[str]]) -> bool:
     """
@@ -3985,6 +4040,142 @@ async def export_comment_txt(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await update.message.reply_text(f"✅ TXT 전송 완료: {processed}경기 / {sent_files}개 파일")
 
+
+
+
+# ───────────────── 메뉴(인라인/리플라이) 구성 ─────────────────
+
+def build_reply_keyboard() -> ReplyKeyboardMarkup:
+    """DM에서 쓸 간단 리플라이 키보드."""
+    keyboard = [
+        ["메뉴 미리보기", "도움말"],
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
+def build_main_inline_menu() -> InlineKeyboardMarkup:
+    """채널/DM 공통 메인 인라인 메뉴."""
+    today_str, tomorrow_str = get_date_labels()
+    buttons = [
+        [InlineKeyboardButton("📺 실시간 무료 중계", url="https://goat-tv.com")],
+        [InlineKeyboardButton(f"📌 {today_str} 경기 분석픽", callback_data="analysis_root:today")],
+        [InlineKeyboardButton(f"📌 {tomorrow_str} 경기 분석픽", callback_data="analysis_root:tomorrow")],
+        [InlineKeyboardButton("📰 스포츠 뉴스 요약", callback_data="news_root")],
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+def _ordered_analysis_categories(keys: list[str]) -> list[str]:
+    # 보기 편한 순서 우선 배치
+    priority = [
+        "해외축구", "K리그", "J리그",
+        "KBO", "NPB", "해외야구",
+        "NBA", "KBL",
+        "V리그",
+        "축구", "야구", "농구", "배구",
+    ]
+    def ksort(k: str):
+        if k in priority:
+            return (0, priority.index(k))
+        return (1, k)
+    return sorted(keys, key=ksort)
+
+
+def build_analysis_category_menu(key: str) -> InlineKeyboardMarkup:
+    """today/tomorrow 분석 종목(카테고리) 선택 메뉴."""
+    data = ANALYSIS_DATA_MAP.get(key, {}) or {}
+    keys = list(data.keys())
+    ordered = _ordered_analysis_categories(keys)
+
+    buttons: list[list[InlineKeyboardButton]] = []
+    for sport in ordered:
+        cnt = len(data.get(sport, []) or [])
+        label = f"{sport} ({cnt})" if cnt else sport
+        buttons.append([InlineKeyboardButton(label, callback_data=f"analysis_cat:{key}:{sport}")])
+
+    buttons.append([InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_analysis_match_menu(key: str, sport: str, page: int = 1, per_page: int = 10) -> InlineKeyboardMarkup:
+    """특정 종목의 경기 리스트(페이지네이션) 메뉴."""
+    items = (ANALYSIS_DATA_MAP.get(key, {}) or {}).get(sport, []) or []
+    total = len(items)
+
+    if total <= 0:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("데이터 없음 (크롤링/시트 확인)", callback_data="noop")],
+            [InlineKeyboardButton("◀ 종목 선택으로", callback_data=f"analysis_root:{key}")],
+            [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
+        ])
+
+    max_page = max(1, math.ceil(total / per_page))
+    page = max(1, min(page, max_page))
+    start = (page - 1) * per_page
+    end = start + per_page
+
+    page_items = items[start:end]
+
+    buttons: list[list[InlineKeyboardButton]] = []
+    for it in page_items:
+        title = (it.get("title") or "").strip() or "경기"
+        if len(title) > 36:
+            title = title[:36] + "…"
+
+        match_id = (it.get("id") or "").strip()
+        buttons.append([InlineKeyboardButton(title, callback_data=f"match:{key}:{sport}:{match_id}")])
+
+    nav: list[InlineKeyboardButton] = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("⬅ 이전", callback_data=f"match_page:{key}:{sport}:{page-1}"))
+    if page < max_page:
+        nav.append(InlineKeyboardButton("다음 ➡", callback_data=f"match_page:{key}:{sport}:{page+1}"))
+    if nav:
+        buttons.append(nav)
+
+    buttons.append([InlineKeyboardButton("◀ 종목 선택으로", callback_data=f"analysis_root:{key}")])
+    buttons.append([InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")])
+
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_news_category_menu() -> InlineKeyboardMarkup:
+    """뉴스 종목 선택 메뉴."""
+    data = NEWS_DATA or {}
+    base_order = ["축구", "야구", "농구", "배구"]
+    keys = list(dict.fromkeys(base_order + sorted([k for k in data.keys() if k not in base_order])))
+
+    buttons: list[list[InlineKeyboardButton]] = []
+    for sport in keys:
+        cnt = len(data.get(sport, []) or [])
+        label = f"{sport} ({cnt})" if cnt else sport
+        buttons.append([InlineKeyboardButton(label, callback_data=f"news_cat:{sport}")])
+
+    buttons.append([InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_news_list_menu(sport: str, per_page: int = 10) -> InlineKeyboardMarkup:
+    """특정 종목 뉴스 리스트(최대 per_page개)."""
+    items = (NEWS_DATA or {}).get(sport, []) or []
+    if not items:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("데이터 없음 (뉴스 크롤링 필요)", callback_data="noop")],
+            [InlineKeyboardButton("◀ 다른 종목", callback_data="news_root")],
+            [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
+        ])
+
+    buttons: list[list[InlineKeyboardButton]] = []
+    for it in items[:per_page]:
+        title = (it.get("title") or "").strip() or "뉴스"
+        if len(title) > 30:
+            title = title[:30] + "…"
+        nid = (it.get("id") or "").strip()
+        buttons.append([InlineKeyboardButton(title, callback_data=f"news_item:{sport}:{nid}")])
+
+    buttons.append([InlineKeyboardButton("◀ 다른 종목", callback_data="news_root")])
+    buttons.append([InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")])
+    return InlineKeyboardMarkup(buttons)
 
 async def send_main_menu(chat_id: int | str, context: ContextTypes.DEFAULT_TYPE, preview: bool = False):
     """
