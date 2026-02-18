@@ -2350,7 +2350,7 @@ def is_admin(update: Update) -> bool:
 
 def get_kst_now() -> datetime:
     """한국 시간 기준 현재 시각 (UTC+9)"""
-    return datetime.utcnow() + timedelta(hours=9)
+    return now_kst()
 
 
 def get_date_labels():
@@ -2877,6 +2877,286 @@ EXPORT_TODAY_SHEET_NAME = os.getenv("SHEET_EXPORT_TODAY_NAME", "export_today")
 EXPORT_TOMORROW_SHEET_NAME = os.getenv("SHEET_EXPORT_TOMORROW_NAME", "export_tomorrow")
 
 EXPORT_HEADER = SITE_EXPORT_HEADER  # 동일 헤더 사용
+
+
+
+# ───────────────── Naver Cafe → Google Sheet (youtoo 탭) ─────────────────
+# youtoo 탭: 카페 게시글 백업/수집용
+
+YOUTOO_SHEET_NAME = (os.getenv("YOUTOO_SHEET_NAME") or "youtoo").strip()
+
+# ✅ 봇이 자동으로 수집/갱신하는 컬럼(A~K)
+# (youtoo()에서 생성하는 new_rows 순서와 반드시 동일해야 함)
+YOUTOO_AUTO_HEADER = [
+    "src_id",
+    "경기",
+    "댓글수",
+    "조회수",
+    "좋아요",
+    "본문링크",
+    "첫댓글내용",
+    "첫댓글작성자",
+    "첫댓글시간",
+    "게시시간(날짜)",
+    "별명",
+]
+
+# ✅ 사람이 수기로 입력하는 컬럼(L~M) - 봇이 절대 덮어쓰지 않음
+YOUTOO_MANUAL_HEADER = [
+    "적중건제출여부",
+    "지급여부",
+]
+
+# 전체 헤더(A~M)
+YOUTOO_HEADER = YOUTOO_AUTO_HEADER + YOUTOO_MANUAL_HEADER
+
+def _col_letter(n: int) -> str:
+    """1-indexed column number -> A1 column letter."""
+    s = ""
+    x = int(n)
+    while x > 0:
+        x, r = divmod(x - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+# 자동 갱신 범위(A~K)의 끝 컬럼(기본: K)
+YOUTOO_AUTO_END_COL = _col_letter(len(YOUTOO_AUTO_HEADER))
+
+# 과거 버전/표기 차이 호환(자동 마이그레이션용)
+_YOUTOO_COL_ALIASES: dict[str, list[str]] = {
+    "첫댓글내용": ["첫댓글"],
+    "첫댓글작성자": ["첫댓글별명", "첫댓글닉네임"],
+    "적중건제출여부": ["적중 제출 여부", "적중제출여부", "적중여부"],
+    "지급여부": ["지급 여부"],
+}
+
+def _youtoo_find_header_index(old_header: list[str], col: str) -> int | None:
+    """old_header에서 col(또는 별칭)의 위치를 찾는다."""
+    try:
+        return old_header.index(col)
+    except ValueError:
+        pass
+    for alt in _YOUTOO_COL_ALIASES.get(col, []):
+        try:
+            return old_header.index(alt)
+        except ValueError:
+            continue
+    return None
+
+
+def ensure_youtoo_header(ws) -> None:
+    """youtoo 시트 헤더를 최신 스펙으로 맞춘다.
+
+    - A~K: 봇이 자동 수집/갱신하는 컬럼
+    - L~M: 사람이 수기로 입력하는 컬럼(적중건제출여부/지급여부) → ✅ 봇이 절대 덮어쓰지 않음
+
+    헤더가 어긋난 과거 버전(구/신 헤더 혼재)도 가능한 범위 내에서 자동 마이그레이션한다.
+    """
+    try:
+        values = ws.get_all_values()
+    except Exception:
+        values = []
+
+    # 시트가 비어있으면 헤더부터 세팅
+    if not values:
+        try:
+            if getattr(ws, "col_count", 0) < len(YOUTOO_HEADER):
+                ws.resize(cols=len(YOUTOO_HEADER))
+        except Exception:
+            pass
+        ws.update(range_name="A1", values=[YOUTOO_HEADER])
+        return
+
+    # get_all_values()는 "헤더 행의 빈 셀"을 끝까지 반환하지 않을 수 있으므로,
+    # 전체 데이터에서 가장 긴 열 길이를 기준으로 헤더를 패딩한다.
+    max_cols = max([len(r) for r in values] + [len(YOUTOO_HEADER)])
+    raw_header = list(values[0] or [])
+    header = [str(c).strip() for c in raw_header] + [""] * (max_cols - len(raw_header))
+
+    # 필요한 경우에만 cols 확장(절대 축소 금지)
+    try:
+        desired_cols = max(len(YOUTOO_HEADER), max_cols)
+        if getattr(ws, "col_count", 0) < desired_cols:
+            ws.resize(cols=desired_cols)
+    except Exception:
+        pass
+
+    auto_len = len(YOUTOO_AUTO_HEADER)
+    auto_match = [str(c).strip() for c in header[:auto_len]] == YOUTOO_AUTO_HEADER
+
+    # ✅ A~K 헤더가 이미 맞으면: L/M 헤더만 보정하고 끝낸다. (수기 데이터 보호)
+    if auto_match:
+        if len(header) < len(YOUTOO_HEADER):
+            header += [""] * (len(YOUTOO_HEADER) - len(header))
+
+        for i, name in enumerate(YOUTOO_MANUAL_HEADER):
+            col_idx_1based = auto_len + 1 + i  # L=12, M=13
+            cur = str(header[auto_len + i] or "").strip()
+            if cur == name:
+                continue
+            try:
+                ws.update_cell(1, col_idx_1based, name)
+            except Exception:
+                try:
+                    ws.update(range_name=f"{_col_letter(col_idx_1based)}1", values=[[name]])
+                except Exception:
+                    pass
+        return
+
+    # ✅ 헤더가 과거 버전이면: 가능한 범위에서 전체 마이그레이션(수기 L/M도 보존)
+    old_header = header  # 패딩된 헤더
+
+    new_rows: list[list[str]] = []
+    for row in values[1:]:
+        rp = list(row) + [""] * (max_cols - len(row))
+        nr: list[str] = []
+        for col_name in YOUTOO_HEADER:
+            idx = _youtoo_find_header_index(old_header, col_name)
+            if idx is None:
+                # 헤더명이 비어있던 경우를 대비해, L/M은 "위치 기반"으로도 복원 시도
+                if col_name in YOUTOO_MANUAL_HEADER:
+                    pos = YOUTOO_HEADER.index(col_name)
+                    nr.append(rp[pos] if pos < len(rp) else "")
+                else:
+                    nr.append("")
+            else:
+                nr.append(rp[idx] if idx < len(rp) else "")
+
+        # 완전 빈 행은 건너뛰기(공백 공간 누적 방지)
+        if any((x or "").strip() for x in nr):
+            new_rows.append(nr)
+
+    try:
+        ws.clear()
+    except Exception:
+        pass
+
+    try:
+        if getattr(ws, "col_count", 0) < len(YOUTOO_HEADER):
+            ws.resize(cols=len(YOUTOO_HEADER))
+    except Exception:
+        pass
+
+    ws.update(range_name="A1", values=[YOUTOO_HEADER] + new_rows, value_input_option="RAW")
+
+
+def get_youtoo_ws():
+    """youtoo 탭 워크시트 반환(없으면 생성 + 헤더 세팅)."""
+    client_gs = get_gs_client()
+    spreadsheet_id = os.getenv("SPREADSHEET_ID")
+    if not (client_gs and spreadsheet_id):
+        return None
+
+    try:
+        sh = client_gs.open_by_key(spreadsheet_id)
+        ws = _get_ws_by_name(sh, YOUTOO_SHEET_NAME)
+        if not ws:
+            ws = sh.add_worksheet(title=YOUTOO_SHEET_NAME, rows=2000, cols=max(10, len(YOUTOO_HEADER)))
+
+        # ✅ cols는 "필요할 때만 확장" (절대 축소 금지: 수기 L/M 보호)
+        try:
+            if getattr(ws, "col_count", 0) < len(YOUTOO_HEADER):
+                ws.resize(cols=len(YOUTOO_HEADER))
+        except Exception:
+            pass
+
+        ensure_youtoo_header(ws)
+        return ws
+    except Exception as e:
+        print(f"[GSHEET][YOUTOO] 워크시트 준비 실패({YOUTOO_SHEET_NAME}): {e}")
+        return None
+
+
+def upsert_youtoo_rows_top(rows: list[list[str]]) -> tuple[bool, int, int]:
+    """youtoo 시트에 rows를 upsert 하되, ✅ 신규는 2행(헤더 아래)에 삽입해서 '위로 업데이트'되게 만든다.
+
+    반환: (ok, inserted_count, updated_count)
+
+    - src_id 기준으로 중복을 판단한다.
+    - 이미 존재하면 해당 행을 덮어쓴다(댓글수/조회수/좋아요 등이 갱신될 수 있으므로).
+    - 신규는 insert_rows(row=2)로 상단에 붙인다.
+    - ✅ 수기 입력 컬럼(L/M)은 절대 덮어쓰지 않도록 A~K만 업데이트한다.
+    """
+    if not rows:
+        return True, 0, 0
+
+    ws = get_youtoo_ws()
+    if not ws:
+        return False, 0, 0
+
+    # 헤더 보정/마이그레이션
+    ensure_youtoo_header(ws)
+
+    try:
+        values = ws.get_all_values()
+    except Exception:
+        values = []
+
+    if not values:
+        ws.update(range_name="A1", values=[YOUTOO_HEADER])
+        values = [YOUTOO_HEADER]
+
+    header = [c.strip() for c in values[0]]
+    try:
+        idx_src = header.index("src_id")
+    except ValueError:
+        idx_src = 0
+
+    # src_id -> row_number(1-indexed)
+    existing_map: dict[str, int] = {}
+    for i, row in enumerate(values[1:], start=2):
+        if len(row) > idx_src:
+            sid = (row[idx_src] or "").strip()
+            if sid and sid not in existing_map:
+                existing_map[sid] = i
+
+    updated = 0
+    to_insert: list[list[str]] = []
+    seen: set[str] = set()
+
+    # 1) 기존 행 업데이트(삽입 전에 수행해야 row index가 흔들리지 않음)
+    for r in rows:
+        if not r:
+            continue
+        rr = list(r)
+        if len(rr) < len(YOUTOO_HEADER):
+            rr += [""] * (len(YOUTOO_HEADER) - len(rr))
+        elif len(rr) > len(YOUTOO_HEADER):
+            rr = rr[: len(YOUTOO_HEADER)]
+
+        sid = (rr[idx_src] or "").strip()
+        if (not sid) or (sid in seen):
+            continue
+        seen.add(sid)
+
+        if sid in existing_map:
+            row_num = existing_map[sid]
+            try:
+                rr_auto = rr[: len(YOUTOO_AUTO_HEADER)]
+                ws.update(
+                    range_name=f"A{row_num}:{YOUTOO_AUTO_END_COL}{row_num}",
+                    values=[rr_auto],
+                    value_input_option="RAW",
+                )
+                updated += 1
+            except Exception as e:
+                print(f"[GSHEET][YOUTOO] update 실패(src_id={sid}): {e}")
+        else:
+            to_insert.append(rr)
+
+    inserted = 0
+    if to_insert:
+        try:
+            # ✅ 신규는 맨 위(2행)에 넣어서 최신이 위로 오게 한다.
+            ws.insert_rows(to_insert, row=2, value_input_option="RAW")
+            inserted = len(to_insert)
+        except Exception as e:
+            print(f"[GSHEET][YOUTOO] insert_rows 오류: {e}")
+            return False, inserted, updated
+
+    print(f"[GSHEET][YOUTOO] {YOUTOO_SHEET_NAME}: inserted={inserted}, updated={updated}")
+    return True, inserted, updated
+
   # createdAt(과거 creatadAt 오타 시트도 호환)
 
 def _ensure_header(ws, header: list[str]) -> None:
@@ -8206,11 +8486,44 @@ async def youtoo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+
+
+async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """전역 에러 핸들러: 예외를 로그로 남기고(가능하면) 호출자에게 간단히 안내한다.
+
+    - Render 로그를 놓쳤을 때, 텔레그램에서 최소한 '에러가 났다'는 사실을 알 수 있게 함
+    - 민감정보(쿠키/토큰)가 메시지에 포함되지 않도록 예외 메시지는 짧게 잘라서 전송
+    """
+    try:
+        import traceback
+        traceback.print_exception(context.error)
+    except Exception:
+        pass
+
+    try:
+        # update가 Update일 수도 있고 아닐 수도 있어 안전하게 처리
+        if update and getattr(update, "effective_chat", None) and getattr(update, "message", None):
+            msg = str(getattr(context, "error", ""))
+            msg = msg.replace("\n", " ").replace("\r", " ")
+            # 쿠키/토큰 문자열이 섞였을 가능성 대비해 길이 제한
+            if len(msg) > 400:
+                msg = msg[:400] + "…"
+            await update.message.reply_text(
+                "⚠️ 처리 중 오류가 발생했습니다. Render 로그를 확인해주세요.\n"
+                f"에러: {msg}"
+            )
+    except Exception:
+        # 에러 핸들러에서 또 에러나면 조용히 무시
+        return
+
 def main():
     reload_analysis_from_sheet()
     reload_news_from_sheet()
 
     app = ApplicationBuilder().token(TOKEN).build()
+
+    # 전역 에러 핸들러 등록(예외 발생 시 최소 안내)
+    app.add_error_handler(_on_error)
 
     # 모든 업데이트에 대해 update_id 중복 처리 방지(웹훅 재전송/슬립 복귀 시 중복 응답 방지)
     app.add_handler(TypeHandler(Update, _dedup_update_guard), group=-1)
