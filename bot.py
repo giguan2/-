@@ -3899,38 +3899,62 @@ def _default_zip_matches() -> int:
 
 
 def _build_export_comment_zip_markup(which: str, sport_filter: str, limit_matches: int | None = None) -> InlineKeyboardMarkup:
+    """export 댓글 ZIP 버튼(심플/심층 2종)."""
     n = limit_matches or _default_zip_matches()
-    cb = f"zip:{which}:{sport_filter}:{n}"
-    label = f"📦 댓글 ZIP 받기 ({n}경기)"
-    if sport_filter:
-        label = f"📦 {sport_filter} ZIP ({n}경기)"
-    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=cb)]])
+    sport_key = (sport_filter or "").strip().lower() or "all"
 
+    cb_simple = f"zip:{which}:{sport_key}:{n}:simple"
+    cb_deep = f"zip:{which}:{sport_key}:{n}:deep"
+
+    # 버튼 라벨: 요구사항에 맞춰 simple_zip / deep_zip 노출
+    if sport_filter:
+        label_simple = f"📦 {sport_filter} simple_zip ({n}경기)"
+        label_deep = f"📦 {sport_filter} deep_zip ({n}경기)"
+    else:
+        label_simple = f"📦 simple_zip ({n}경기)"
+        label_deep = f"📦 deep_zip ({n}경기)"
+
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(label_simple, callback_data=cb_simple),
+            InlineKeyboardButton(label_deep, callback_data=cb_deep),
+        ]
+    ])
 
 def _build_export_comment_zip_markup_bv(which: str, limit_matches: int | None = None) -> InlineKeyboardMarkup:
     n = limit_matches or _default_zip_matches()
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(f"📦 basketball ZIP ({n}경기)", callback_data=f"zip:{which}:basketball:{n}"),
-            InlineKeyboardButton(f"📦 volleyball ZIP ({n}경기)", callback_data=f"zip:{which}:volleyball:{n}"),
-        ]
+            InlineKeyboardButton(f"📦 basketball simple_zip ({n}경기)", callback_data=f"zip:{which}:basketball:{n}:simple"),
+            InlineKeyboardButton(f"📦 basketball deep_zip ({n}경기)", callback_data=f"zip:{which}:basketball:{n}:deep"),
+        ],
+        [
+            InlineKeyboardButton(f"📦 volleyball simple_zip ({n}경기)", callback_data=f"zip:{which}:volleyball:{n}:simple"),
+            InlineKeyboardButton(f"📦 volleyball deep_zip ({n}경기)", callback_data=f"zip:{which}:volleyball:{n}:deep"),
+        ],
     ])
 
-
 def _build_export_comment_zip_markup_all(which: str, limit_matches: int | None = None) -> InlineKeyboardMarkup:
-    # 4종목 버튼 한번에
+    # 4종목 버튼 한번에 (simple_zip / deep_zip)
     n = limit_matches or _default_zip_matches()
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(f"📦 soccer ZIP ({n})", callback_data=f"zip:{which}:soccer:{n}"),
-            InlineKeyboardButton(f"📦 baseball ZIP ({n})", callback_data=f"zip:{which}:baseball:{n}"),
+            InlineKeyboardButton(f"📦 soccer simple_zip ({n})", callback_data=f"zip:{which}:soccer:{n}:simple"),
+            InlineKeyboardButton(f"📦 soccer deep_zip ({n})", callback_data=f"zip:{which}:soccer:{n}:deep"),
         ],
         [
-            InlineKeyboardButton(f"📦 basketball ZIP ({n})", callback_data=f"zip:{which}:basketball:{n}"),
-            InlineKeyboardButton(f"📦 volleyball ZIP ({n})", callback_data=f"zip:{which}:volleyball:{n}"),
+            InlineKeyboardButton(f"📦 baseball simple_zip ({n})", callback_data=f"zip:{which}:baseball:{n}:simple"),
+            InlineKeyboardButton(f"📦 baseball deep_zip ({n})", callback_data=f"zip:{which}:baseball:{n}:deep"),
+        ],
+        [
+            InlineKeyboardButton(f"📦 basketball simple_zip ({n})", callback_data=f"zip:{which}:basketball:{n}:simple"),
+            InlineKeyboardButton(f"📦 basketball deep_zip ({n})", callback_data=f"zip:{which}:basketball:{n}:deep"),
+        ],
+        [
+            InlineKeyboardButton(f"📦 volleyball simple_zip ({n})", callback_data=f"zip:{which}:volleyball:{n}:simple"),
+            InlineKeyboardButton(f"📦 volleyball deep_zip ({n})", callback_data=f"zip:{which}:volleyball:{n}:deep"),
         ],
     ])
-
 
 async def _send_export_comment_zip_file(
     chat_id: int,
@@ -3938,13 +3962,26 @@ async def _send_export_comment_zip_file(
     which: str,
     limit_matches: int,
     sport_filter: str = "",
+    mode: str = "simple",
 ) -> tuple[int, int, str]:
-    """export_* 시트의 comments(H) 줄바꿈을 ZIP(내부: 한 줄당 txt 1개)로 묶어 전송.
+    """export_* 시트의 댓글 컬럼을 ZIP(내부: 한 줄당 txt 1개)로 묶어 전송.
+
+    - mode="simple": comments (J열)
+    - mode="deep"  : deep_comments (L열)
+
     반환: (zip에 담긴 txt 파일 수, 처리한 경기 수, zip 파일명)
     """
     which = (which or "tomorrow").strip().lower()
     if which not in ("today", "tomorrow"):
         which = "tomorrow"
+
+    mode = (mode or "simple").strip().lower()
+    if mode not in ("simple", "deep"):
+        mode = "simple"
+
+    col_name = "comments" if mode == "simple" else "deep_comments"
+    # 과거 헤더(구버전) 호환을 위한 fallback 인덱스
+    fallback_idx = 7 if mode == "simple" else 11
 
     max_files = int(os.getenv("EXPORT_COMMENT_ZIP_MAX_FILES", os.getenv("EXPORT_COMMENT_TXT_MAX_FILES", "600")))
 
@@ -3970,7 +4007,7 @@ async def _send_export_comment_zip_file(
     i_sport = _idx("sport", 1)
     i_src = _idx("src_id", 2)
     i_title = _idx("title", 3)
-    i_comments = _idx("comments", 7)
+    i_col = _idx(col_name, fallback_idx)
 
     selected: list[tuple[str, str, list[str]]] = []  # (sid, title, comment_lines)
     for r in reversed(vals[1:]):
@@ -3980,8 +4017,8 @@ async def _send_export_comment_zip_file(
 
         sid = (r[i_src] if len(r) > i_src else "").strip()
         title = (r[i_title] if len(r) > i_title else "").strip()
-        comments_raw = (r[i_comments] if len(r) > i_comments else "")
-        comment_lines = _split_comment_lines(comments_raw)
+        raw = (r[i_col] if len(r) > i_col else "")
+        comment_lines = _split_comment_lines(raw)
 
         if not comment_lines:
             continue
@@ -3991,15 +4028,17 @@ async def _send_export_comment_zip_file(
             break
 
     if not selected:
-        msg = "ZIP으로 보낼 댓글이 없어. export 시트 H열(comments)을 먼저 채워줘."
+        col_hint = "J열(comments)" if mode == "simple" else "L열(deep_comments)"
+        msg = f"ZIP으로 보낼 댓글이 없어. export 시트 {col_hint}을 먼저 채워줘."
         if sport_filter:
-            msg = f"ZIP으로 보낼 댓글이 없어({sport_filter}). export 시트 H열(comments)을 먼저 채워줘."
+            msg = f"ZIP으로 보낼 댓글이 없어({sport_filter}). export 시트 {col_hint}을 먼저 채워줘."
         await context.bot.send_message(chat_id=chat_id, text=msg)
         return 0, 0, ""
 
     ts = now_kst().strftime("%Y%m%d_%H%M%S")
     sport_tag = sport_filter or "all"
-    zip_filename = f"comments_{which}_{sport_tag}_{ts}.zip"
+    zip_tag = "simple_zip" if mode == "simple" else "deep_zip"
+    zip_filename = f"{zip_tag}_{which}_{sport_tag}_{ts}.zip"
 
     bio = io.BytesIO()
     total_files = 0
@@ -4028,7 +4067,6 @@ async def _send_export_comment_zip_file(
         print(f"[EXPORT][ZIP] zip 생성/전송 실패: {e}")
         await context.bot.send_message(chat_id=chat_id, text=f"ZIP 생성/전송 중 오류: {e}")
         return 0, 0, ""
-
 
 async def export_comment_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """export 시트 H열(comments) → 한 줄당 txt를 ZIP으로 묶어 전송.
@@ -7280,28 +7318,49 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "noop":
         return
 
-    # export 댓글 ZIP 버튼 (1 zip 파일로 전송)
+    # export 댓글 ZIP 버튼 (simple_zip / deep_zip)
     if data.startswith("zip:"):
-        try:
-            _, which, sport_key, n = data.split(":", 3)
-            which = (which or "tomorrow").strip().lower()
-            sport_key = (sport_key or "").strip().lower()
-            limit_matches = int(n) if str(n).isdigit() else _default_zip_matches()
-        except Exception:
-            which, limit_matches, sport_key = "tomorrow", _default_zip_matches(), ""
+        # 지원 포맷:
+        #   - 구버전: zip:{which}:{sport}:{n}
+        #   - 신버전: zip:{which}:{sport}:{n}:{simple|deep}
+        which = "tomorrow"
+        sport_key = ""
+        n = ""
+        mode = "simple"
 
-        await q.message.reply_text(f"📦 댓글 ZIP 생성/전송 시작: {which}, {limit_matches}경기, sport={sport_key or 'ALL'}")
+        try:
+            parts = (data or "").split(":")
+            if len(parts) >= 4:
+                which = (parts[1] or "tomorrow").strip().lower()
+                sport_key = (parts[2] or "").strip().lower()
+                n = (parts[3] or "").strip()
+                if len(parts) >= 5:
+                    mode = (parts[4] or "simple").strip().lower()
+        except Exception:
+            which, sport_key, n, mode = "tomorrow", "", "", "simple"
+
+        if which not in ("today", "tomorrow"):
+            which = "tomorrow"
+
+        if mode not in ("simple", "deep"):
+            mode = "simple"
+
+        limit_matches = int(n) if str(n).isdigit() else _default_zip_matches()
+
+        zip_tag = "simple_zip" if mode == "simple" else "deep_zip"
+        await q.message.reply_text(f"📦 {zip_tag} 생성/전송 시작: {which}, {limit_matches}경기, sport={sport_key or 'ALL'}")
         files_cnt, matches_cnt, zip_name = await _send_export_comment_zip_file(
             chat_id=q.message.chat_id,
             context=context,
             which=which,
             limit_matches=limit_matches,
             sport_filter=sport_key,
+            mode=mode,
         )
         if files_cnt and matches_cnt:
-            await q.message.reply_text(f"✅ ZIP 전송 완료: {matches_cnt}경기 / {files_cnt}개 파일 (1 zip)")
+            await q.message.reply_text(f"✅ {zip_tag} 전송 완료: {matches_cnt}경기 / {files_cnt}개 파일 (1 zip)")
         else:
-            await q.message.reply_text("ZIP 전송할 댓글이 없거나 실패했습니다.")
+            await q.message.reply_text(f"{zip_tag} 전송할 댓글이 없거나 실패했습니다.")
         return
 
     # export 댓글 TXT 버튼
