@@ -3404,7 +3404,7 @@ def generate_export_comments_pair(title: str, sport_label: str = "", body_hint: 
     deep_comments = generate_export_comments(title=title, sport_label=sport_label, count=count, mode="deep", body_hint=body_hint, avoid_text=comments)
     return (comments or "").strip(), (deep_comments or "").strip()
 
-def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
+def append_export_rows(sheet_name: str, rows: list[list[str]], *, fill_comments: bool | None = None) -> bool:
     """지정 export 시트에 rows를 append.
 
     입력 row 포맷(호환):
@@ -3414,6 +3414,14 @@ def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
 
     저장 포맷(항상 EXPORT_HEADER 순서):
       day, sport, src_id, title, body, createdAt, simple, cafe_title, cafe_url, comments, cafe_url_deep, deep_comments
+
+    ⚠️ 주의(성능):
+    - comments/deep_comments 생성은 OpenAI 호출이 포함되어 대량 크롤링(수십건)에서는 시간이 오래 걸릴 수 있다.
+    - 기본 동작은 "대량 append 시 댓글 자동 생성은 스킵"(export 시트 저장을 먼저 끝내기)이다.
+      필요 시:
+        - EXPORT_COMMENT_ON_APPEND=1 로 켜고
+        - EXPORT_COMMENT_ON_APPEND_MAX 로 한 번에 생성할 최대 행 수를 조절한다.
+      또는 /export_comment_fill 명령으로 별도 채우기를 권장.
     """
     if not rows:
         return True
@@ -3422,7 +3430,46 @@ def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
     if not ws:
         return False
 
-    # 컬럼 인덱스(헤더명 기반)
+    # ── 댓글 자동 생성 옵션 결정 ────────────────────────────────────────────
+    enabled_comments = (os.getenv("EXPORT_COMMENT_ENABLED", "1").strip().lower() not in ("0", "false", "no"))
+    env_on_append = os.getenv("EXPORT_COMMENT_ON_APPEND")  # 명시적으로 설정했는지 여부
+    try:
+        max_fill = int(os.getenv("EXPORT_COMMENT_ON_APPEND_MAX", "10"))
+    except Exception:
+        max_fill = 10
+
+    # fill_comments:
+    # - 파라미터가 오면 그 값을 우선(단, EXPORT_COMMENT_ENABLED=0이면 강제 OFF)
+    # - 파라미터가 없고 EXPORT_COMMENT_ON_APPEND가 설정돼 있으면 그 값 사용
+    # - 둘 다 없으면: 작은 배치(<= max_fill)에서만 자동 생성 ON
+    if fill_comments is None:
+        if env_on_append is not None and str(env_on_append).strip() != "":
+            fill_comments = (str(env_on_append).strip().lower() not in ("0", "false", "no"))
+        else:
+            if not enabled_comments:
+                fill_comments = False
+            elif max_fill <= 0:
+                # 0 이하 = 제한 없이 허용(단, 여전히 아래 fill_limit에서 안전장치 가능)
+                fill_comments = True
+            else:
+                # 대량 크롤링 지연 방지: 작은 배치만 자동 생성
+                fill_comments = len(rows) <= max_fill
+    else:
+        fill_comments = bool(fill_comments)
+
+    if not enabled_comments:
+        fill_comments = False
+
+    if fill_comments:
+        # 안전장치: 한 번에 생성할 최대 행 수(기본 10). max_fill<=0이면 전체.
+        if max_fill > 0:
+            fill_limit = min(len(rows), max_fill)
+        else:
+            fill_limit = len(rows)
+    else:
+        fill_limit = 0
+
+    # ── 컬럼 인덱스(헤더명 기반) ───────────────────────────────────────────
     def _h(name: str, fallback: int) -> int:
         try:
             return EXPORT_HEADER.index(name)
@@ -3443,7 +3490,7 @@ def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
     i_deep_comments = _h("deep_comments", 11)
 
     fixed_rows: list[list[str]] = []
-    for r in rows:
+    for idx_row, r in enumerate(rows):
         if not r:
             continue
         legacy = list(r)
@@ -3479,43 +3526,47 @@ def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
             if len(legacy) > 10:
                 rr[i_cafe_url_deep] = legacy[10]
 
-        day = rr[i_day] if i_day < len(rr) else ""
-        sport_label = rr[i_sport] if i_sport < len(rr) else ""
         title = rr[i_title] if i_title < len(rr) else ""
         body = rr[i_body] if i_body < len(rr) else ""
 
-        # simple 보정(비어있으면 body에서 추출)
+        # simple 보정(비어있으면 body에서 추출) — 빠른 로컬 처리
         if i_simple < len(rr) and not str(rr[i_simple]).strip():
             rr[i_simple] = extract_simple_from_body(body)
 
-        # base_title: 우선 title, 없으면 simple 첫 줄
-        base_title = (title or "").strip()
-        if not base_title:
-            simple_txt = (rr[i_simple] if i_simple < len(rr) else "") or ""
-            base_title = (simple_txt.splitlines()[0] if simple_txt else "").strip()
+        # ── comments/deep_comments 생성(옵션) ─────────────────────────────
+        # 대량 append에서는 기본적으로 스킵하여 export 시트를 먼저 채우고,
+        # 필요하면 /export_comment_fill 로 별도 생성하도록 유도한다.
+        if idx_row < fill_limit:
+            sport_label = rr[i_sport] if i_sport < len(rr) else ""
 
-        # comments(심플용) 생성/보정
-        if i_comments < len(rr) and (not str(rr[i_comments]).strip()):
-            comments, deep_comments = generate_export_comments_pair(
-                title=base_title,
-                sport_label=str(sport_label or "").strip(),
-                body_hint=str(body or "").strip(),
-            )
-            rr[i_comments] = (comments or "").strip()
-            # deep_comments도 동시에 채워주되, 이미 값이 있으면 유지
-            if i_deep_comments < len(rr) and (not str(rr[i_deep_comments]).strip()):
-                rr[i_deep_comments] = (deep_comments or "").strip()
-        else:
-            # comments가 이미 있고 deep_comments만 비어있으면 deep만 생성
-            if i_deep_comments < len(rr) and (not str(rr[i_deep_comments]).strip()):
-                deep_comments = generate_export_comments(
+            # base_title: 우선 title, 없으면 simple 첫 줄
+            base_title = (title or "").strip()
+            if not base_title:
+                simple_txt = (rr[i_simple] if i_simple < len(rr) else "") or ""
+                base_title = (simple_txt.splitlines()[0] if simple_txt else "").strip()
+
+            # comments(심플용) 생성/보정
+            if i_comments < len(rr) and (not str(rr[i_comments]).strip()):
+                comments, deep_comments = generate_export_comments_pair(
                     title=base_title,
                     sport_label=str(sport_label or "").strip(),
-                    mode="deep",
                     body_hint=str(body or "").strip(),
-                    avoid_text=str(rr[i_comments] if i_comments < len(rr) else ""),
                 )
-                rr[i_deep_comments] = (deep_comments or "").strip()
+                rr[i_comments] = (comments or "").strip()
+                # deep_comments도 동시에 채워주되, 이미 값이 있으면 유지
+                if i_deep_comments < len(rr) and (not str(rr[i_deep_comments]).strip()):
+                    rr[i_deep_comments] = (deep_comments or "").strip()
+            else:
+                # comments가 이미 있고 deep_comments만 비어있으면 deep만 생성
+                if i_deep_comments < len(rr) and (not str(rr[i_deep_comments]).strip()):
+                    deep_comments = generate_export_comments(
+                        title=base_title,
+                        sport_label=str(sport_label or "").strip(),
+                        mode="deep",
+                        body_hint=str(body or "").strip(),
+                        avoid_text=str(rr[i_comments] if i_comments < len(rr) else ""),
+                    )
+                    rr[i_deep_comments] = (deep_comments or "").strip()
 
         # rr 길이 보정
         if len(rr) < len(EXPORT_HEADER):
@@ -6032,7 +6083,12 @@ async def crawl_maz_analysis_common(
 
     # ✅ site_export 시트 저장
     if export_site and site_rows_to_append:
-        ok2 = append_export_rows(export_sheet_name, site_rows_to_append)
+        try:
+            ok2 = append_export_rows(export_sheet_name, site_rows_to_append)
+        except Exception as e:
+            print(f"[SITE_EXPORT][ERR] append_export_rows({export_sheet_name}) 예외: {e}")
+            await update.message.reply_text(f"site_export 시트 저장 중 예외가 발생했습니다: {e}")
+            return
         if not ok2:
             await update.message.reply_text("site_export 시트 저장 중 오류가 발생했습니다.")
             return
