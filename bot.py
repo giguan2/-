@@ -3404,7 +3404,7 @@ def generate_export_comments_pair(title: str, sport_label: str = "", body_hint: 
     deep_comments = generate_export_comments(title=title, sport_label=sport_label, count=count, mode="deep", body_hint=body_hint, avoid_text=comments)
     return (comments or "").strip(), (deep_comments or "").strip()
 
-def append_export_rows(sheet_name: str, rows: list[list[str]], *, fill_comments: bool | None = None) -> bool:
+def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
     """지정 export 시트에 rows를 append.
 
     입력 row 포맷(호환):
@@ -3414,14 +3414,6 @@ def append_export_rows(sheet_name: str, rows: list[list[str]], *, fill_comments:
 
     저장 포맷(항상 EXPORT_HEADER 순서):
       day, sport, src_id, title, body, createdAt, simple, cafe_title, cafe_url, comments, cafe_url_deep, deep_comments
-
-    ⚠️ 주의(성능):
-    - comments/deep_comments 생성은 OpenAI 호출이 포함되어 대량 크롤링(수십건)에서는 시간이 오래 걸릴 수 있다.
-    - 기본 동작은 "대량 append 시 댓글 자동 생성은 스킵"(export 시트 저장을 먼저 끝내기)이다.
-      필요 시:
-        - EXPORT_COMMENT_ON_APPEND=1 로 켜고
-        - EXPORT_COMMENT_ON_APPEND_MAX 로 한 번에 생성할 최대 행 수를 조절한다.
-      또는 /export_comment_fill 명령으로 별도 채우기를 권장.
     """
     if not rows:
         return True
@@ -3430,46 +3422,7 @@ def append_export_rows(sheet_name: str, rows: list[list[str]], *, fill_comments:
     if not ws:
         return False
 
-    # ── 댓글 자동 생성 옵션 결정 ────────────────────────────────────────────
-    enabled_comments = (os.getenv("EXPORT_COMMENT_ENABLED", "1").strip().lower() not in ("0", "false", "no"))
-    env_on_append = os.getenv("EXPORT_COMMENT_ON_APPEND")  # 명시적으로 설정했는지 여부
-    try:
-        max_fill = int(os.getenv("EXPORT_COMMENT_ON_APPEND_MAX", "10"))
-    except Exception:
-        max_fill = 10
-
-    # fill_comments:
-    # - 파라미터가 오면 그 값을 우선(단, EXPORT_COMMENT_ENABLED=0이면 강제 OFF)
-    # - 파라미터가 없고 EXPORT_COMMENT_ON_APPEND가 설정돼 있으면 그 값 사용
-    # - 둘 다 없으면: 작은 배치(<= max_fill)에서만 자동 생성 ON
-    if fill_comments is None:
-        if env_on_append is not None and str(env_on_append).strip() != "":
-            fill_comments = (str(env_on_append).strip().lower() not in ("0", "false", "no"))
-        else:
-            if not enabled_comments:
-                fill_comments = False
-            elif max_fill <= 0:
-                # 0 이하 = 제한 없이 허용(단, 여전히 아래 fill_limit에서 안전장치 가능)
-                fill_comments = True
-            else:
-                # 대량 크롤링 지연 방지: 작은 배치만 자동 생성
-                fill_comments = len(rows) <= max_fill
-    else:
-        fill_comments = bool(fill_comments)
-
-    if not enabled_comments:
-        fill_comments = False
-
-    if fill_comments:
-        # 안전장치: 한 번에 생성할 최대 행 수(기본 10). max_fill<=0이면 전체.
-        if max_fill > 0:
-            fill_limit = min(len(rows), max_fill)
-        else:
-            fill_limit = len(rows)
-    else:
-        fill_limit = 0
-
-    # ── 컬럼 인덱스(헤더명 기반) ───────────────────────────────────────────
+    # 컬럼 인덱스(헤더명 기반)
     def _h(name: str, fallback: int) -> int:
         try:
             return EXPORT_HEADER.index(name)
@@ -3490,7 +3443,7 @@ def append_export_rows(sheet_name: str, rows: list[list[str]], *, fill_comments:
     i_deep_comments = _h("deep_comments", 11)
 
     fixed_rows: list[list[str]] = []
-    for idx_row, r in enumerate(rows):
+    for r in rows:
         if not r:
             continue
         legacy = list(r)
@@ -3526,47 +3479,43 @@ def append_export_rows(sheet_name: str, rows: list[list[str]], *, fill_comments:
             if len(legacy) > 10:
                 rr[i_cafe_url_deep] = legacy[10]
 
+        day = rr[i_day] if i_day < len(rr) else ""
+        sport_label = rr[i_sport] if i_sport < len(rr) else ""
         title = rr[i_title] if i_title < len(rr) else ""
         body = rr[i_body] if i_body < len(rr) else ""
 
-        # simple 보정(비어있으면 body에서 추출) — 빠른 로컬 처리
+        # simple 보정(비어있으면 body에서 추출)
         if i_simple < len(rr) and not str(rr[i_simple]).strip():
             rr[i_simple] = extract_simple_from_body(body)
 
-        # ── comments/deep_comments 생성(옵션) ─────────────────────────────
-        # 대량 append에서는 기본적으로 스킵하여 export 시트를 먼저 채우고,
-        # 필요하면 /export_comment_fill 로 별도 생성하도록 유도한다.
-        if idx_row < fill_limit:
-            sport_label = rr[i_sport] if i_sport < len(rr) else ""
+        # base_title: 우선 title, 없으면 simple 첫 줄
+        base_title = (title or "").strip()
+        if not base_title:
+            simple_txt = (rr[i_simple] if i_simple < len(rr) else "") or ""
+            base_title = (simple_txt.splitlines()[0] if simple_txt else "").strip()
 
-            # base_title: 우선 title, 없으면 simple 첫 줄
-            base_title = (title or "").strip()
-            if not base_title:
-                simple_txt = (rr[i_simple] if i_simple < len(rr) else "") or ""
-                base_title = (simple_txt.splitlines()[0] if simple_txt else "").strip()
-
-            # comments(심플용) 생성/보정
-            if i_comments < len(rr) and (not str(rr[i_comments]).strip()):
-                comments, deep_comments = generate_export_comments_pair(
+        # comments(심플용) 생성/보정
+        if i_comments < len(rr) and (not str(rr[i_comments]).strip()):
+            comments, deep_comments = generate_export_comments_pair(
+                title=base_title,
+                sport_label=str(sport_label or "").strip(),
+                body_hint=str(body or "").strip(),
+            )
+            rr[i_comments] = (comments or "").strip()
+            # deep_comments도 동시에 채워주되, 이미 값이 있으면 유지
+            if i_deep_comments < len(rr) and (not str(rr[i_deep_comments]).strip()):
+                rr[i_deep_comments] = (deep_comments or "").strip()
+        else:
+            # comments가 이미 있고 deep_comments만 비어있으면 deep만 생성
+            if i_deep_comments < len(rr) and (not str(rr[i_deep_comments]).strip()):
+                deep_comments = generate_export_comments(
                     title=base_title,
                     sport_label=str(sport_label or "").strip(),
+                    mode="deep",
                     body_hint=str(body or "").strip(),
+                    avoid_text=str(rr[i_comments] if i_comments < len(rr) else ""),
                 )
-                rr[i_comments] = (comments or "").strip()
-                # deep_comments도 동시에 채워주되, 이미 값이 있으면 유지
-                if i_deep_comments < len(rr) and (not str(rr[i_deep_comments]).strip()):
-                    rr[i_deep_comments] = (deep_comments or "").strip()
-            else:
-                # comments가 이미 있고 deep_comments만 비어있으면 deep만 생성
-                if i_deep_comments < len(rr) and (not str(rr[i_deep_comments]).strip()):
-                    deep_comments = generate_export_comments(
-                        title=base_title,
-                        sport_label=str(sport_label or "").strip(),
-                        mode="deep",
-                        body_hint=str(body or "").strip(),
-                        avoid_text=str(rr[i_comments] if i_comments < len(rr) else ""),
-                    )
-                    rr[i_deep_comments] = (deep_comments or "").strip()
+                rr[i_deep_comments] = (deep_comments or "").strip()
 
         # rr 길이 보정
         if len(rr) < len(EXPORT_HEADER):
@@ -3950,62 +3899,38 @@ def _default_zip_matches() -> int:
 
 
 def _build_export_comment_zip_markup(which: str, sport_filter: str, limit_matches: int | None = None) -> InlineKeyboardMarkup:
-    """export 댓글 ZIP 버튼(심플/심층 2종)."""
     n = limit_matches or _default_zip_matches()
-    sport_key = (sport_filter or "").strip().lower() or "all"
-
-    cb_simple = f"zip:{which}:{sport_key}:{n}:simple"
-    cb_deep = f"zip:{which}:{sport_key}:{n}:deep"
-
-    # 버튼 라벨: 요구사항에 맞춰 simple_zip / deep_zip 노출
+    cb = f"zip:{which}:{sport_filter}:{n}"
+    label = f"📦 댓글 ZIP 받기 ({n}경기)"
     if sport_filter:
-        label_simple = f"📦 {sport_filter} simple_zip ({n}경기)"
-        label_deep = f"📦 {sport_filter} deep_zip ({n}경기)"
-    else:
-        label_simple = f"📦 simple_zip ({n}경기)"
-        label_deep = f"📦 deep_zip ({n}경기)"
+        label = f"📦 {sport_filter} ZIP ({n}경기)"
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=cb)]])
 
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(label_simple, callback_data=cb_simple),
-            InlineKeyboardButton(label_deep, callback_data=cb_deep),
-        ]
-    ])
 
 def _build_export_comment_zip_markup_bv(which: str, limit_matches: int | None = None) -> InlineKeyboardMarkup:
     n = limit_matches or _default_zip_matches()
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(f"📦 basketball simple_zip ({n}경기)", callback_data=f"zip:{which}:basketball:{n}:simple"),
-            InlineKeyboardButton(f"📦 basketball deep_zip ({n}경기)", callback_data=f"zip:{which}:basketball:{n}:deep"),
-        ],
-        [
-            InlineKeyboardButton(f"📦 volleyball simple_zip ({n}경기)", callback_data=f"zip:{which}:volleyball:{n}:simple"),
-            InlineKeyboardButton(f"📦 volleyball deep_zip ({n}경기)", callback_data=f"zip:{which}:volleyball:{n}:deep"),
-        ],
+            InlineKeyboardButton(f"📦 basketball ZIP ({n}경기)", callback_data=f"zip:{which}:basketball:{n}"),
+            InlineKeyboardButton(f"📦 volleyball ZIP ({n}경기)", callback_data=f"zip:{which}:volleyball:{n}"),
+        ]
     ])
 
+
 def _build_export_comment_zip_markup_all(which: str, limit_matches: int | None = None) -> InlineKeyboardMarkup:
-    # 4종목 버튼 한번에 (simple_zip / deep_zip)
+    # 4종목 버튼 한번에
     n = limit_matches or _default_zip_matches()
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(f"📦 soccer simple_zip ({n})", callback_data=f"zip:{which}:soccer:{n}:simple"),
-            InlineKeyboardButton(f"📦 soccer deep_zip ({n})", callback_data=f"zip:{which}:soccer:{n}:deep"),
+            InlineKeyboardButton(f"📦 soccer ZIP ({n})", callback_data=f"zip:{which}:soccer:{n}"),
+            InlineKeyboardButton(f"📦 baseball ZIP ({n})", callback_data=f"zip:{which}:baseball:{n}"),
         ],
         [
-            InlineKeyboardButton(f"📦 baseball simple_zip ({n})", callback_data=f"zip:{which}:baseball:{n}:simple"),
-            InlineKeyboardButton(f"📦 baseball deep_zip ({n})", callback_data=f"zip:{which}:baseball:{n}:deep"),
-        ],
-        [
-            InlineKeyboardButton(f"📦 basketball simple_zip ({n})", callback_data=f"zip:{which}:basketball:{n}:simple"),
-            InlineKeyboardButton(f"📦 basketball deep_zip ({n})", callback_data=f"zip:{which}:basketball:{n}:deep"),
-        ],
-        [
-            InlineKeyboardButton(f"📦 volleyball simple_zip ({n})", callback_data=f"zip:{which}:volleyball:{n}:simple"),
-            InlineKeyboardButton(f"📦 volleyball deep_zip ({n})", callback_data=f"zip:{which}:volleyball:{n}:deep"),
+            InlineKeyboardButton(f"📦 basketball ZIP ({n})", callback_data=f"zip:{which}:basketball:{n}"),
+            InlineKeyboardButton(f"📦 volleyball ZIP ({n})", callback_data=f"zip:{which}:volleyball:{n}"),
         ],
     ])
+
 
 async def _send_export_comment_zip_file(
     chat_id: int,
@@ -4013,26 +3938,13 @@ async def _send_export_comment_zip_file(
     which: str,
     limit_matches: int,
     sport_filter: str = "",
-    mode: str = "simple",
 ) -> tuple[int, int, str]:
-    """export_* 시트의 댓글 컬럼을 ZIP(내부: 한 줄당 txt 1개)로 묶어 전송.
-
-    - mode="simple": comments (J열)
-    - mode="deep"  : deep_comments (L열)
-
+    """export_* 시트의 comments(H) 줄바꿈을 ZIP(내부: 한 줄당 txt 1개)로 묶어 전송.
     반환: (zip에 담긴 txt 파일 수, 처리한 경기 수, zip 파일명)
     """
     which = (which or "tomorrow").strip().lower()
     if which not in ("today", "tomorrow"):
         which = "tomorrow"
-
-    mode = (mode or "simple").strip().lower()
-    if mode not in ("simple", "deep"):
-        mode = "simple"
-
-    col_name = "comments" if mode == "simple" else "deep_comments"
-    # 과거 헤더(구버전) 호환을 위한 fallback 인덱스
-    fallback_idx = 7 if mode == "simple" else 11
 
     max_files = int(os.getenv("EXPORT_COMMENT_ZIP_MAX_FILES", os.getenv("EXPORT_COMMENT_TXT_MAX_FILES", "600")))
 
@@ -4058,7 +3970,7 @@ async def _send_export_comment_zip_file(
     i_sport = _idx("sport", 1)
     i_src = _idx("src_id", 2)
     i_title = _idx("title", 3)
-    i_col = _idx(col_name, fallback_idx)
+    i_comments = _idx("comments", 7)
 
     selected: list[tuple[str, str, list[str]]] = []  # (sid, title, comment_lines)
     for r in reversed(vals[1:]):
@@ -4068,8 +3980,8 @@ async def _send_export_comment_zip_file(
 
         sid = (r[i_src] if len(r) > i_src else "").strip()
         title = (r[i_title] if len(r) > i_title else "").strip()
-        raw = (r[i_col] if len(r) > i_col else "")
-        comment_lines = _split_comment_lines(raw)
+        comments_raw = (r[i_comments] if len(r) > i_comments else "")
+        comment_lines = _split_comment_lines(comments_raw)
 
         if not comment_lines:
             continue
@@ -4079,17 +3991,15 @@ async def _send_export_comment_zip_file(
             break
 
     if not selected:
-        col_hint = "J열(comments)" if mode == "simple" else "L열(deep_comments)"
-        msg = f"ZIP으로 보낼 댓글이 없어. export 시트 {col_hint}을 먼저 채워줘."
+        msg = "ZIP으로 보낼 댓글이 없어. export 시트 H열(comments)을 먼저 채워줘."
         if sport_filter:
-            msg = f"ZIP으로 보낼 댓글이 없어({sport_filter}). export 시트 {col_hint}을 먼저 채워줘."
+            msg = f"ZIP으로 보낼 댓글이 없어({sport_filter}). export 시트 H열(comments)을 먼저 채워줘."
         await context.bot.send_message(chat_id=chat_id, text=msg)
         return 0, 0, ""
 
     ts = now_kst().strftime("%Y%m%d_%H%M%S")
     sport_tag = sport_filter or "all"
-    zip_tag = "simple_zip" if mode == "simple" else "deep_zip"
-    zip_filename = f"{zip_tag}_{which}_{sport_tag}_{ts}.zip"
+    zip_filename = f"comments_{which}_{sport_tag}_{ts}.zip"
 
     bio = io.BytesIO()
     total_files = 0
@@ -4118,6 +4028,7 @@ async def _send_export_comment_zip_file(
         print(f"[EXPORT][ZIP] zip 생성/전송 실패: {e}")
         await context.bot.send_message(chat_id=chat_id, text=f"ZIP 생성/전송 중 오류: {e}")
         return 0, 0, ""
+
 
 async def export_comment_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """export 시트 H열(comments) → 한 줄당 txt를 ZIP으로 묶어 전송.
@@ -6083,12 +5994,7 @@ async def crawl_maz_analysis_common(
 
     # ✅ site_export 시트 저장
     if export_site and site_rows_to_append:
-        try:
-            ok2 = append_export_rows(export_sheet_name, site_rows_to_append)
-        except Exception as e:
-            print(f"[SITE_EXPORT][ERR] append_export_rows({export_sheet_name}) 예외: {e}")
-            await update.message.reply_text(f"site_export 시트 저장 중 예외가 발생했습니다: {e}")
-            return
+        ok2 = append_export_rows(export_sheet_name, site_rows_to_append)
         if not ok2:
             await update.message.reply_text("site_export 시트 저장 중 오류가 발생했습니다.")
             return
@@ -7374,49 +7280,28 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "noop":
         return
 
-    # export 댓글 ZIP 버튼 (simple_zip / deep_zip)
+    # export 댓글 ZIP 버튼 (1 zip 파일로 전송)
     if data.startswith("zip:"):
-        # 지원 포맷:
-        #   - 구버전: zip:{which}:{sport}:{n}
-        #   - 신버전: zip:{which}:{sport}:{n}:{simple|deep}
-        which = "tomorrow"
-        sport_key = ""
-        n = ""
-        mode = "simple"
-
         try:
-            parts = (data or "").split(":")
-            if len(parts) >= 4:
-                which = (parts[1] or "tomorrow").strip().lower()
-                sport_key = (parts[2] or "").strip().lower()
-                n = (parts[3] or "").strip()
-                if len(parts) >= 5:
-                    mode = (parts[4] or "simple").strip().lower()
+            _, which, sport_key, n = data.split(":", 3)
+            which = (which or "tomorrow").strip().lower()
+            sport_key = (sport_key or "").strip().lower()
+            limit_matches = int(n) if str(n).isdigit() else _default_zip_matches()
         except Exception:
-            which, sport_key, n, mode = "tomorrow", "", "", "simple"
+            which, limit_matches, sport_key = "tomorrow", _default_zip_matches(), ""
 
-        if which not in ("today", "tomorrow"):
-            which = "tomorrow"
-
-        if mode not in ("simple", "deep"):
-            mode = "simple"
-
-        limit_matches = int(n) if str(n).isdigit() else _default_zip_matches()
-
-        zip_tag = "simple_zip" if mode == "simple" else "deep_zip"
-        await q.message.reply_text(f"📦 {zip_tag} 생성/전송 시작: {which}, {limit_matches}경기, sport={sport_key or 'ALL'}")
+        await q.message.reply_text(f"📦 댓글 ZIP 생성/전송 시작: {which}, {limit_matches}경기, sport={sport_key or 'ALL'}")
         files_cnt, matches_cnt, zip_name = await _send_export_comment_zip_file(
             chat_id=q.message.chat_id,
             context=context,
             which=which,
             limit_matches=limit_matches,
             sport_filter=sport_key,
-            mode=mode,
         )
         if files_cnt and matches_cnt:
-            await q.message.reply_text(f"✅ {zip_tag} 전송 완료: {matches_cnt}경기 / {files_cnt}개 파일 (1 zip)")
+            await q.message.reply_text(f"✅ ZIP 전송 완료: {matches_cnt}경기 / {files_cnt}개 파일 (1 zip)")
         else:
-            await q.message.reply_text(f"{zip_tag} 전송할 댓글이 없거나 실패했습니다.")
+            await q.message.reply_text("ZIP 전송할 댓글이 없거나 실패했습니다.")
         return
 
     # export 댓글 TXT 버튼
@@ -8699,6 +8584,474 @@ async def youtoo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+# ───────────────── 네이버 카페(호치민이야기) 게시글 수집 → '호치민이야기' 탭 저장 ─────────────────
+# ✅ /crawlcafeviet 명령어:
+#   - 기본: 4~1페이지(pageSize=15)를 수집해서 구글시트 '호치민이야기' 탭에 저장
+#   - 제목(subject) + 본문(content) 저장, 본문은 OpenAI로 "표현만 자연스럽게 재작성"하여 content_rewrite 컬럼에도 저장
+#
+# ⚠️ 주의:
+#   - 아래 엔드포인트는 네이버 카페 웹에서 사용하는 내부 API 성격이라, 스펙/정책 변경 가능성이 있습니다.
+#   - 수집/재게시 시 카페 운영 정책/저작권/개인정보 정책을 준수하세요.
+
+VIET_CAFE_LIST_API_URL_DEFAULT = (
+    "https://apis.naver.com/cafe-web/cafe-boardlist-api/v1/cafes/28534281/menus/6/articles"
+    "?page=1&pageSize=15&sortBy=TIME&viewType=L"
+)
+
+VIET_CAFE_SHEET_NAME = (os.getenv("VIET_CAFE_SHEET_NAME") or "호치민이야기").strip()
+
+VIET_CAFE_HEADER = [
+    "fetchedAt",
+    "cafeId",
+    "menuId",
+    "articleId",
+    "title",
+    "summary",
+    "content_raw",
+    "content_rewrite",
+    "writeDateKST",
+    "commentCount",
+    "readCount",
+    "articleUrl",
+    "listApiUrl",
+    "detailApiUrl",
+    "writerNick",
+    "page",
+]
+
+def _viet_get_cookie() -> str:
+    """호치민이야기 크롤링용 쿠키 문자열.
+    우선순위:
+      NAVER_CAFE_VIET_COOKIE > NAVER_VIET_COOKIE > VIET_CAFE_COOKIE > (기존) NAVER_COOKIE/NAVER_CAFE_COOKIE/NAVER_WEB_COOKIE
+    """
+    ck = (
+        os.getenv("NAVER_CAFE_VIET_COOKIE")
+        or os.getenv("NAVER_VIET_COOKIE")
+        or os.getenv("VIET_CAFE_COOKIE")
+        or ""
+    )
+    ck = str(ck).strip()
+    if not ck:
+        ck = _get_naver_web_cookie()
+
+    # 따옴표 제거
+    if (ck.startswith('"') and ck.endswith('"')) or (ck.startswith("'") and ck.endswith("'")):
+        ck = ck[1:-1].strip()
+
+    # "Cookie:" 프리픽스 제거
+    if ck.lower().startswith("cookie:"):
+        ck = ck.split(":", 1)[1].strip()
+
+    # 줄바꿈/연속 공백 제거
+    ck = " ".join(ck.splitlines()).strip()
+    return ck
+
+def _viet_parse_cafe_menu_from_list_url(url: str) -> tuple[str, str]:
+    try:
+        m = re.search(r"/cafes/(\d+)/menus/(\d+)/articles", url)
+        if m:
+            return m.group(1), m.group(2)
+    except Exception:
+        pass
+    return (os.getenv("VIET_CAFE_ID") or "28534281", os.getenv("VIET_MENU_ID") or "6")
+
+def _viet_list_url_for_page(page: int) -> str:
+    """환경변수/기본 URL의 query를 유지한 채 page만 바꿔서 반환."""
+    base = (os.getenv("VIET_CAFE_LIST_API_URL") or VIET_CAFE_LIST_API_URL_DEFAULT).strip()
+    from urllib.parse import urlsplit, parse_qs, urlencode, urlunsplit
+    parts = urlsplit(base)
+    q = parse_qs(parts.query)
+    q["page"] = [str(max(1, int(page)))]
+    new_query = urlencode(q, doseq=True)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+
+def _viet_page_size_from_list_url() -> int:
+    base = (os.getenv("VIET_CAFE_LIST_API_URL") or VIET_CAFE_LIST_API_URL_DEFAULT).strip()
+    try:
+        from urllib.parse import urlsplit, parse_qs
+        q = parse_qs(urlsplit(base).query)
+        v = (q.get("pageSize") or ["15"])[0]
+        n = int(v)
+        return max(1, n)
+    except Exception:
+        return 15
+
+def _viet_web_headers(cafe_id: str, menu_id: str, *, referer: str | None = None) -> dict[str, str]:
+    cookie = _viet_get_cookie()
+    ua = (
+        (os.getenv("NAVER_USER_AGENT") or "").strip()
+        or (os.getenv("MAZ_USER_AGENT") or "").strip()
+        or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    )
+
+    if not referer:
+        referer = (os.getenv("VIET_CAFE_REFERER") or "").strip()
+    if not referer:
+        # ca-fe 기준 게시판 URL 형태(대체로 무난)
+        referer = f"https://cafe.naver.com/ca-fe/cafes/{cafe_id}/boards/{menu_id}"
+
+    headers = {
+        "User-Agent": ua,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": referer,
+        "Origin": "https://cafe.naver.com",
+        "Connection": "keep-alive",
+    }
+    if cookie:
+        headers["Cookie"] = cookie
+    return headers
+
+def get_viet_ws():
+    """구글시트 '호치민이야기' 탭 워크시트 반환(없으면 생성 + 헤더 세팅)."""
+    client_gs = get_gs_client()
+    spreadsheet_id = os.getenv("SPREADSHEET_ID")
+    if not (client_gs and spreadsheet_id):
+        return None
+
+    try:
+        sh = client_gs.open_by_key(spreadsheet_id)
+        ws = _get_ws_by_name(sh, VIET_CAFE_SHEET_NAME)
+        if not ws:
+            ws = sh.add_worksheet(title=VIET_CAFE_SHEET_NAME, rows=4000, cols=max(10, len(VIET_CAFE_HEADER)))
+
+        # 필요 시 컬럼 확장(절대 축소 X)
+        try:
+            if getattr(ws, "col_count", 0) < len(VIET_CAFE_HEADER):
+                ws.resize(cols=len(VIET_CAFE_HEADER))
+        except Exception:
+            pass
+
+        _ensure_header(ws, VIET_CAFE_HEADER)
+        return ws
+    except Exception as e:
+        print(f"[GSHEET][VIET] 워크시트 준비 실패({VIET_CAFE_SHEET_NAME}): {e}")
+        return None
+
+def get_existing_viet_article_ids(ws) -> set[str]:
+    """시트에 이미 저장된 articleId set."""
+    try:
+        header = ws.row_values(1) or []
+    except Exception:
+        header = []
+    try:
+        col = (header.index("articleId") + 1) if "articleId" in header else -1
+    except Exception:
+        col = -1
+    if col <= 0:
+        return set()
+    try:
+        vals = ws.col_values(col) or []
+    except Exception:
+        vals = []
+    out: set[str] = set()
+    for v in vals[1:]:
+        s = str(v).strip()
+        if s:
+            out.add(s)
+    return out
+
+def _viet_article_url(cafe_id: str, article_id: str) -> str:
+    return f"https://cafe.naver.com/ca-fe/cafes/{cafe_id}/articles/{article_id}"
+
+def _viet_detail_api_url(cafe_id: str, article_id: str) -> str:
+    # 게시글 상세 API (v3)
+    return f"https://apis.naver.com/cafe-web/cafe-articleapi/v3/cafes/{cafe_id}/articles/{article_id}"
+
+async def _viet_fetch_json(client: httpx.AsyncClient, url: str, headers: dict[str, str]) -> tuple[int, dict | None, str]:
+    """(status_code, json_or_none, text_snippet)"""
+    try:
+        r = await client.get(url, headers=headers, timeout=20.0)
+        snippet = (r.text or "")[:500]
+        if r.status_code != 200:
+            return r.status_code, None, snippet
+        try:
+            return r.status_code, r.json(), snippet
+        except Exception:
+            return r.status_code, None, snippet
+    except Exception as e:
+        return 0, None, str(e)[:500]
+
+def _viet_extract_article_text(detail_json: dict | None) -> str:
+    """게시글 상세 JSON에서 본문 텍스트를 최대한 찾아서 반환."""
+    if not isinstance(detail_json, dict):
+        return ""
+    # 보통: {"result": {"article": {...}}}
+    root = detail_json.get("result") if isinstance(detail_json.get("result"), dict) else detail_json
+    art = None
+    if isinstance(root, dict):
+        if isinstance(root.get("article"), dict):
+            art = root.get("article")
+        elif isinstance(root.get("item"), dict):
+            art = root.get("item")
+        else:
+            art = root
+    if not isinstance(art, dict):
+        return ""
+
+    def _pick_str(d: dict, keys: list[str]) -> str:
+        for k in keys:
+            v = d.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return ""
+
+    html_body = ""
+    text_body = ""
+
+    # 1) 최우선: contentHtml 계열
+    html_body = _pick_str(art, ["contentHtml", "contentHTML", "content_html", "ContentHtml"])
+    # 2) content가 dict인 케이스
+    c = art.get("content")
+    if not html_body and isinstance(c, dict):
+        html_body = _pick_str(c, ["contentHtml", "contentHTML", "html", "bodyHtml"])
+        text_body = _pick_str(c, ["contentText", "text", "bodyText"])
+    # 3) plain text 계열
+    if not text_body:
+        text_body = _pick_str(art, ["contentText", "contentPlain", "content_text", "text"])
+
+    # 4) 마지막 폴백: html_body가 있으면 텍스트로 추출
+    if html_body and not text_body:
+        try:
+            text_body = BeautifulSoup(html_body, "html.parser").get_text("\n", strip=True)
+        except Exception:
+            text_body = html_body
+
+    text_body = (text_body or "").strip()
+    text_body = re.sub(r"\n{3,}", "\n\n", text_body).strip()
+    return text_body
+
+def _viet_rewrite_text(text: str) -> str:
+    """본문 텍스트를 의미 유지하며 자연스럽게 재작성(표현만 변경). 실패 시 빈 문자열."""
+    if not text:
+        return ""
+    enabled = str(os.getenv("VIET_REWRITE_ENABLED", "1")).strip().lower() not in ("0", "false", "no", "off")
+    if not enabled:
+        return ""
+    client_oa = get_openai_client()
+    if not client_oa:
+        return ""
+    try:
+        max_chars = int(os.getenv("VIET_REWRITE_MAX_CHARS", "2500"))
+    except Exception:
+        max_chars = 2500
+
+    src = str(text).strip()
+    if max_chars > 0 and len(src) > max_chars:
+        src = src[:max_chars].rstrip()
+
+    prompt = f"""아래 글을 의미와 정보는 유지하되, 문장 구조와 표현을 자연스럽게 바꿔 재작성해줘.
+
+조건:
+- 사실/의미 유지
+- 어투는 자연스러운 한국어
+- 원문을 그대로 복붙한 느낌이 나지 않게
+- 과도한 축약 금지(핵심 내용 유지)
+- 출력은 재작성된 본문만 (머리말/설명/따옴표 금지)
+
+원문:
+{src}
+"""
+    try:
+        resp = client_oa.chat.completions.create(
+            model=os.getenv("VIET_REWRITE_MODEL", "gpt-4.1-mini"),
+            messages=[
+                {"role": "system", "content": "You rewrite Korean community posts naturally while preserving meaning."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.4,
+        )
+        out = (resp.choices[0].message.content or "").strip()
+        out = re.sub(r"\n{3,}", "\n\n", out).strip()
+        return out
+    except Exception:
+        return ""
+
+async def crawlcafeviet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/crawlcafeviet:
+    호치민이야기(카페ID=28534281, 메뉴=6) 게시판 API에서 4~1페이지 글을 수집하여 구글시트 '호치민이야기' 탭에 저장.
+    옵션(선택):
+      - /crawlcafeviet 4 1        -> 페이지 범위 지정(기본: 4 1)
+      - /crawlcafeviet rewrite=0  -> 재작성 비활성화(원문만 저장)
+    """
+    if not is_admin(update):
+        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+
+    cookie = _viet_get_cookie()
+    if not cookie:
+        await update.message.reply_text(
+            "호치민이야기 크롤링용 쿠키가 없습니다.\n"
+            "- NAVER_CAFE_VIET_COOKIE(권장) 또는 NAVER_COOKIE 환경변수에 브라우저 쿠키 문자열을 넣어주세요."
+        )
+        return
+
+    # 기본 페이지 범위(요청: 4~1)
+    start_page = 4
+    end_page = 1
+    rewrite_enabled = True
+
+    # args 파싱
+    args = list(context.args or [])
+    nums = [a for a in args if str(a).strip().isdigit()]
+    if len(nums) >= 1:
+        start_page = int(nums[0])
+    if len(nums) >= 2:
+        end_page = int(nums[1])
+    for a in args:
+        s = str(a).strip().lower()
+        if s in ("rewrite=0", "rewrite=off", "rewrite=false", "rewrite=no"):
+            rewrite_enabled = False
+
+    # 역방향(큰 페이지 → 작은 페이지)만 지원(요청대로 4→1). 반대로 들어오면 swap
+    if start_page < end_page:
+        start_page, end_page = end_page, start_page
+
+    list_base = (os.getenv("VIET_CAFE_LIST_API_URL") or VIET_CAFE_LIST_API_URL_DEFAULT).strip()
+    cafe_id, menu_id = _viet_parse_cafe_menu_from_list_url(list_base)
+    page_size = _viet_page_size_from_list_url()
+
+    ws = get_viet_ws()
+    if not ws:
+        await update.message.reply_text("구글시트 연동 실패: SPREADSHEET_ID / GOOGLE_SERVICE_KEY를 확인하세요.")
+        return
+
+    existing = get_existing_viet_article_ids(ws)
+
+    try:
+        delay_sec = float(os.getenv("VIET_CAFE_DELAY_SEC", "0.2"))
+        if delay_sec < 0:
+            delay_sec = 0.0
+    except Exception:
+        delay_sec = 0.2
+
+    await update.message.reply_text(
+        f"호치민이야기 카페 수집 시작\n"
+        f"- cafeId={cafe_id}, menuId={menu_id}\n"
+        f"- 페이지: {start_page} → {end_page} (pageSize={page_size})\n"
+        f"- 재작성: {'ON' if rewrite_enabled else 'OFF'}"
+    )
+
+    total_new = 0
+    total_skip = 0
+    total_fail = 0
+    total_pages = 0
+
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        for page in range(start_page, end_page - 1, -1):
+            total_pages += 1
+            list_url = _viet_list_url_for_page(page)
+            headers = _viet_web_headers(cafe_id, menu_id)
+            st, j, snip = await _viet_fetch_json(client, list_url, headers)
+
+            if not j:
+                total_fail += 1
+                await update.message.reply_text(f"⚠️ {page}페이지 목록 호출 실패: HTTP {st} / {snip[:120]}")
+                continue
+
+            article_list = j.get("result", {}).get("articleList", []) or []
+            page_rows = []
+            page_skip = 0
+            page_new = 0
+
+            for entry in article_list:
+                if not isinstance(entry, dict):
+                    continue
+                item = entry.get("item")
+                if not isinstance(item, dict):
+                    continue
+                article_id = item.get("articleId")
+                if article_id is None:
+                    continue
+                sid = str(article_id).strip()
+                if not sid:
+                    continue
+
+                if sid in existing:
+                    page_skip += 1
+                    continue
+
+                subject = str(item.get("subject") or "").strip()
+                summary = str(item.get("summary") or "").strip()
+
+                writer_nick = ""
+                wi = item.get("writerInfo")
+                if isinstance(wi, dict):
+                    writer_nick = str(wi.get("nickName") or "").strip()
+
+                write_kst = _ms_to_kst_str(item.get("writeDateTimestamp"))
+                comment_cnt = item.get("commentCount", "")
+                read_cnt = item.get("readCount", "")
+
+                article_url = _viet_article_url(cafe_id, sid)
+                detail_url = _viet_detail_api_url(cafe_id, sid)
+
+                # 상세 본문 가져오기
+                detail_headers = _viet_web_headers(cafe_id, menu_id, referer=article_url)
+                st2, detail_json, _ = await _viet_fetch_json(client, detail_url, detail_headers)
+
+                content_raw = _viet_extract_article_text(detail_json) if detail_json else ""
+                if not content_raw:
+                    # 상세 API가 막히면 summary라도 저장
+                    content_raw = summary
+
+                content_rewrite = ""
+                if rewrite_enabled:
+                    content_rewrite = _viet_rewrite_text(content_raw)
+
+                fetched_at = now_kst().isoformat()
+
+                page_rows.append([
+                    fetched_at,
+                    str(cafe_id),
+                    str(menu_id),
+                    sid,
+                    subject,
+                    summary,
+                    content_raw,
+                    content_rewrite,
+                    write_kst,
+                    str(comment_cnt),
+                    str(read_cnt),
+                    article_url,
+                    list_url,
+                    detail_url,
+                    writer_nick,
+                    str(page),
+                ])
+
+                existing.add(sid)
+                page_new += 1
+
+                if delay_sec:
+                    await asyncio.sleep(delay_sec)
+
+            # 페이지 단위로 시트 저장(중간 실패 대비)
+            if page_rows:
+                try:
+                    ws.append_rows(page_rows, value_input_option="RAW", table_range="A1")
+                    total_new += page_new
+                except Exception as e:
+                    total_fail += page_new
+                    await update.message.reply_text(f"⚠️ {page}페이지 시트 저장 실패: {e}")
+                    continue
+
+            total_skip += page_skip
+
+            await update.message.reply_text(
+                f"✅ {page}페이지 완료: 신규 {page_new} / 중복 {page_skip} / 목록 {len(article_list)}"
+            )
+
+    await update.message.reply_text(
+        f"✅ 호치민이야기 수집 완료\n"
+        f"- 페이지 처리: {total_pages}p\n"
+        f"- 신규 저장: {total_new}건\n"
+        f"- 중복 스킵: {total_skip}건\n"
+        f"- 실패: {total_fail}건"
+    )
+
+
+
 def main():
     reload_analysis_from_sheet()
     reload_news_from_sheet()
@@ -8727,7 +9080,8 @@ def main():
     app.add_handler(CommandHandler("export_comment_txt", export_comment_txt))
     app.add_handler(CommandHandler("export_comment_zip", export_comment_zip))
     app.add_handler(CommandHandler("export_comment_zip_buttons", export_comment_zip_buttons))
-    app.add_handler(CommandHandler("youtoo", youtoo))  # 네이버 카페 메뉴 글 수집 → youtoo 시트
+    app.add_handler(CommandHandler("youtoo", youtoo))
+    app.add_handler(CommandHandler("crawlcafeviet", crawlcafeviet))  # 호치민이야기 카페 크롤링  # 네이버 카페 메뉴 글 수집 → youtoo 시트
 
     # 네이버 카페 자동 글쓰기(종목별 게시판)  ※ /cafe_soccer [tomorrow] 처럼 사용
     app.add_handler(CommandHandler("cafe_soccer", cafe_soccer))
