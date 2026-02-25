@@ -7838,6 +7838,68 @@ def _col_letter(n: int) -> str:
 # 자동 갱신 범위(A~K)의 끝 컬럼(기본: K)
 YOUTOO_AUTO_END_COL = _col_letter(len(YOUTOO_AUTO_HEADER))
 
+# ---- Google Sheets write retry for YOUTOO (429 quota / transient errors) ----
+try:
+    from gspread.exceptions import APIError as GspreadAPIError  # type: ignore
+except Exception:
+    # gspread가 없는 환경(로컬 테스트 등)에서도 import 에러로 죽지 않게 폴백
+    GspreadAPIError = Exception  # type: ignore
+
+_YOUTOO_LAST_ERROR: str = ""
+
+def _gsheet_api_status(err: Exception) -> int | None:
+    """gspread APIError 등에서 HTTP status code를 최대한 추출."""
+    resp = getattr(err, "response", None)
+    code = getattr(resp, "status_code", None)
+    if isinstance(code, int):
+        return code
+
+    # 문자열에 "[429]" 같은 형태가 포함되는 케이스 대응
+    s = str(err)
+    m = _re_simple.search(r"\[(\d{3})\]", s)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    return None
+
+def _is_gsheets_quota_err(err: Exception) -> bool:
+    code = _gsheet_api_status(err)
+    if code == 429:
+        return True
+    s = str(err)
+    return ("429" in s) or ("Quota exceeded" in s) or ("Write requests" in s)
+
+def _format_gsheet_error(err: Exception) -> str:
+    code = _gsheet_api_status(err)
+    s = str(err)
+    if code == 429 or _is_gsheets_quota_err(err):
+        return "Google Sheets 쓰기 쿼터(429) 초과"
+    if code == 403:
+        return "Google Sheets 권한/공유 설정(403) 문제"
+    if code == 404:
+        return "Google Sheets ID/시트 경로(404) 문제"
+    # 너무 길면 축약
+    return s if len(s) <= 300 else s[:300] + "…"
+
+def _gsheet_write_with_backoff(op_name: str, func, max_retries: int | None = None):
+    """Google Sheets write 호출을 429(쿼터) 등에 대해 백오프 재시도."""
+    retries = int(max_retries if max_retries is not None else os.getenv("GSHEET_WRITE_MAX_RETRIES", "4"))
+    base = float(os.getenv("GSHEET_WRITE_BACKOFF_BASE", "1.5"))
+    for attempt in range(retries + 1):
+        try:
+            return func()
+        except GspreadAPIError as e:  # type: ignore
+            if _is_gsheets_quota_err(e) and attempt < retries:
+                sleep_s = min(base * (2 ** attempt), 30.0)
+                sleep_s += float(_random.uniform(0, 0.35))  # small jitter
+                print(f"[GSHEET][YOUTOO] {op_name}: quota backoff {sleep_s:.2f}s (attempt {attempt+1}/{retries})")
+                time.sleep(sleep_s)
+                continue
+            raise
+
+
 # 과거 버전/표기 차이 호환(자동 마이그레이션용)
 _YOUTOO_COL_ALIASES: dict[str, list[str]] = {
     "첫댓글내용": ["첫댓글"],
@@ -7880,7 +7942,7 @@ def ensure_youtoo_header(ws) -> None:
                 ws.resize(cols=len(YOUTOO_HEADER))
         except Exception:
             pass
-        ws.update("A1", [YOUTOO_HEADER])
+        ws.update(range_name="A1", values=[YOUTOO_HEADER], value_input_option="RAW")
         return
 
     # get_all_values()는 "헤더 행의 빈 셀"을 끝까지 반환하지 않을 수 있으므로,
@@ -7916,7 +7978,7 @@ def ensure_youtoo_header(ws) -> None:
                 ws.update_cell(1, col_idx_1based, name)
             except Exception:
                 try:
-                    ws.update(f"{_col_letter(col_idx_1based)}1", [[name]])
+                    ws.update(range_name=f"{_col_letter(col_idx_1based)}1", values=[[name]], value_input_option="RAW")
                 except Exception:
                     pass
         return
@@ -7955,7 +8017,7 @@ def ensure_youtoo_header(ws) -> None:
     except Exception:
         pass
 
-    ws.update("A1", [YOUTOO_HEADER] + new_rows, value_input_option="RAW")
+    ws.update(range_name="A1", values=[YOUTOO_HEADER] + new_rows, value_input_option="RAW")
 
 def get_youtoo_ws():
     """youtoo 탭 워크시트 반환(없으면 생성 + 헤더 세팅)."""
@@ -8019,14 +8081,18 @@ def upsert_youtoo_rows_top(rows: list[list[str]]) -> tuple[bool, int, int]:
     반환: (ok, inserted_count, updated_count)
 
     - src_id 기준으로 중복을 판단한다.
-    - 이미 존재하면 해당 행을 덮어쓴다(댓글수/조회수/좋아요 등이 갱신될 수 있으므로).
+    - 이미 존재하면 해당 행의 A~K(자동 컬럼)만 덮어쓴다.  (L~M 수기 컬럼 보호)
     - 신규는 insert_rows(row=2)로 상단에 붙인다.
     """
+    global _YOUTOO_LAST_ERROR
+    _YOUTOO_LAST_ERROR = ""
+
     if not rows:
         return True, 0, 0
 
     ws = get_youtoo_ws()
     if not ws:
+        _YOUTOO_LAST_ERROR = "워크시트 준비 실패(구글 서비스키/스프레드시트 ID/공유 권한 확인)"
         return False, 0, 0
 
     # 헤더 보정/마이그레이션
@@ -8037,9 +8103,18 @@ def upsert_youtoo_rows_top(rows: list[list[str]]) -> tuple[bool, int, int]:
     except Exception:
         values = []
 
+    # 헤더가 없으면 생성
     if not values:
-        ws.update("A1", [YOUTOO_HEADER])
-        values = [YOUTOO_HEADER]
+        try:
+            _gsheet_write_with_backoff(
+                "youtoo.init_header",
+                lambda: ws.update(range_name="A1", values=[YOUTOO_HEADER], value_input_option="RAW"),
+            )
+            values = [YOUTOO_HEADER]
+        except Exception as e:
+            _YOUTOO_LAST_ERROR = _format_gsheet_error(e)
+            print(f"[GSHEET][YOUTOO] 헤더 초기화 실패: {e}")
+            return False, 0, 0
 
     header = [c.strip() for c in values[0]]
     try:
@@ -8055,11 +8130,10 @@ def upsert_youtoo_rows_top(rows: list[list[str]]) -> tuple[bool, int, int]:
             if sid and sid not in existing_map:
                 existing_map[sid] = i
 
-    updated = 0
+    update_payloads: list[dict] = []
     to_insert: list[list[str]] = []
     seen: set[str] = set()
 
-    # 1) 기존 행 업데이트(삽입 전에 수행해야 row index가 흔들리지 않음)
     for r in rows:
         if not r:
             continue
@@ -8076,22 +8150,54 @@ def upsert_youtoo_rows_top(rows: list[list[str]]) -> tuple[bool, int, int]:
 
         if sid in existing_map:
             row_num = existing_map[sid]
-            try:
-                rr_auto = rr[: len(YOUTOO_AUTO_HEADER)]
-                ws.update(f"A{row_num}:{YOUTOO_AUTO_END_COL}{row_num}", [rr_auto], value_input_option="RAW")
-                updated += 1
-            except Exception as e:
-                print(f"[GSHEET][YOUTOO] update 실패(src_id={sid}): {e}")
+            rr_auto = rr[: len(YOUTOO_AUTO_HEADER)]
+            update_payloads.append(
+                {
+                    "range": f"A{row_num}:{YOUTOO_AUTO_END_COL}{row_num}",
+                    "values": [rr_auto],
+                }
+            )
         else:
             to_insert.append(rr)
 
+    updated = 0
+    # ✅ 1) 기존 행 업데이트(삽입 전에 수행해야 row index가 흔들리지 않음)
+    if update_payloads:
+        try:
+            # gspread >= 6: batch_update(data=[{'range':..., 'values':...}, ...])
+            _gsheet_write_with_backoff(
+                "youtoo.batch_update",
+                lambda: ws.batch_update(update_payloads, value_input_option="RAW"),
+            )
+            updated = len(update_payloads)
+        except Exception as e:
+            # batch_update가 없거나(구버전) 실패하면 per-row 업데이트로 폴백
+            print(f"[GSHEET][YOUTOO] batch_update 실패(폴백 시도): {e}")
+            try:
+                for req in update_payloads:
+                    rng = req.get("range")
+                    vals = req.get("values")
+                    _gsheet_write_with_backoff(
+                        "youtoo.update",
+                        lambda rng=rng, vals=vals: ws.update(range_name=rng, values=vals, value_input_option="RAW"),
+                    )
+                updated = len(update_payloads)
+            except Exception as e2:
+                _YOUTOO_LAST_ERROR = _format_gsheet_error(e2)
+                print(f"[GSHEET][YOUTOO] update 실패: {e2}")
+                return False, 0, 0
+
     inserted = 0
+    # ✅ 2) 신규는 맨 위(2행)에 넣어서 최신이 위로 오게 한다.
     if to_insert:
         try:
-            # ✅ 신규는 맨 위(2행)에 넣어서 최신이 위로 오게 한다.
-            ws.insert_rows(to_insert, row=2, value_input_option="RAW")
+            _gsheet_write_with_backoff(
+                "youtoo.insert_rows",
+                lambda: ws.insert_rows(to_insert, row=2, value_input_option="RAW"),
+            )
             inserted = len(to_insert)
         except Exception as e:
+            _YOUTOO_LAST_ERROR = _format_gsheet_error(e)
             print(f"[GSHEET][YOUTOO] insert_rows 오류: {e}")
             return False, inserted, updated
 
@@ -8567,7 +8673,17 @@ async def youtoo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if new_rows:
             ok, inserted, updated = upsert_youtoo_rows_top(new_rows)
             if not ok:
-                await update.message.reply_text("구글시트(youtoo)에 저장하지 못했습니다. 권한/시트 상태를 확인하세요.")
+                err = (_YOUTOO_LAST_ERROR or "").strip()
+                if err and ("429" in err or "쿼터" in err):
+                    await update.message.reply_text(
+                        "구글시트(youtoo) 저장 실패: Google Sheets 쓰기 쿼터(429) 초과입니다.\n"
+                        "1~2분 후 다시 실행해 주세요.\n"
+                        "(다른 크롤링/저장 명령과 동시에 돌리면 더 잘 걸립니다)"
+                    )
+                else:
+                    await update.message.reply_text(
+                        f"구글시트(youtoo)에 저장하지 못했습니다.\n사유: {err or '알 수 없는 오류'}"
+                    )
                 return
 
         await update.message.reply_text(
@@ -8581,474 +8697,6 @@ async def youtoo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"요청 중 오류가 발생했습니다: {e}")
         return
-
-
-
-# ───────────────── 네이버 카페(호치민이야기) 게시글 수집 → '호치민이야기' 탭 저장 ─────────────────
-# ✅ /crawlcafeviet 명령어:
-#   - 기본: 4~1페이지(pageSize=15)를 수집해서 구글시트 '호치민이야기' 탭에 저장
-#   - 제목(subject) + 본문(content) 저장, 본문은 OpenAI로 "표현만 자연스럽게 재작성"하여 content_rewrite 컬럼에도 저장
-#
-# ⚠️ 주의:
-#   - 아래 엔드포인트는 네이버 카페 웹에서 사용하는 내부 API 성격이라, 스펙/정책 변경 가능성이 있습니다.
-#   - 수집/재게시 시 카페 운영 정책/저작권/개인정보 정책을 준수하세요.
-
-VIET_CAFE_LIST_API_URL_DEFAULT = (
-    "https://apis.naver.com/cafe-web/cafe-boardlist-api/v1/cafes/28534281/menus/6/articles"
-    "?page=1&pageSize=15&sortBy=TIME&viewType=L"
-)
-
-VIET_CAFE_SHEET_NAME = (os.getenv("VIET_CAFE_SHEET_NAME") or "호치민이야기").strip()
-
-VIET_CAFE_HEADER = [
-    "fetchedAt",
-    "cafeId",
-    "menuId",
-    "articleId",
-    "title",
-    "summary",
-    "content_raw",
-    "content_rewrite",
-    "writeDateKST",
-    "commentCount",
-    "readCount",
-    "articleUrl",
-    "listApiUrl",
-    "detailApiUrl",
-    "writerNick",
-    "page",
-]
-
-def _viet_get_cookie() -> str:
-    """호치민이야기 크롤링용 쿠키 문자열.
-    우선순위:
-      NAVER_CAFE_VIET_COOKIE > NAVER_VIET_COOKIE > VIET_CAFE_COOKIE > (기존) NAVER_COOKIE/NAVER_CAFE_COOKIE/NAVER_WEB_COOKIE
-    """
-    ck = (
-        os.getenv("NAVER_CAFE_VIET_COOKIE")
-        or os.getenv("NAVER_VIET_COOKIE")
-        or os.getenv("VIET_CAFE_COOKIE")
-        or ""
-    )
-    ck = str(ck).strip()
-    if not ck:
-        ck = _get_naver_web_cookie()
-
-    # 따옴표 제거
-    if (ck.startswith('"') and ck.endswith('"')) or (ck.startswith("'") and ck.endswith("'")):
-        ck = ck[1:-1].strip()
-
-    # "Cookie:" 프리픽스 제거
-    if ck.lower().startswith("cookie:"):
-        ck = ck.split(":", 1)[1].strip()
-
-    # 줄바꿈/연속 공백 제거
-    ck = " ".join(ck.splitlines()).strip()
-    return ck
-
-def _viet_parse_cafe_menu_from_list_url(url: str) -> tuple[str, str]:
-    try:
-        m = re.search(r"/cafes/(\d+)/menus/(\d+)/articles", url)
-        if m:
-            return m.group(1), m.group(2)
-    except Exception:
-        pass
-    return (os.getenv("VIET_CAFE_ID") or "28534281", os.getenv("VIET_MENU_ID") or "6")
-
-def _viet_list_url_for_page(page: int) -> str:
-    """환경변수/기본 URL의 query를 유지한 채 page만 바꿔서 반환."""
-    base = (os.getenv("VIET_CAFE_LIST_API_URL") or VIET_CAFE_LIST_API_URL_DEFAULT).strip()
-    from urllib.parse import urlsplit, parse_qs, urlencode, urlunsplit
-    parts = urlsplit(base)
-    q = parse_qs(parts.query)
-    q["page"] = [str(max(1, int(page)))]
-    new_query = urlencode(q, doseq=True)
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
-
-def _viet_page_size_from_list_url() -> int:
-    base = (os.getenv("VIET_CAFE_LIST_API_URL") or VIET_CAFE_LIST_API_URL_DEFAULT).strip()
-    try:
-        from urllib.parse import urlsplit, parse_qs
-        q = parse_qs(urlsplit(base).query)
-        v = (q.get("pageSize") or ["15"])[0]
-        n = int(v)
-        return max(1, n)
-    except Exception:
-        return 15
-
-def _viet_web_headers(cafe_id: str, menu_id: str, *, referer: str | None = None) -> dict[str, str]:
-    cookie = _viet_get_cookie()
-    ua = (
-        (os.getenv("NAVER_USER_AGENT") or "").strip()
-        or (os.getenv("MAZ_USER_AGENT") or "").strip()
-        or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    )
-
-    if not referer:
-        referer = (os.getenv("VIET_CAFE_REFERER") or "").strip()
-    if not referer:
-        # ca-fe 기준 게시판 URL 형태(대체로 무난)
-        referer = f"https://cafe.naver.com/ca-fe/cafes/{cafe_id}/boards/{menu_id}"
-
-    headers = {
-        "User-Agent": ua,
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Referer": referer,
-        "Origin": "https://cafe.naver.com",
-        "Connection": "keep-alive",
-    }
-    if cookie:
-        headers["Cookie"] = cookie
-    return headers
-
-def get_viet_ws():
-    """구글시트 '호치민이야기' 탭 워크시트 반환(없으면 생성 + 헤더 세팅)."""
-    client_gs = get_gs_client()
-    spreadsheet_id = os.getenv("SPREADSHEET_ID")
-    if not (client_gs and spreadsheet_id):
-        return None
-
-    try:
-        sh = client_gs.open_by_key(spreadsheet_id)
-        ws = _get_ws_by_name(sh, VIET_CAFE_SHEET_NAME)
-        if not ws:
-            ws = sh.add_worksheet(title=VIET_CAFE_SHEET_NAME, rows=4000, cols=max(10, len(VIET_CAFE_HEADER)))
-
-        # 필요 시 컬럼 확장(절대 축소 X)
-        try:
-            if getattr(ws, "col_count", 0) < len(VIET_CAFE_HEADER):
-                ws.resize(cols=len(VIET_CAFE_HEADER))
-        except Exception:
-            pass
-
-        _ensure_header(ws, VIET_CAFE_HEADER)
-        return ws
-    except Exception as e:
-        print(f"[GSHEET][VIET] 워크시트 준비 실패({VIET_CAFE_SHEET_NAME}): {e}")
-        return None
-
-def get_existing_viet_article_ids(ws) -> set[str]:
-    """시트에 이미 저장된 articleId set."""
-    try:
-        header = ws.row_values(1) or []
-    except Exception:
-        header = []
-    try:
-        col = (header.index("articleId") + 1) if "articleId" in header else -1
-    except Exception:
-        col = -1
-    if col <= 0:
-        return set()
-    try:
-        vals = ws.col_values(col) or []
-    except Exception:
-        vals = []
-    out: set[str] = set()
-    for v in vals[1:]:
-        s = str(v).strip()
-        if s:
-            out.add(s)
-    return out
-
-def _viet_article_url(cafe_id: str, article_id: str) -> str:
-    return f"https://cafe.naver.com/ca-fe/cafes/{cafe_id}/articles/{article_id}"
-
-def _viet_detail_api_url(cafe_id: str, article_id: str) -> str:
-    # 게시글 상세 API (v3)
-    return f"https://apis.naver.com/cafe-web/cafe-articleapi/v3/cafes/{cafe_id}/articles/{article_id}"
-
-async def _viet_fetch_json(client: httpx.AsyncClient, url: str, headers: dict[str, str]) -> tuple[int, dict | None, str]:
-    """(status_code, json_or_none, text_snippet)"""
-    try:
-        r = await client.get(url, headers=headers, timeout=20.0)
-        snippet = (r.text or "")[:500]
-        if r.status_code != 200:
-            return r.status_code, None, snippet
-        try:
-            return r.status_code, r.json(), snippet
-        except Exception:
-            return r.status_code, None, snippet
-    except Exception as e:
-        return 0, None, str(e)[:500]
-
-def _viet_extract_article_text(detail_json: dict | None) -> str:
-    """게시글 상세 JSON에서 본문 텍스트를 최대한 찾아서 반환."""
-    if not isinstance(detail_json, dict):
-        return ""
-    # 보통: {"result": {"article": {...}}}
-    root = detail_json.get("result") if isinstance(detail_json.get("result"), dict) else detail_json
-    art = None
-    if isinstance(root, dict):
-        if isinstance(root.get("article"), dict):
-            art = root.get("article")
-        elif isinstance(root.get("item"), dict):
-            art = root.get("item")
-        else:
-            art = root
-    if not isinstance(art, dict):
-        return ""
-
-    def _pick_str(d: dict, keys: list[str]) -> str:
-        for k in keys:
-            v = d.get(k)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-        return ""
-
-    html_body = ""
-    text_body = ""
-
-    # 1) 최우선: contentHtml 계열
-    html_body = _pick_str(art, ["contentHtml", "contentHTML", "content_html", "ContentHtml"])
-    # 2) content가 dict인 케이스
-    c = art.get("content")
-    if not html_body and isinstance(c, dict):
-        html_body = _pick_str(c, ["contentHtml", "contentHTML", "html", "bodyHtml"])
-        text_body = _pick_str(c, ["contentText", "text", "bodyText"])
-    # 3) plain text 계열
-    if not text_body:
-        text_body = _pick_str(art, ["contentText", "contentPlain", "content_text", "text"])
-
-    # 4) 마지막 폴백: html_body가 있으면 텍스트로 추출
-    if html_body and not text_body:
-        try:
-            text_body = BeautifulSoup(html_body, "html.parser").get_text("\n", strip=True)
-        except Exception:
-            text_body = html_body
-
-    text_body = (text_body or "").strip()
-    text_body = re.sub(r"\n{3,}", "\n\n", text_body).strip()
-    return text_body
-
-def _viet_rewrite_text(text: str) -> str:
-    """본문 텍스트를 의미 유지하며 자연스럽게 재작성(표현만 변경). 실패 시 빈 문자열."""
-    if not text:
-        return ""
-    enabled = str(os.getenv("VIET_REWRITE_ENABLED", "1")).strip().lower() not in ("0", "false", "no", "off")
-    if not enabled:
-        return ""
-    client_oa = get_openai_client()
-    if not client_oa:
-        return ""
-    try:
-        max_chars = int(os.getenv("VIET_REWRITE_MAX_CHARS", "2500"))
-    except Exception:
-        max_chars = 2500
-
-    src = str(text).strip()
-    if max_chars > 0 and len(src) > max_chars:
-        src = src[:max_chars].rstrip()
-
-    prompt = f"""아래 글을 의미와 정보는 유지하되, 문장 구조와 표현을 자연스럽게 바꿔 재작성해줘.
-
-조건:
-- 사실/의미 유지
-- 어투는 자연스러운 한국어
-- 원문을 그대로 복붙한 느낌이 나지 않게
-- 과도한 축약 금지(핵심 내용 유지)
-- 출력은 재작성된 본문만 (머리말/설명/따옴표 금지)
-
-원문:
-{src}
-"""
-    try:
-        resp = client_oa.chat.completions.create(
-            model=os.getenv("VIET_REWRITE_MODEL", "gpt-4.1-mini"),
-            messages=[
-                {"role": "system", "content": "You rewrite Korean community posts naturally while preserving meaning."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.4,
-        )
-        out = (resp.choices[0].message.content or "").strip()
-        out = re.sub(r"\n{3,}", "\n\n", out).strip()
-        return out
-    except Exception:
-        return ""
-
-async def crawlcafeviet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/crawlcafeviet:
-    호치민이야기(카페ID=28534281, 메뉴=6) 게시판 API에서 4~1페이지 글을 수집하여 구글시트 '호치민이야기' 탭에 저장.
-    옵션(선택):
-      - /crawlcafeviet 4 1        -> 페이지 범위 지정(기본: 4 1)
-      - /crawlcafeviet rewrite=0  -> 재작성 비활성화(원문만 저장)
-    """
-    if not is_admin(update):
-        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
-        return
-
-    cookie = _viet_get_cookie()
-    if not cookie:
-        await update.message.reply_text(
-            "호치민이야기 크롤링용 쿠키가 없습니다.\n"
-            "- NAVER_CAFE_VIET_COOKIE(권장) 또는 NAVER_COOKIE 환경변수에 브라우저 쿠키 문자열을 넣어주세요."
-        )
-        return
-
-    # 기본 페이지 범위(요청: 4~1)
-    start_page = 4
-    end_page = 1
-    rewrite_enabled = True
-
-    # args 파싱
-    args = list(context.args or [])
-    nums = [a for a in args if str(a).strip().isdigit()]
-    if len(nums) >= 1:
-        start_page = int(nums[0])
-    if len(nums) >= 2:
-        end_page = int(nums[1])
-    for a in args:
-        s = str(a).strip().lower()
-        if s in ("rewrite=0", "rewrite=off", "rewrite=false", "rewrite=no"):
-            rewrite_enabled = False
-
-    # 역방향(큰 페이지 → 작은 페이지)만 지원(요청대로 4→1). 반대로 들어오면 swap
-    if start_page < end_page:
-        start_page, end_page = end_page, start_page
-
-    list_base = (os.getenv("VIET_CAFE_LIST_API_URL") or VIET_CAFE_LIST_API_URL_DEFAULT).strip()
-    cafe_id, menu_id = _viet_parse_cafe_menu_from_list_url(list_base)
-    page_size = _viet_page_size_from_list_url()
-
-    ws = get_viet_ws()
-    if not ws:
-        await update.message.reply_text("구글시트 연동 실패: SPREADSHEET_ID / GOOGLE_SERVICE_KEY를 확인하세요.")
-        return
-
-    existing = get_existing_viet_article_ids(ws)
-
-    try:
-        delay_sec = float(os.getenv("VIET_CAFE_DELAY_SEC", "0.2"))
-        if delay_sec < 0:
-            delay_sec = 0.0
-    except Exception:
-        delay_sec = 0.2
-
-    await update.message.reply_text(
-        f"호치민이야기 카페 수집 시작\n"
-        f"- cafeId={cafe_id}, menuId={menu_id}\n"
-        f"- 페이지: {start_page} → {end_page} (pageSize={page_size})\n"
-        f"- 재작성: {'ON' if rewrite_enabled else 'OFF'}"
-    )
-
-    total_new = 0
-    total_skip = 0
-    total_fail = 0
-    total_pages = 0
-
-    async with httpx.AsyncClient(follow_redirects=True) as client:
-        for page in range(start_page, end_page - 1, -1):
-            total_pages += 1
-            list_url = _viet_list_url_for_page(page)
-            headers = _viet_web_headers(cafe_id, menu_id)
-            st, j, snip = await _viet_fetch_json(client, list_url, headers)
-
-            if not j:
-                total_fail += 1
-                await update.message.reply_text(f"⚠️ {page}페이지 목록 호출 실패: HTTP {st} / {snip[:120]}")
-                continue
-
-            article_list = j.get("result", {}).get("articleList", []) or []
-            page_rows = []
-            page_skip = 0
-            page_new = 0
-
-            for entry in article_list:
-                if not isinstance(entry, dict):
-                    continue
-                item = entry.get("item")
-                if not isinstance(item, dict):
-                    continue
-                article_id = item.get("articleId")
-                if article_id is None:
-                    continue
-                sid = str(article_id).strip()
-                if not sid:
-                    continue
-
-                if sid in existing:
-                    page_skip += 1
-                    continue
-
-                subject = str(item.get("subject") or "").strip()
-                summary = str(item.get("summary") or "").strip()
-
-                writer_nick = ""
-                wi = item.get("writerInfo")
-                if isinstance(wi, dict):
-                    writer_nick = str(wi.get("nickName") or "").strip()
-
-                write_kst = _ms_to_kst_str(item.get("writeDateTimestamp"))
-                comment_cnt = item.get("commentCount", "")
-                read_cnt = item.get("readCount", "")
-
-                article_url = _viet_article_url(cafe_id, sid)
-                detail_url = _viet_detail_api_url(cafe_id, sid)
-
-                # 상세 본문 가져오기
-                detail_headers = _viet_web_headers(cafe_id, menu_id, referer=article_url)
-                st2, detail_json, _ = await _viet_fetch_json(client, detail_url, detail_headers)
-
-                content_raw = _viet_extract_article_text(detail_json) if detail_json else ""
-                if not content_raw:
-                    # 상세 API가 막히면 summary라도 저장
-                    content_raw = summary
-
-                content_rewrite = ""
-                if rewrite_enabled:
-                    content_rewrite = _viet_rewrite_text(content_raw)
-
-                fetched_at = now_kst().isoformat()
-
-                page_rows.append([
-                    fetched_at,
-                    str(cafe_id),
-                    str(menu_id),
-                    sid,
-                    subject,
-                    summary,
-                    content_raw,
-                    content_rewrite,
-                    write_kst,
-                    str(comment_cnt),
-                    str(read_cnt),
-                    article_url,
-                    list_url,
-                    detail_url,
-                    writer_nick,
-                    str(page),
-                ])
-
-                existing.add(sid)
-                page_new += 1
-
-                if delay_sec:
-                    await asyncio.sleep(delay_sec)
-
-            # 페이지 단위로 시트 저장(중간 실패 대비)
-            if page_rows:
-                try:
-                    ws.append_rows(page_rows, value_input_option="RAW", table_range="A1")
-                    total_new += page_new
-                except Exception as e:
-                    total_fail += page_new
-                    await update.message.reply_text(f"⚠️ {page}페이지 시트 저장 실패: {e}")
-                    continue
-
-            total_skip += page_skip
-
-            await update.message.reply_text(
-                f"✅ {page}페이지 완료: 신규 {page_new} / 중복 {page_skip} / 목록 {len(article_list)}"
-            )
-
-    await update.message.reply_text(
-        f"✅ 호치민이야기 수집 완료\n"
-        f"- 페이지 처리: {total_pages}p\n"
-        f"- 신규 저장: {total_new}건\n"
-        f"- 중복 스킵: {total_skip}건\n"
-        f"- 실패: {total_fail}건"
-    )
 
 
 
@@ -9080,8 +8728,7 @@ def main():
     app.add_handler(CommandHandler("export_comment_txt", export_comment_txt))
     app.add_handler(CommandHandler("export_comment_zip", export_comment_zip))
     app.add_handler(CommandHandler("export_comment_zip_buttons", export_comment_zip_buttons))
-    app.add_handler(CommandHandler("youtoo", youtoo))
-    app.add_handler(CommandHandler("crawlcafeviet", crawlcafeviet))  # 호치민이야기 카페 크롤링  # 네이버 카페 메뉴 글 수집 → youtoo 시트
+    app.add_handler(CommandHandler("youtoo", youtoo))  # 네이버 카페 메뉴 글 수집 → youtoo 시트
 
     # 네이버 카페 자동 글쓰기(종목별 게시판)  ※ /cafe_soccer [tomorrow] 처럼 사용
     app.add_handler(CommandHandler("cafe_soccer", cafe_soccer))
