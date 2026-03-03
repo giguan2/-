@@ -9317,7 +9317,7 @@ async def _ensure_quiz_schema(ws) -> None:
         updates.append({"range": "L3:U3", "values": [sort_header]})
 
     if updates:
-        await _gsheet_call_with_backoff("quiz_schema.batch_update", ws.batch_update, updates, value_input_option="RAW")
+        await _gsheet_call_with_backoff("quiz_schema.batch_update", ws.batch_update, updates, value_input_option="USER_ENTERED")
 
     # freeze(선택): 실패해도 무시
     try:
