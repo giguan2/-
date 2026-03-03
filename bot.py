@@ -9269,13 +9269,56 @@ def get_quiz_ws():
 
 async def _ensure_quiz_schema(ws) -> None:
     """
-    (중요) 퀴즈 시트의 서식/수식은 사용자가 직접 관리합니다.
-    - 이전 버전: A1~U4(정답/헤더/수식/정렬뷰)를 자동 세팅/수정
-    - 현재 버전: 크롤링/리셋 시 **시트 서식/수식/헤더를 절대 건드리지 않도록** 자동 세팅을 중단
+    (중요) 퀴즈 시트의 서식/헤더는 사용자가 직접 관리합니다.
 
-    필요하면 구글시트에서 직접 수식/헤더/정렬뷰를 작성하세요.
+    다만, '주간 정답 횟수(I열)' 자동 계산이 필요하므로 /quizcrawl 실행 시
+    I4 셀에 ArrayFormula가 없거나 텍스트로 들어가 있어(앞에 ' 가 붙는 경우 포함) 동작하지 않으면
+    아래 수식을 1회 자동으로 세팅합니다.
+
+    이 외 범위(A열 헤더/정렬뷰 등)는 건드리지 않습니다.
     """
-    return
+    if not ws:
+        return
+
+    # I4: 주간 정답 횟수(ArrayFormula)
+    desired = "=ARRAYFORMULA(IF(A4:A=\"\",\"\",MMULT(--((TO_TEXT(B4:H)=TO_TEXT(B$1:H$1))*(B$1:H$1<>\"\")),TRANSPOSE(COLUMN(B$1:H$1)^0))))"
+
+    def _get_single(rng: str, render: str) -> str:
+        try:
+            v = ws.get(rng, value_render_option=render)
+            if v and isinstance(v, list) and v[0] and isinstance(v[0], list) and len(v[0]) >= 1:
+                return str(v[0][0] if v[0][0] is not None else "")
+        except Exception:
+            pass
+        return ""
+
+    def _norm(s: str) -> str:
+        return "".join((s or "").split())
+
+    try:
+        f_cell = _get_single("I4", "FORMULA").strip()
+        v_cell = _get_single("I4", "FORMATTED_VALUE").strip()
+
+        # FORMULA 렌더는 수식(또는 텍스트)을 그대로 돌려주고,
+        # FORMATTED_VALUE 렌더는 '진짜 수식'이면 계산 결과를 돌려줍니다.
+        # (텍스트로 들어간 수식은 FORMATTED_VALUE에서도 '='로 시작)
+        is_text_formula = f_cell.startswith("=") and v_cell.startswith("=")
+        has_any_formula = f_cell.startswith("=")
+        needs = (not has_any_formula) or is_text_formula or (_norm(f_cell) != _norm(desired))
+
+        if needs:
+            updates = [{"range": "I4", "values": [[desired]]}]
+            await _gsheet_call_with_backoff(
+                "quiz_schema.I4",
+                ws.batch_update,
+                updates,
+                value_input_option="USER_ENTERED",
+            )
+            print("[GSHEET][QUIZ] I4 ArrayFormula ensured.")
+    except Exception as e:
+        print(f"[GSHEET][QUIZ] ensure I4 formula error: {e}")
+        return
+
 
 async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/quizcrawl M.DD : 해당 날짜(작성일 기준) 게시글 1개를 찾고 댓글 전체를 수집해 '퀴즈' 시트에 반영."""
@@ -9329,6 +9372,15 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ws:
         await update.message.reply_text("구글시트(퀴즈 탭) 준비에 실패했습니다. SPREADSHEET_ID/권한을 확인하세요.")
         return
+
+    # I4(주간 정답 횟수) ArrayFormula 최소 세팅
+    # - 텍스트로 들어간 수식('=...') 때문에 계산이 안 되는 경우를 자동 복구
+    # - 다른 범위(헤더/정렬뷰)는 건드리지 않음
+    try:
+        await _ensure_quiz_schema(ws)
+    except Exception:
+        pass
+
 
     # 네이버 쿠키
     cookie = _get_naver_quiz_cookie()
