@@ -9268,63 +9268,14 @@ def get_quiz_ws():
 
 
 async def _ensure_quiz_schema(ws) -> None:
-    """퀴즈 시트 스키마/수식이 없으면 세팅(기존 값 최대한 유지)."""
-    if not ws:
-        return
+    """
+    (중요) 퀴즈 시트의 서식/수식은 사용자가 직접 관리합니다.
+    - 이전 버전: A1~U4(정답/헤더/수식/정렬뷰)를 자동 세팅/수정
+    - 현재 버전: 크롤링/리셋 시 **시트 서식/수식/헤더를 절대 건드리지 않도록** 자동 세팅을 중단
 
-    # 기대 구조
-    header = ["nickname", "월 제출답", "화 제출답", "수 제출답", "목 제출답", "금 제출답", "토 제출답", "일 제출답", "주간 정답 횟수", "정답자 여부"]
-    # 수식은 가능한 ArrayFormula로 1회만 세팅
-    f_I4 = "=ARRAYFORMULA(IF(A4:A=\"\",,MMULT(--(B4:H=B$1:H$1),TRANSPOSE(COLUMN(B1:H1)^0))))"
-    f_J4 = "=ARRAYFORMULA(IF(A4:A=\"\",,IF(I4:I>0,1,0)))"
-    f_L4 = "=IFERROR(SORT(FILTER(A4:J, A4:A<>\"\"), 9, FALSE, 1, TRUE),)"  # 정렬뷰
-
-    # 현재 상태 읽기(최소 범위)
-    try:
-        top = ws.get("A1:U4")  # 1~4행(정답/헤더/수식)만 확인
-    except Exception:
-        top = []
-
-    def _cell(r: int, c: int) -> str:
-        try:
-            return str(top[r-1][c-1]) if len(top) >= r and len(top[r-1]) >= c else ""
-        except Exception:
-            return ""
-
-    updates = []
-
-    # A1 라벨(선택)
-    if not _cell(1, 1).strip():
-        updates.append({"range": "A1", "values": [["정답(월~일) 입력"]]})
-
-    # A3:J3 헤더
-    row3 = [(_cell(3, i) or "").strip() for i in range(1, 11)]
-    if row3[: len(header)] != header:
-        updates.append({"range": "A3:J3", "values": [header]})
-
-    # I4/J4/L4 수식
-    if not str(_cell(4, 9)).strip().startswith("="):
-        updates.append({"range": "I4", "values": [[f_I4]]})
-    if not str(_cell(4, 10)).strip().startswith("="):
-        updates.append({"range": "J4", "values": [[f_J4]]})
-    if not str(_cell(4, 12)).strip().startswith("="):
-        updates.append({"range": "L4", "values": [[f_L4]]})
-
-    # 정렬뷰 헤더(선택) L3:U3
-    sort_header = ["정렬뷰_nickname", "월", "화", "수", "목", "금", "토", "일", "주간정답", "정답여부"]
-    row3_l = [(_cell(3, 12 + i) or "").strip() for i in range(0, 10)]
-    if row3_l[: len(sort_header)] != sort_header:
-        updates.append({"range": "L3:U3", "values": [sort_header]})
-
-    if updates:
-        await _gsheet_call_with_backoff("quiz_schema.batch_update", ws.batch_update, updates, value_input_option="USER_ENTERED")
-
-    # freeze(선택): 실패해도 무시
-    try:
-        ws.freeze(rows=3)
-    except Exception:
-        pass
-
+    필요하면 구글시트에서 직접 수식/헤더/정렬뷰를 작성하세요.
+    """
+    return
 
 async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/quizcrawl M.DD : 해당 날짜(작성일 기준) 게시글 1개를 찾고 댓글 전체를 수집해 '퀴즈' 시트에 반영."""
@@ -9377,12 +9328,6 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ws = get_quiz_ws()
     if not ws:
         await update.message.reply_text("구글시트(퀴즈 탭) 준비에 실패했습니다. SPREADSHEET_ID/권한을 확인하세요.")
-        return
-
-    try:
-        await _ensure_quiz_schema(ws)
-    except Exception as e:
-        await update.message.reply_text(f"퀴즈 시트 스키마 세팅 중 오류: {e}")
         return
 
     # 네이버 쿠키
@@ -9602,7 +9547,7 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def quiz_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/quiz_reset : '퀴즈' 탭의 제출답(B~H) 영역만 초기화."""
+    """/quiz_reset : '퀴즈' 탭의 닉네임(A열) + 제출답(B~H) 데이터를 초기화."""
     if not is_admin(update):
         await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
         return
@@ -9613,19 +9558,12 @@ async def quiz_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        await _ensure_quiz_schema(ws)
-    except Exception:
-        pass
-
-    try:
-        # 닉네임 마지막 행 계산(가능하면 최소 범위만)
-        nicks_raw = ws.get("A4:A")
-        nicks = [r[0] for r in (nicks_raw or []) if r and str(r[0]).strip()]
-        last = 3 + len(nicks)
+        # 데이터 영역 전체 초기화 (A4~H) — 닉네임도 함께 초기화
+        last = int(getattr(ws, "row_count", 2000) or 2000)
         last = max(4, last)
-        rng = f"B4:H{last}"
+        rng = f"A4:H{last}"
         await _gsheet_call_with_backoff("quiz_reset.batch_clear", ws.batch_clear, [rng])
-        await update.message.reply_text(f"✅ 퀴즈 제출답 영역 초기화 완료: {rng}")
+        await update.message.reply_text(f"✅ 퀴즈 데이터 초기화 완료: {rng}")
     except Exception as e:
         await update.message.reply_text(f"초기화 중 오류가 발생했습니다: {e}")
 
