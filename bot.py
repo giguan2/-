@@ -8868,6 +8868,23 @@ def _ms_to_kst_date(ts_ms) -> datetime.date | None:
         return None
 
 
+
+def _ms_to_kst_dt(ts_ms) -> datetime | None:
+    """네이버 timestamp(ms 또는 sec) → KST datetime(aware)."""
+    try:
+        n = int(ts_ms)
+    except Exception:
+        return None
+    if n > 10**12:
+        sec = n / 1000.0
+    else:
+        sec = float(n)
+    try:
+        return datetime.fromtimestamp(sec, tz=timezone.utc).astimezone(KST)
+    except Exception:
+        return None
+
+
 def _parse_md_arg(s: str) -> tuple[int, int] | None:
     """입력 포맷: M.DD (0패딩 허용, 3.3 / 03.03 등)."""
     raw = (s or "").strip()
@@ -8879,6 +8896,49 @@ def _parse_md_arg(s: str) -> tuple[int, int] | None:
     if not (1 <= mm <= 12 and 1 <= dd <= 31):
         return None
     return (mm, dd)
+
+
+
+def _parse_hhmm(s: str) -> tuple[int, int] | None:
+    """'02:30', '14:30' 같은 HH:MM(또는 시간 서식) 문자열을 (hh, mm)로 파싱.
+    - '오전/오후', 'AM/PM', '02:30:00' 형태도 최대한 지원
+    - 숫자(0~1) 형태(시트 시간 serial)도 지원(예: 0.1041666...)
+    """
+    raw = str(s or "").strip()
+    if not raw:
+        return None
+
+    # 1) 구글시트가 시간 serial(0~1)로 내려주는 경우 대비
+    try:
+        if re.fullmatch(r"\d+(?:\.\d+)?", raw):
+            f = float(raw)
+            if 0.0 <= f < 1.0:
+                total_minutes = int(round(f * 24 * 60))
+                hh = (total_minutes // 60) % 24
+                mm = total_minutes % 60
+                return (hh, mm)
+    except Exception:
+        pass
+
+    low = raw.lower()
+    is_pm = ("pm" in low) or ("오후" in raw)
+    is_am = ("am" in low) or ("오전" in raw)
+
+    m = re.search(r"(\d{1,2})\s*:\s*(\d{1,2})", raw)
+    if not m:
+        return None
+
+    hh = int(m.group(1))
+    mm = int(m.group(2))
+
+    if is_pm and hh < 12:
+        hh += 12
+    if is_am and hh == 12:
+        hh = 0
+
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        return None
+    return (hh, mm)
 
 
 async def _http_get_json_with_retry(
@@ -9060,7 +9120,7 @@ def _extract_comment_nick_and_text(it: dict) -> tuple[str, str, int]:
 
     # 작성 시각 후보(ms)
     ts = 0
-    for k in ("updateDate", "createdDate", "writeDate", "regDate", "timestamp"):
+    for k in ("createdDate", "writeDate", "regDate", "updateDate", "timestamp"):
         v = it.get(k)
         try:
             if v is None:
@@ -9381,6 +9441,30 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
+    # 퀴즈 마감시간(B2:H2) 로딩 (해당 요일 컬럼)
+    # - 값이 비어있으면 마감시간 필터를 적용하지 않습니다.
+    # - 값이 있지만 형식이 올바르지 않으면(예: '2시30분') 안전을 위해 중단합니다.
+    deadline_raw = ""
+    deadline_hm: tuple[int, int] | None = None
+    try:
+        row2 = ws.get("B2:H2", value_render_option="FORMATTED_VALUE")
+        if row2 and isinstance(row2, list) and len(row2) >= 1 and isinstance(row2[0], list):
+            row = row2[0]
+            if len(row) > dow:
+                deadline_raw = str(row[dow] if row[dow] is not None else "").strip()
+    except Exception as e:
+        print(f"[GSHEET][QUIZ] deadline read error: {e}")
+
+    if deadline_raw:
+        deadline_hm = _parse_hhmm(deadline_raw)
+        if not deadline_hm:
+            await update.message.reply_text(
+                "퀴즈 시트의 마감시간(B2:H2) 형식이 올바르지 않습니다.\n"
+                f"- 현재 값({day_col}2): {deadline_raw}\n"
+                "형식 예: 02:30, 14:30"
+            )
+            return
+
 
     # 네이버 쿠키
     cookie = _get_naver_quiz_cookie()
@@ -9404,6 +9488,7 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     found_article_id = ""
     found_subject = ""
     found_ts = None
+    found_write_dt = None
 
     try:
         async with httpx.AsyncClient(follow_redirects=True) as client:
@@ -9453,6 +9538,7 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         found_article_id = str(aid)
                         found_subject = str(item.get("subject") or "").strip()
                         found_ts = d
+                        found_write_dt = _ms_to_kst_dt(wts)
                         break
                 if found_article_id:
                     break
@@ -9488,11 +9574,42 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"요청 중 오류가 발생했습니다: {e}")
         return
 
+    # 2.5) 마감시간 적용 (퀴즈!B2:H2)
+    # - 마감시간이 게시글 작성일의 '다음날'일 수 있음:
+    #   게시글 작성 시각(HH:MM)보다 마감 HH:MM 이 작으면, 다음날로 간주합니다.
+    deadline_cutoff_ms: int | None = None
+    deadline_cutoff_kst = ""
+    if deadline_hm and found_ts:
+        hh, mi = deadline_hm
+        cutoff_dt = datetime(found_ts.year, found_ts.month, found_ts.day, hh, mi, tzinfo=KST)
+        try:
+            if found_write_dt:
+                post_hm = (found_write_dt.hour, found_write_dt.minute)
+                if (hh, mi) < post_hm:
+                    cutoff_dt = cutoff_dt + timedelta(days=1)
+        except Exception:
+            pass
+
+        try:
+            deadline_cutoff_ms = int(cutoff_dt.astimezone(timezone.utc).timestamp() * 1000)
+        except Exception:
+            deadline_cutoff_ms = None
+
+        deadline_cutoff_kst = cutoff_dt.strftime("%Y-%m-%d %H:%M")
+        print(f"[QUIZ] deadline {day_col}2='{deadline_raw}' => cutoff={deadline_cutoff_kst} KST")
+
     # 3) 댓글 → (닉네임, 답안) 추출 + 중복 제거(첫 답안만)
     # 작성시간 오름차순
     parsed = []
+    deadline_skip = 0
     for it in items:
         nick, text, ts = _extract_comment_nick_and_text(it)
+
+        # 마감시간 이후 댓글은 제외
+        if deadline_cutoff_ms and ts and ts > deadline_cutoff_ms:
+            deadline_skip += 1
+            continue
+
         if not nick or not text:
             continue
         parsed.append((ts, nick, text))
@@ -9595,6 +9712,8 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- 기존값 있어 스킵: {skipped_already}명\n"
         f"- 반영 컬럼: {day_col}(월~일 제출답)"
     )
+    if deadline_cutoff_kst:
+        summary += f"\n- 마감시간({day_col}2): {deadline_raw} (cutoff={deadline_cutoff_kst} KST / 이후 제외 {deadline_skip}개)"
     await update.message.reply_text(summary)
 
 
