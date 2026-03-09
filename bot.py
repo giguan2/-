@@ -2212,6 +2212,7 @@ def _sanitize_env_http_url(raw: str, *, base_url: str = "") -> str:
     - 잘못 붙은 KEY= prefix 제거 (예: /MAZ_LIST_API=https://...)
     - 상대경로(/api/...)면 base_url과 결합
     """
+    from urllib.parse import urljoin
     s = (raw or "").strip().strip('"').strip("'")
     if not s:
         return s
@@ -2235,6 +2236,7 @@ def _sanitize_env_http_url(raw: str, *, base_url: str = "") -> str:
 
 def _merge_url_query(base_url: str, extra_params: dict) -> str:
     """기존 query가 있어도 안전하게 파라미터를 병합한다."""
+    from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qsl, urlencode
     base_url = _sanitize_env_http_url(base_url, base_url=MAZ_BASE_URL)
     parts = urlsplit(base_url)
 
