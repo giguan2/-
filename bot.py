@@ -2202,55 +2202,59 @@ def _log_httpx_exception(prefix: str, e: Exception) -> None:
 # ----------------------------
 # HTTP helpers (Mazgtv anti-bot 대응: 브라우저 헤더 + 쿠키 워밍업)
 # ----------------------------
-def _normalize_env_url(raw: str, fallback: str) -> str:
+MAZ_BASE_URL = os.getenv("MAZ_BASE_URL", "https://mazgtv3.com").rstrip("/")
+MAZ_LIST_API = os.getenv("MAZ_LIST_API", f"{MAZ_BASE_URL}/api/board/list")
+
+
+def _sanitize_env_http_url(raw: str, *, base_url: str = "") -> str:
     """환경변수 URL 문자열을 안전하게 정리한다.
-    - 실수로 '/MAZ_LIST_API=https://...' 또는 'MAZ_LIST_API=https://...' 형태로 넣은 경우 복구
-    - 양끝 공백/따옴표 제거
+    - 앞뒤 공백/따옴표 제거
+    - 잘못 붙은 KEY= prefix 제거 (예: /MAZ_LIST_API=https://...)
+    - 상대경로(/api/...)면 base_url과 결합
     """
     s = (raw or "").strip().strip('"').strip("'")
     if not s:
-        return fallback
+        return s
 
-    # Render 환경변수 값에 키 이름까지 넣는 실수 방지
-    for prefix in ("MAZ_LIST_API=", "/MAZ_LIST_API=", "MAZ_BASE_URL=", "/MAZ_BASE_URL="):
-        if s.startswith(prefix):
-            s = s[len(prefix):].strip()
+    # 잘못 복사된 prefix 제거: /MAZ_LIST_API=..., MAZ_LIST_API=...
+    for key in ("MAZ_LIST_API=", "/MAZ_LIST_API=", "MAZ_BASE_URL=", "/MAZ_BASE_URL="):
+        if s.startswith(key):
+            s = s[len(key):].strip()
             break
 
-    # 선행 슬래시만 잘못 붙은 경우 제거 (/https://...)
+    # /https://example.com 같은 오입력 보정
     if s.startswith("/http://") or s.startswith("/https://"):
         s = s[1:]
 
-    return s or fallback
+    # 상대경로면 base_url과 결합
+    if s.startswith("/") and base_url:
+        s = urljoin(base_url.rstrip("/") + "/", s.lstrip("/"))
+
+    return s
 
 
-MAZ_BASE_URL = _normalize_env_url(os.getenv("MAZ_BASE_URL", ""), "https://litfusegroup.com").rstrip("/")
-MAZ_LIST_API = _normalize_env_url(os.getenv("MAZ_LIST_API", ""), f"{MAZ_BASE_URL}/api/board/list")
-MAZ_DETAIL_API_TEMPLATE = _normalize_env_url(
-    os.getenv("MAZ_DETAIL_API_TEMPLATE", ""),
-    f"{MAZ_BASE_URL}/api/board/{{board_id}}",
-)
+def _merge_url_query(base_url: str, extra_params: dict) -> str:
+    """기존 query가 있어도 안전하게 파라미터를 병합한다."""
+    base_url = _sanitize_env_http_url(base_url, base_url=MAZ_BASE_URL)
+    parts = urlsplit(base_url)
+
+    # scheme이 없으면 MAZ_BASE_URL 기준으로 절대 URL 보정
+    if not parts.scheme:
+        base_url = urljoin(MAZ_BASE_URL.rstrip("/") + "/", base_url.lstrip("/"))
+        parts = urlsplit(base_url)
+
+    q = dict(parse_qsl(parts.query, keep_blank_values=True))
+    for k, v in (extra_params or {}).items():
+        if v is None:
+            continue
+        q[str(k)] = str(v)
+
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(q, doseq=True), parts.fragment))
 
 
-def _build_maz_list_url(*, page: int, perpage: int, board_type: int, category: int, sort: str) -> str:
-    """MAZ_LIST_API가 이미 쿼리스트링을 포함해도 안전하게 목록 URL을 생성한다."""
-    from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
-
-    base = (MAZ_LIST_API or "").strip()
-    parts = urlsplit(base)
-    query = dict(parse_qsl(parts.query, keep_blank_values=True))
-
-    # 코드 호출부에서 넘긴 값을 우선 적용
-    query.update({
-        "page": str(page),
-        "perpage": str(perpage),
-        "boardType": str(board_type),
-        "category": str(category),
-        "sort": sort,
-    })
-
-    new_query = urlencode(query, doseq=True)
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+# 환경변수 URL 오입력 보정
+MAZ_BASE_URL = _sanitize_env_http_url(MAZ_BASE_URL) or MAZ_BASE_URL
+MAZ_LIST_API = _sanitize_env_http_url(MAZ_LIST_API, base_url=MAZ_BASE_URL) or MAZ_LIST_API
 
 
 def build_maz_list_params(*, page: int = 1, perpage: int = 15, type_: str = "event",
@@ -2293,7 +2297,7 @@ import math
 import io
 import zipfile
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, quote_plus, unquote_plus
+from urllib.parse import urljoin, quote_plus, unquote_plus, urlsplit, urlunsplit, parse_qsl, urlencode
 from openai import OpenAI
 
 from telegram import (
@@ -3589,21 +3593,15 @@ async def export_comment_fill(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     사용:
       /export_comment_fill
-      /export_comment_fill today|tomorrow|all [limit] [force] [simple|deep|both]
+      /export_comment_fill today|tomorrow|all [limit] [force] [deep|both]
 
-    기본 동작(✅ 요청 반영):
-      - /export_comment_fill (인자 없음) → comments + deep_comments 둘 다 채움(비어있는 것만)
-      - 최신 행(아래쪽)부터 최대 30행(경기) 처리
+    기본 동작:
+      - tomorrow 시트에서 comments(심플용)가 비어있는 행을 최신순으로 최대 30개 채움
 
     옵션:
-      - simple : comments(심플)만
-      - deep   : deep_comments(심층)만
-      - both   : comments + deep_comments
-      - force  : 이미 값이 있어도 덮어쓰기(단, 생성 결과가 비어있으면 덮어쓰지 않음)
-
-    주의:
-      - OpenAI 생성 실패(키/모델/레이트리밋 등) 시, 시트가 비어있는 상태로 남을 수 있음
-      - 이 경우 "생성 실패" 카운트와 마지막 에러를 응답에 포함한다.
+      - deep : deep_comments(심층용)만 채움
+      - both : comments + deep_comments를 함께 채움(비어있는 것만)
+      - force: 이미 값이 있어도 덮어쓰기
     """
     if not is_admin(update):
         await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
@@ -3613,38 +3611,23 @@ async def export_comment_fill(update: Update, context: ContextTypes.DEFAULT_TYPE
     target = "tomorrow"
     limit = 30
     force = False
-
-    # mode를 명시하지 않으면 기본은 both(요청사항)
-    mode: str | None = None  # simple | deep | both
+    mode = "simple"  # simple | deep | both
 
     for a in args:
-        al = (a or "").strip().lower()
-        if not al:
-            continue
+        al = a.lower()
         if al in ("today", "tomorrow", "all"):
             target = al
-            continue
-        if al.isdigit():
+        elif al.isdigit():
             try:
                 limit = int(al)
             except Exception:
                 pass
-            continue
-        if al in ("force", "overwrite"):
+        elif al in ("force", "overwrite"):
             force = True
-            continue
-        if al in ("simple", "comments", "comment", "sim", "j"):
-            mode = "simple"
-            continue
-        if al in ("deep", "deep_comments", "deepcomment", "deepcomments", "l"):
+        elif al in ("deep", "deep_comments", "deepcomment", "deepcomments"):
             mode = "deep"
-            continue
-        if al in ("both", "allcols", "allcol", "bothcols", "allcomment"):
+        elif al in ("both", "allcols", "allcol", "bothcols"):
             mode = "both"
-            continue
-
-    if mode is None:
-        mode = "both"
 
     limit = max(1, min(int(limit), 200))
 
@@ -3662,29 +3645,12 @@ async def export_comment_fill(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     total_updated_simple = 0
     total_updated_deep = 0
-    total_attempt_rows = 0
-    total_gen_fail_simple = 0
-    total_gen_fail_deep = 0
-    total_write_fail = 0
-    last_err = ""
 
     for sheet_name in sheet_names:
         ws = get_export_ws(sheet_name)
         if not ws:
             await update.message.reply_text(f"{sheet_name} 시트를 찾을 수 없습니다.")
             continue
-
-        # (구버전 호환) deep_comments가 필요한 모드인데 헤더에 없으면 스키마 보정
-        try:
-            first = ws.row_values(1)
-        except Exception:
-            first = []
-        first_norm = [str(c).strip() for c in (first or [])]
-        if mode in ("deep", "both") and ("deep_comments" not in first_norm):
-            try:
-                ensure_export_schema(ws, EXPORT_HEADER)
-            except Exception as e:
-                print(f"[GSHEET][EXPORT_COMMENT] ensure_export_schema 실패({sheet_name}): {e}")
 
         try:
             vals = ws.get_all_values()
@@ -3696,11 +3662,10 @@ async def export_comment_fill(update: Update, context: ContextTypes.DEFAULT_TYPE
             continue
 
         header = vals[0]
-        header_norm = [str(h).strip() for h in header]
 
         def _idx(name: str, fallback: int) -> int:
             try:
-                return header_norm.index(name)
+                return header.index(name)
             except ValueError:
                 return fallback
 
@@ -3708,28 +3673,20 @@ async def export_comment_fill(update: Update, context: ContextTypes.DEFAULT_TYPE
         i_title = _idx("title", 3)
         i_body = _idx("body", 4)
         i_simple = _idx("simple", 6)
-        # ✅ 최신 헤더 기준: comments=J(9), deep_comments=L(11)
         i_comments = _idx("comments", 9)
         i_deep = _idx("deep_comments", 11)
 
-        # deep_comments 컬럼이 여전히 없는 상태면 사용자에게 안내(모드가 deep/both일 때)
-        if mode in ("deep", "both") and ("deep_comments" not in header_norm):
-            await update.message.reply_text(
-                f"{sheet_name} 시트에 deep_comments 컬럼이 없습니다. (헤더/컬럼 보정이 필요)"
-            )
+        # deep_comments 컬럼이 없는 상태면 알려주기
+        if mode in ("deep", "both") and ("deep_comments" not in header):
+            await update.message.reply_text(f"{sheet_name} 시트에 deep_comments 컬럼이 없습니다. 헤더 보정이 필요합니다.")
+            # 계속 진행(헤더 재배치가 실패했거나 수동 수정 중일 수 있음)
 
-        # 업데이트 payload + 메타(kind)
-        updates: list[tuple[dict, str]] = []
+        updates: list[dict] = []
+        updated_simple = 0
+        updated_deep = 0
 
         # 최신순(아래쪽)부터 채우기
-        attempted_rows = 0
-        gen_fail_simple = 0
-        gen_fail_deep = 0
-
         for row_idx, r in enumerate(reversed(vals[1:]), start=2):
-            if attempted_rows >= limit:
-                break
-
             # reversed에서 row_idx 계산은 실제 행번호와 다르므로 재계산
             real_row_idx = len(vals) - (row_idx - 2)
 
@@ -3737,11 +3694,8 @@ async def export_comment_fill(update: Update, context: ContextTypes.DEFAULT_TYPE
             titlev = (r[i_title] if len(r) > i_title else "").strip()
             bodyv = (r[i_body] if len(r) > i_body else "").strip()
             simplev = (r[i_simple] if len(r) > i_simple else "").strip()
-            comments_raw = (r[i_comments] if (i_comments >= 0 and len(r) > i_comments) else "")
-            deep_raw = (r[i_deep] if (i_deep >= 0 and len(r) > i_deep) else "")
-
-            comments_raw = (comments_raw or "").strip()
-            deep_raw = (deep_raw or "").strip()
+            comments_raw = (r[i_comments] if len(r) > i_comments else "").strip() if i_comments >= 0 else ""
+            deep_raw = (r[i_deep] if len(r) > i_deep else "").strip() if i_deep >= 0 else ""
 
             base_title = titlev or (simplev.splitlines()[0].strip() if simplev else "")
             if not base_title:
@@ -3753,7 +3707,9 @@ async def export_comment_fill(update: Update, context: ContextTypes.DEFAULT_TYPE
             if not (need_simple or need_deep):
                 continue
 
-            attempted_rows += 1
+            # limit 적용: "생성 작업 수" 기준(경기 기준)
+            if (updated_simple + updated_deep) >= limit:
+                break
 
             # 생성
             new_comments = comments_raw
@@ -3786,106 +3742,36 @@ async def export_comment_fill(update: Update, context: ContextTypes.DEFAULT_TYPE
                 print(f"[OPENAI][EXPORT_COMMENT] 생성 예외: {e}")
                 continue
 
-            # 업데이트 예약 (✅ 생성 결과가 비어있으면 업데이트/카운트하지 않음)
+            # 업데이트 예약
             if need_simple and i_comments >= 0:
-                v = (new_comments or "").strip()
-                if not v:
-                    gen_fail_simple += 1
-                    last_err = EXPORT_COMMENT_LAST_ERROR or last_err
-                else:
-                    col = _col_letter(i_comments + 1)
-                    updates.append(({"range": f"{col}{real_row_idx}", "values": [[v]]}, "simple"))
+                col = _col_letter(i_comments + 1)
+                updates.append({"range": f"{col}{real_row_idx}", "values": [[(new_comments or "").strip()]]})
+                updated_simple += 1
 
             if need_deep and i_deep >= 0:
-                v = (new_deep or "").strip()
-                if not v:
-                    gen_fail_deep += 1
-                    last_err = EXPORT_COMMENT_LAST_ERROR or last_err
-                else:
-                    col = _col_letter(i_deep + 1)
-                    updates.append(({"range": f"{col}{real_row_idx}", "values": [[v]]}, "deep"))
-
-        # 실제 시트 반영
-        updated_simple = 0
-        updated_deep = 0
-        write_fail = 0
+                col = _col_letter(i_deep + 1)
+                updates.append({"range": f"{col}{real_row_idx}", "values": [[(new_deep or "").strip()]]})
+                updated_deep += 1
 
         if updates:
-            payload = [u[0] for u in updates]
-
-            # 1) batch_update 우선(Write quota 절약)
-            batch_ok = False
-            batch_err = ""
-            for attempt in range(3):
-                try:
-                    ws.batch_update(payload, value_input_option="RAW")
-                    batch_ok = True
-                    break
-                except Exception as e:
-                    batch_err = str(e)
-                    # 429/Quota 류면 잠깐 쉬고 재시도
-                    low = batch_err.lower()
-                    if attempt < 2 and ("429" in low or "quota" in low or "rate" in low or "too many" in low):
-                        try:
-                            await asyncio.sleep(2 * (attempt + 1))
-                        except Exception:
-                            pass
-                        continue
-                    break
-
-            if batch_ok:
-                updated_simple = sum(1 for _, k in updates if k == "simple")
-                updated_deep = sum(1 for _, k in updates if k == "deep")
-            else:
-                # 2) batch_update 실패 시 단건 update로 폴백(성공한 것만 카운트)
-                print(f"[GSHEET][EXPORT] batch_update 실패({sheet_name}) → 폴백: {batch_err}")
-                for u, kind in updates:
+            try:
+                ws.batch_update(updates, value_input_option="RAW")
+            except Exception as e:
+                # batch_update 실패 시 단건 update로 폴백
+                print(f"[GSHEET][EXPORT] batch_update 실패 → 폴백: {e}")
+                for u in updates:
                     try:
-                        # update()는 인자 순서 변경 경고가 있어서 named args 사용
-                        ws.update(range_name=u["range"], values=u["values"], value_input_option="RAW")
-                        if kind == "simple":
-                            updated_simple += 1
-                        else:
-                            updated_deep += 1
+                        ws.update(range_name=u["range"], values=u["values"])
                     except Exception as e2:
-                        write_fail += 1
-                        last_err = str(e2) or last_err
-                        low2 = last_err.lower()
-                        # 429면 과도한 반복을 피하기 위해 아주 짧게 쉬어줌
-                        if ("429" in low2 or "quota" in low2 or "rate" in low2 or "too many" in low2):
-                            try:
-                                await asyncio.sleep(0.4)
-                            except Exception:
-                                pass
+                        print(f"[GSHEET][EXPORT] 단건 update 실패({sheet_name} {u.get('range')}): {e2}")
 
         total_updated_simple += updated_simple
         total_updated_deep += updated_deep
-        total_attempt_rows += attempted_rows
-        total_gen_fail_simple += gen_fail_simple
-        total_gen_fail_deep += gen_fail_deep
-        total_write_fail += write_fail
 
     msg = "✅ export 댓글 채우기 완료\n"
-    msg += f"- mode: {mode}\n"
-    msg += f"- 대상 시트: {', '.join(sheet_names)}\n"
-    msg += f"- 처리(행): {total_attempt_rows}\n"
-    msg += f"- comments(심플) 반영: {total_updated_simple}\n"
-    msg += f"- deep_comments(심층) 반영: {total_updated_deep}\n"
-
-    if total_gen_fail_simple or total_gen_fail_deep:
-        msg += f"- 생성 실패: simple {total_gen_fail_simple} / deep {total_gen_fail_deep}\n"
-
-    if total_write_fail:
-        msg += f"- 시트 쓰기 실패: {total_write_fail}\n"
-
-    if (total_gen_fail_simple or total_gen_fail_deep or total_write_fail) and last_err:
-        # 에러가 너무 길면 잘라서 전달
-        if len(last_err) > 350:
-            last_err = last_err[:350] + "…"
-        msg += f"- 마지막 에러: {last_err}\n"
-
+    msg += f"- comments(심플): {total_updated_simple}개\n"
+    msg += f"- deep_comments(심층): {total_updated_deep}개\n"
     await update.message.reply_text(msg)
-
 
 def _parse_export_comment_txt_args(args: list[str]) -> tuple[str, int, str]:
     """TXT 생성 옵션 파싱.
@@ -4064,62 +3950,38 @@ def _default_zip_matches() -> int:
 
 
 def _build_export_comment_zip_markup(which: str, sport_filter: str, limit_matches: int | None = None) -> InlineKeyboardMarkup:
-    """export 댓글 ZIP 버튼(심플/심층 2종)."""
     n = limit_matches or _default_zip_matches()
-    sport_key = (sport_filter or "").strip().lower() or "all"
-
-    cb_simple = f"zip:{which}:{sport_key}:{n}:simple"
-    cb_deep = f"zip:{which}:{sport_key}:{n}:deep"
-
-    # 버튼 라벨: 요구사항에 맞춰 simple_zip / deep_zip 노출
+    cb = f"zip:{which}:{sport_filter}:{n}"
+    label = f"📦 댓글 ZIP 받기 ({n}경기)"
     if sport_filter:
-        label_simple = f"📦 {sport_filter} simple_zip ({n}경기)"
-        label_deep = f"📦 {sport_filter} deep_zip ({n}경기)"
-    else:
-        label_simple = f"📦 simple_zip ({n}경기)"
-        label_deep = f"📦 deep_zip ({n}경기)"
+        label = f"📦 {sport_filter} ZIP ({n}경기)"
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=cb)]])
 
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(label_simple, callback_data=cb_simple),
-            InlineKeyboardButton(label_deep, callback_data=cb_deep),
-        ]
-    ])
 
 def _build_export_comment_zip_markup_bv(which: str, limit_matches: int | None = None) -> InlineKeyboardMarkup:
     n = limit_matches or _default_zip_matches()
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(f"📦 basketball simple_zip ({n}경기)", callback_data=f"zip:{which}:basketball:{n}:simple"),
-            InlineKeyboardButton(f"📦 basketball deep_zip ({n}경기)", callback_data=f"zip:{which}:basketball:{n}:deep"),
-        ],
-        [
-            InlineKeyboardButton(f"📦 volleyball simple_zip ({n}경기)", callback_data=f"zip:{which}:volleyball:{n}:simple"),
-            InlineKeyboardButton(f"📦 volleyball deep_zip ({n}경기)", callback_data=f"zip:{which}:volleyball:{n}:deep"),
-        ],
+            InlineKeyboardButton(f"📦 basketball ZIP ({n}경기)", callback_data=f"zip:{which}:basketball:{n}"),
+            InlineKeyboardButton(f"📦 volleyball ZIP ({n}경기)", callback_data=f"zip:{which}:volleyball:{n}"),
+        ]
     ])
 
+
 def _build_export_comment_zip_markup_all(which: str, limit_matches: int | None = None) -> InlineKeyboardMarkup:
-    # 4종목 버튼 한번에 (simple_zip / deep_zip)
+    # 4종목 버튼 한번에
     n = limit_matches or _default_zip_matches()
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(f"📦 soccer simple_zip ({n})", callback_data=f"zip:{which}:soccer:{n}:simple"),
-            InlineKeyboardButton(f"📦 soccer deep_zip ({n})", callback_data=f"zip:{which}:soccer:{n}:deep"),
+            InlineKeyboardButton(f"📦 soccer ZIP ({n})", callback_data=f"zip:{which}:soccer:{n}"),
+            InlineKeyboardButton(f"📦 baseball ZIP ({n})", callback_data=f"zip:{which}:baseball:{n}"),
         ],
         [
-            InlineKeyboardButton(f"📦 baseball simple_zip ({n})", callback_data=f"zip:{which}:baseball:{n}:simple"),
-            InlineKeyboardButton(f"📦 baseball deep_zip ({n})", callback_data=f"zip:{which}:baseball:{n}:deep"),
-        ],
-        [
-            InlineKeyboardButton(f"📦 basketball simple_zip ({n})", callback_data=f"zip:{which}:basketball:{n}:simple"),
-            InlineKeyboardButton(f"📦 basketball deep_zip ({n})", callback_data=f"zip:{which}:basketball:{n}:deep"),
-        ],
-        [
-            InlineKeyboardButton(f"📦 volleyball simple_zip ({n})", callback_data=f"zip:{which}:volleyball:{n}:simple"),
-            InlineKeyboardButton(f"📦 volleyball deep_zip ({n})", callback_data=f"zip:{which}:volleyball:{n}:deep"),
+            InlineKeyboardButton(f"📦 basketball ZIP ({n})", callback_data=f"zip:{which}:basketball:{n}"),
+            InlineKeyboardButton(f"📦 volleyball ZIP ({n})", callback_data=f"zip:{which}:volleyball:{n}"),
         ],
     ])
+
 
 async def _send_export_comment_zip_file(
     chat_id: int,
@@ -4127,26 +3989,13 @@ async def _send_export_comment_zip_file(
     which: str,
     limit_matches: int,
     sport_filter: str = "",
-    mode: str = "simple",
 ) -> tuple[int, int, str]:
-    """export_* 시트의 댓글 컬럼을 ZIP(내부: 한 줄당 txt 1개)로 묶어 전송.
-
-    - mode="simple": comments (J열)
-    - mode="deep"  : deep_comments (L열)
-
+    """export_* 시트의 comments(H) 줄바꿈을 ZIP(내부: 한 줄당 txt 1개)로 묶어 전송.
     반환: (zip에 담긴 txt 파일 수, 처리한 경기 수, zip 파일명)
     """
     which = (which or "tomorrow").strip().lower()
     if which not in ("today", "tomorrow"):
         which = "tomorrow"
-
-    mode = (mode or "simple").strip().lower()
-    if mode not in ("simple", "deep"):
-        mode = "simple"
-
-    col_name = "comments" if mode == "simple" else "deep_comments"
-    # 과거 헤더(구버전) 호환을 위한 fallback 인덱스
-    fallback_idx = 7 if mode == "simple" else 11
 
     max_files = int(os.getenv("EXPORT_COMMENT_ZIP_MAX_FILES", os.getenv("EXPORT_COMMENT_TXT_MAX_FILES", "600")))
 
@@ -4172,7 +4021,7 @@ async def _send_export_comment_zip_file(
     i_sport = _idx("sport", 1)
     i_src = _idx("src_id", 2)
     i_title = _idx("title", 3)
-    i_col = _idx(col_name, fallback_idx)
+    i_comments = _idx("comments", 7)
 
     selected: list[tuple[str, str, list[str]]] = []  # (sid, title, comment_lines)
     for r in reversed(vals[1:]):
@@ -4182,8 +4031,8 @@ async def _send_export_comment_zip_file(
 
         sid = (r[i_src] if len(r) > i_src else "").strip()
         title = (r[i_title] if len(r) > i_title else "").strip()
-        raw = (r[i_col] if len(r) > i_col else "")
-        comment_lines = _split_comment_lines(raw)
+        comments_raw = (r[i_comments] if len(r) > i_comments else "")
+        comment_lines = _split_comment_lines(comments_raw)
 
         if not comment_lines:
             continue
@@ -4193,17 +4042,15 @@ async def _send_export_comment_zip_file(
             break
 
     if not selected:
-        col_hint = "J열(comments)" if mode == "simple" else "L열(deep_comments)"
-        msg = f"ZIP으로 보낼 댓글이 없어. export 시트 {col_hint}을 먼저 채워줘."
+        msg = "ZIP으로 보낼 댓글이 없어. export 시트 H열(comments)을 먼저 채워줘."
         if sport_filter:
-            msg = f"ZIP으로 보낼 댓글이 없어({sport_filter}). export 시트 {col_hint}을 먼저 채워줘."
+            msg = f"ZIP으로 보낼 댓글이 없어({sport_filter}). export 시트 H열(comments)을 먼저 채워줘."
         await context.bot.send_message(chat_id=chat_id, text=msg)
         return 0, 0, ""
 
     ts = now_kst().strftime("%Y%m%d_%H%M%S")
     sport_tag = sport_filter or "all"
-    zip_tag = "simple_zip" if mode == "simple" else "deep_zip"
-    zip_filename = f"{zip_tag}_{which}_{sport_tag}_{ts}.zip"
+    zip_filename = f"comments_{which}_{sport_tag}_{ts}.zip"
 
     bio = io.BytesIO()
     total_files = 0
@@ -4232,6 +4079,7 @@ async def _send_export_comment_zip_file(
         print(f"[EXPORT][ZIP] zip 생성/전송 실패: {e}")
         await context.bot.send_message(chat_id=chat_id, text=f"ZIP 생성/전송 중 오류: {e}")
         return 0, 0, ""
+
 
 async def export_comment_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """export 시트 H열(comments) → 한 줄당 txt를 ZIP으로 묶어 전송.
@@ -5775,6 +5623,10 @@ async def crawl_daum_news_common(
 
 # ───────────────── mazgtv 분석 공통 (내일 경기 → today/tomorrow 시트, JSON/API 버전) ─────────────────
 
+# 상세 API 실제 경로에 맞게 여기만 수정하면 됨
+MAZ_DETAIL_API_TEMPLATE = _sanitize_env_http_url(os.getenv("MAZ_DETAIL_API_TEMPLATE", f"{MAZ_BASE_URL}/api/board/{{board_id}}"), base_url=MAZ_BASE_URL)
+
+
 def _parse_game_start_date(game_start_at: str) -> date | None:
     """
     '2025-11-28T05:00:00' 같은 문자열에서 날짜(date)만 뽑는다.
@@ -5937,14 +5789,16 @@ async def crawl_maz_analysis_common(
             await _maz_warmup(client)
 
             for page in range(1, max_pages + 1):
-                list_url = _build_maz_list_url(
-                    page=page,
-                    perpage=20,
-                    board_type=board_type,
-                    category=category,
-                    sort="b.game_start_at DESC, b.created_at DESC",
+                list_url = _merge_url_query(
+                    MAZ_LIST_API,
+                    {
+                        "page": page,
+                        "perpage": 20,
+                        "boardType": board_type,
+                        "category": category,
+                        "sort": "b.game_start_at DESC, b.created_at DESC",
+                    },
                 )
-                print(f"[MAZ][LIST_URL] page={page} url={list_url}")
 
                 r = await client.get(list_url, timeout=10.0)
                 r.raise_for_status()
@@ -7481,49 +7335,28 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "noop":
         return
 
-    # export 댓글 ZIP 버튼 (simple_zip / deep_zip)
+    # export 댓글 ZIP 버튼 (1 zip 파일로 전송)
     if data.startswith("zip:"):
-        # 지원 포맷:
-        #   - 구버전: zip:{which}:{sport}:{n}
-        #   - 신버전: zip:{which}:{sport}:{n}:{simple|deep}
-        which = "tomorrow"
-        sport_key = ""
-        n = ""
-        mode = "simple"
-
         try:
-            parts = (data or "").split(":")
-            if len(parts) >= 4:
-                which = (parts[1] or "tomorrow").strip().lower()
-                sport_key = (parts[2] or "").strip().lower()
-                n = (parts[3] or "").strip()
-                if len(parts) >= 5:
-                    mode = (parts[4] or "simple").strip().lower()
+            _, which, sport_key, n = data.split(":", 3)
+            which = (which or "tomorrow").strip().lower()
+            sport_key = (sport_key or "").strip().lower()
+            limit_matches = int(n) if str(n).isdigit() else _default_zip_matches()
         except Exception:
-            which, sport_key, n, mode = "tomorrow", "", "", "simple"
+            which, limit_matches, sport_key = "tomorrow", _default_zip_matches(), ""
 
-        if which not in ("today", "tomorrow"):
-            which = "tomorrow"
-
-        if mode not in ("simple", "deep"):
-            mode = "simple"
-
-        limit_matches = int(n) if str(n).isdigit() else _default_zip_matches()
-
-        zip_tag = "simple_zip" if mode == "simple" else "deep_zip"
-        await q.message.reply_text(f"📦 {zip_tag} 생성/전송 시작: {which}, {limit_matches}경기, sport={sport_key or 'ALL'}")
+        await q.message.reply_text(f"📦 댓글 ZIP 생성/전송 시작: {which}, {limit_matches}경기, sport={sport_key or 'ALL'}")
         files_cnt, matches_cnt, zip_name = await _send_export_comment_zip_file(
             chat_id=q.message.chat_id,
             context=context,
             which=which,
             limit_matches=limit_matches,
             sport_filter=sport_key,
-            mode=mode,
         )
         if files_cnt and matches_cnt:
-            await q.message.reply_text(f"✅ {zip_tag} 전송 완료: {matches_cnt}경기 / {files_cnt}개 파일 (1 zip)")
+            await q.message.reply_text(f"✅ ZIP 전송 완료: {matches_cnt}경기 / {files_cnt}개 파일 (1 zip)")
         else:
-            await q.message.reply_text(f"{zip_tag} 전송할 댓글이 없거나 실패했습니다.")
+            await q.message.reply_text("ZIP 전송할 댓글이 없거나 실패했습니다.")
         return
 
     # export 댓글 TXT 버튼
@@ -8060,6 +7893,68 @@ def _col_letter(n: int) -> str:
 # 자동 갱신 범위(A~K)의 끝 컬럼(기본: K)
 YOUTOO_AUTO_END_COL = _col_letter(len(YOUTOO_AUTO_HEADER))
 
+# ---- Google Sheets write retry for YOUTOO (429 quota / transient errors) ----
+try:
+    from gspread.exceptions import APIError as GspreadAPIError  # type: ignore
+except Exception:
+    # gspread가 없는 환경(로컬 테스트 등)에서도 import 에러로 죽지 않게 폴백
+    GspreadAPIError = Exception  # type: ignore
+
+_YOUTOO_LAST_ERROR: str = ""
+
+def _gsheet_api_status(err: Exception) -> int | None:
+    """gspread APIError 등에서 HTTP status code를 최대한 추출."""
+    resp = getattr(err, "response", None)
+    code = getattr(resp, "status_code", None)
+    if isinstance(code, int):
+        return code
+
+    # 문자열에 "[429]" 같은 형태가 포함되는 케이스 대응
+    s = str(err)
+    m = _re_simple.search(r"\[(\d{3})\]", s)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    return None
+
+def _is_gsheets_quota_err(err: Exception) -> bool:
+    code = _gsheet_api_status(err)
+    if code == 429:
+        return True
+    s = str(err)
+    return ("429" in s) or ("Quota exceeded" in s) or ("Write requests" in s)
+
+def _format_gsheet_error(err: Exception) -> str:
+    code = _gsheet_api_status(err)
+    s = str(err)
+    if code == 429 or _is_gsheets_quota_err(err):
+        return "Google Sheets 쓰기 쿼터(429) 초과"
+    if code == 403:
+        return "Google Sheets 권한/공유 설정(403) 문제"
+    if code == 404:
+        return "Google Sheets ID/시트 경로(404) 문제"
+    # 너무 길면 축약
+    return s if len(s) <= 300 else s[:300] + "…"
+
+def _gsheet_write_with_backoff(op_name: str, func, max_retries: int | None = None):
+    """Google Sheets write 호출을 429(쿼터) 등에 대해 백오프 재시도."""
+    retries = int(max_retries if max_retries is not None else os.getenv("GSHEET_WRITE_MAX_RETRIES", "4"))
+    base = float(os.getenv("GSHEET_WRITE_BACKOFF_BASE", "1.5"))
+    for attempt in range(retries + 1):
+        try:
+            return func()
+        except GspreadAPIError as e:  # type: ignore
+            if _is_gsheets_quota_err(e) and attempt < retries:
+                sleep_s = min(base * (2 ** attempt), 30.0)
+                sleep_s += float(_random.uniform(0, 0.35))  # small jitter
+                print(f"[GSHEET][YOUTOO] {op_name}: quota backoff {sleep_s:.2f}s (attempt {attempt+1}/{retries})")
+                time.sleep(sleep_s)
+                continue
+            raise
+
+
 # 과거 버전/표기 차이 호환(자동 마이그레이션용)
 _YOUTOO_COL_ALIASES: dict[str, list[str]] = {
     "첫댓글내용": ["첫댓글"],
@@ -8102,7 +7997,7 @@ def ensure_youtoo_header(ws) -> None:
                 ws.resize(cols=len(YOUTOO_HEADER))
         except Exception:
             pass
-        ws.update("A1", [YOUTOO_HEADER])
+        ws.update(range_name="A1", values=[YOUTOO_HEADER], value_input_option="RAW")
         return
 
     # get_all_values()는 "헤더 행의 빈 셀"을 끝까지 반환하지 않을 수 있으므로,
@@ -8138,7 +8033,7 @@ def ensure_youtoo_header(ws) -> None:
                 ws.update_cell(1, col_idx_1based, name)
             except Exception:
                 try:
-                    ws.update(f"{_col_letter(col_idx_1based)}1", [[name]])
+                    ws.update(range_name=f"{_col_letter(col_idx_1based)}1", values=[[name]], value_input_option="RAW")
                 except Exception:
                     pass
         return
@@ -8177,7 +8072,7 @@ def ensure_youtoo_header(ws) -> None:
     except Exception:
         pass
 
-    ws.update("A1", [YOUTOO_HEADER] + new_rows, value_input_option="RAW")
+    ws.update(range_name="A1", values=[YOUTOO_HEADER] + new_rows, value_input_option="RAW")
 
 def get_youtoo_ws():
     """youtoo 탭 워크시트 반환(없으면 생성 + 헤더 세팅)."""
@@ -8241,14 +8136,18 @@ def upsert_youtoo_rows_top(rows: list[list[str]]) -> tuple[bool, int, int]:
     반환: (ok, inserted_count, updated_count)
 
     - src_id 기준으로 중복을 판단한다.
-    - 이미 존재하면 해당 행을 덮어쓴다(댓글수/조회수/좋아요 등이 갱신될 수 있으므로).
+    - 이미 존재하면 해당 행의 A~K(자동 컬럼)만 덮어쓴다.  (L~M 수기 컬럼 보호)
     - 신규는 insert_rows(row=2)로 상단에 붙인다.
     """
+    global _YOUTOO_LAST_ERROR
+    _YOUTOO_LAST_ERROR = ""
+
     if not rows:
         return True, 0, 0
 
     ws = get_youtoo_ws()
     if not ws:
+        _YOUTOO_LAST_ERROR = "워크시트 준비 실패(구글 서비스키/스프레드시트 ID/공유 권한 확인)"
         return False, 0, 0
 
     # 헤더 보정/마이그레이션
@@ -8259,9 +8158,18 @@ def upsert_youtoo_rows_top(rows: list[list[str]]) -> tuple[bool, int, int]:
     except Exception:
         values = []
 
+    # 헤더가 없으면 생성
     if not values:
-        ws.update("A1", [YOUTOO_HEADER])
-        values = [YOUTOO_HEADER]
+        try:
+            _gsheet_write_with_backoff(
+                "youtoo.init_header",
+                lambda: ws.update(range_name="A1", values=[YOUTOO_HEADER], value_input_option="RAW"),
+            )
+            values = [YOUTOO_HEADER]
+        except Exception as e:
+            _YOUTOO_LAST_ERROR = _format_gsheet_error(e)
+            print(f"[GSHEET][YOUTOO] 헤더 초기화 실패: {e}")
+            return False, 0, 0
 
     header = [c.strip() for c in values[0]]
     try:
@@ -8277,11 +8185,10 @@ def upsert_youtoo_rows_top(rows: list[list[str]]) -> tuple[bool, int, int]:
             if sid and sid not in existing_map:
                 existing_map[sid] = i
 
-    updated = 0
+    update_payloads: list[dict] = []
     to_insert: list[list[str]] = []
     seen: set[str] = set()
 
-    # 1) 기존 행 업데이트(삽입 전에 수행해야 row index가 흔들리지 않음)
     for r in rows:
         if not r:
             continue
@@ -8298,22 +8205,54 @@ def upsert_youtoo_rows_top(rows: list[list[str]]) -> tuple[bool, int, int]:
 
         if sid in existing_map:
             row_num = existing_map[sid]
-            try:
-                rr_auto = rr[: len(YOUTOO_AUTO_HEADER)]
-                ws.update(f"A{row_num}:{YOUTOO_AUTO_END_COL}{row_num}", [rr_auto], value_input_option="RAW")
-                updated += 1
-            except Exception as e:
-                print(f"[GSHEET][YOUTOO] update 실패(src_id={sid}): {e}")
+            rr_auto = rr[: len(YOUTOO_AUTO_HEADER)]
+            update_payloads.append(
+                {
+                    "range": f"A{row_num}:{YOUTOO_AUTO_END_COL}{row_num}",
+                    "values": [rr_auto],
+                }
+            )
         else:
             to_insert.append(rr)
 
+    updated = 0
+    # ✅ 1) 기존 행 업데이트(삽입 전에 수행해야 row index가 흔들리지 않음)
+    if update_payloads:
+        try:
+            # gspread >= 6: batch_update(data=[{'range':..., 'values':...}, ...])
+            _gsheet_write_with_backoff(
+                "youtoo.batch_update",
+                lambda: ws.batch_update(update_payloads, value_input_option="RAW"),
+            )
+            updated = len(update_payloads)
+        except Exception as e:
+            # batch_update가 없거나(구버전) 실패하면 per-row 업데이트로 폴백
+            print(f"[GSHEET][YOUTOO] batch_update 실패(폴백 시도): {e}")
+            try:
+                for req in update_payloads:
+                    rng = req.get("range")
+                    vals = req.get("values")
+                    _gsheet_write_with_backoff(
+                        "youtoo.update",
+                        lambda rng=rng, vals=vals: ws.update(range_name=rng, values=vals, value_input_option="RAW"),
+                    )
+                updated = len(update_payloads)
+            except Exception as e2:
+                _YOUTOO_LAST_ERROR = _format_gsheet_error(e2)
+                print(f"[GSHEET][YOUTOO] update 실패: {e2}")
+                return False, 0, 0
+
     inserted = 0
+    # ✅ 2) 신규는 맨 위(2행)에 넣어서 최신이 위로 오게 한다.
     if to_insert:
         try:
-            # ✅ 신규는 맨 위(2행)에 넣어서 최신이 위로 오게 한다.
-            ws.insert_rows(to_insert, row=2, value_input_option="RAW")
+            _gsheet_write_with_backoff(
+                "youtoo.insert_rows",
+                lambda: ws.insert_rows(to_insert, row=2, value_input_option="RAW"),
+            )
             inserted = len(to_insert)
         except Exception as e:
+            _YOUTOO_LAST_ERROR = _format_gsheet_error(e)
             print(f"[GSHEET][YOUTOO] insert_rows 오류: {e}")
             return False, inserted, updated
 
@@ -8789,7 +8728,17 @@ async def youtoo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if new_rows:
             ok, inserted, updated = upsert_youtoo_rows_top(new_rows)
             if not ok:
-                await update.message.reply_text("구글시트(youtoo)에 저장하지 못했습니다. 권한/시트 상태를 확인하세요.")
+                err = (_YOUTOO_LAST_ERROR or "").strip()
+                if err and ("429" in err or "쿼터" in err):
+                    await update.message.reply_text(
+                        "구글시트(youtoo) 저장 실패: Google Sheets 쓰기 쿼터(429) 초과입니다.\n"
+                        "1~2분 후 다시 실행해 주세요.\n"
+                        "(다른 크롤링/저장 명령과 동시에 돌리면 더 잘 걸립니다)"
+                    )
+                else:
+                    await update.message.reply_text(
+                        f"구글시트(youtoo)에 저장하지 못했습니다.\n사유: {err or '알 수 없는 오류'}"
+                    )
                 return
 
         await update.message.reply_text(
@@ -8803,876 +8752,6 @@ async def youtoo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"요청 중 오류가 발생했습니다: {e}")
         return
-
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Quiz crawl (네이버 카페 퀴즈 이벤트 댓글 수집 → 구글시트 '퀴즈' 탭 적재)
-#  - 기존 기능 영향 최소화를 위해 별도 쿠키/헤더/시트 스키마를 사용한다.
-# ─────────────────────────────────────────────────────────────────────────────
-
-QUIZ_CAFE_ID = (os.getenv("NAVER_QUIZ_CAFE_ID") or "28534281").strip()
-QUIZ_MENU_ID = (os.getenv("NAVER_QUIZ_MENU_ID") or "6").strip()
-QUIZ_FIND_PAGES = int((os.getenv("NAVER_QUIZ_FIND_PAGES") or "5").strip() or "5")
-QUIZ_FIND_PAGE_SIZE = int((os.getenv("NAVER_QUIZ_PAGE_SIZE") or "15").strip() or "15")
-QUIZ_SHEET_NAME = (os.getenv("QUIZ_SHEET_NAME") or "퀴즈").strip()
-
-# 시트 재시도(429/503) 백오프
-QUIZ_GSHEET_MAX_RETRIES = int(os.getenv("QUIZ_GSHEET_MAX_RETRIES", "6"))
-QUIZ_GSHEET_BACKOFF_BASE_SEC = float(os.getenv("QUIZ_GSHEET_BACKOFF_BASE_SEC", "1.6"))
-QUIZ_GSHEET_BACKOFF_MAX_SEC = float(os.getenv("QUIZ_GSHEET_BACKOFF_MAX_SEC", "35"))
-
-# 댓글 수집 안전장치
-QUIZ_COMMENT_MAX_PAGES = int(os.getenv("QUIZ_COMMENT_MAX_PAGES", "200"))
-QUIZ_COMMENT_TIMEOUT_SEC = float(os.getenv("QUIZ_COMMENT_TIMEOUT_SEC", "18"))
-
-# 요일 컬럼(월~일)
-_QUIZ_DOW_COLS = ["B", "C", "D", "E", "F", "G", "H"]
-
-# (선택) 명령어 중복 실행 방지(인스턴스 내부)
-_QUIZ_RECENT_REQ: dict[tuple[int, int, str], float] = {}
-_QUIZ_RECENT_REQ_LOCK = asyncio.Lock()
-QUIZ_REQ_DEDUP_TTL_SEC = int(os.getenv("QUIZ_REQ_DEDUP_TTL_SEC", "120"))
-
-
-def _normalize_cookie_str(ck: str) -> str:
-    """Render 환경변수 쿠키 문자열 정규화."""
-    ck = (ck or "").strip()
-    if not ck:
-        return ""
-
-    # Render 환경변수에 따옴표로 감싸 넣은 경우 제거
-    if (ck.startswith('"') and ck.endswith('"')) or (ck.startswith("'") and ck.endswith("'")):
-        ck = ck[1:-1].strip()
-
-    if ck.lower().startswith("cookie:"):
-        ck = ck.split(":", 1)[1].strip()
-
-    # 줄바꿈/연속 공백 제거
-    ck = " ".join(ck.splitlines()).strip()
-    return ck
-
-
-def _get_naver_quiz_cookie() -> str:
-    """퀴즈 기능 전용 쿠키 우선순위:
-    1) NAVER_QUIZ_COOKIE
-    2) 기존 쿠키(_get_naver_web_cookie 폴백)
-    """
-    ck = _normalize_cookie_str(os.getenv("NAVER_QUIZ_COOKIE", ""))
-    if ck:
-        return ck
-    # 기존 기능 유지: 다른 기능 쿠키를 건드리지 않기 위해 폴백만 사용
-    try:
-        return _get_naver_web_cookie()
-    except Exception:
-        return ""
-
-
-def _naver_quiz_headers(*, cafe_id: str, menu_id: str, article_id: str | None = None) -> dict[str, str]:
-    """퀴즈 기능 전용 헤더(쿠키/리퍼러 분리)."""
-    cookie = _get_naver_quiz_cookie()
-    ua = (
-        (os.getenv("NAVER_USER_AGENT") or "").strip()
-        or (os.getenv("MAZ_USER_AGENT") or "").strip()
-        or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    )
-
-    if article_id:
-        # 댓글/본문 쪽 referer는 읽기 URL 형태가 더 안전
-        referer = f"https://cafe.naver.com/ArticleRead.nhn?clubid={cafe_id}&articleid={article_id}"
-    else:
-        referer = f"https://cafe.naver.com/ArticleList.nhn?search.clubid={cafe_id}&search.menuid={menu_id}"
-
-    headers = {
-        "User-Agent": ua,
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Referer": referer,
-        "Origin": "https://cafe.naver.com",
-        "Connection": "keep-alive",
-    }
-    if cookie:
-        headers["Cookie"] = cookie
-    return headers
-
-
-def _ms_to_kst_date(ts_ms) -> datetime.date | None:
-    """네이버 writeDateTimestamp(ms 또는 sec) → KST date."""
-    try:
-        n = int(ts_ms)
-    except Exception:
-        return None
-    if n > 10**12:
-        sec = n / 1000.0
-    else:
-        sec = float(n)
-    try:
-        dt = datetime.fromtimestamp(sec, tz=timezone.utc).astimezone(KST)
-        return dt.date()
-    except Exception:
-        return None
-
-
-def _parse_md_arg(s: str) -> tuple[int, int] | None:
-    """입력 포맷: M.DD (0패딩 허용, 3.3 / 03.03 등)."""
-    raw = (s or "").strip()
-    m = re.match(r"^\s*(\d{1,2})\s*[./\-]\s*(\d{1,2})\s*$", raw)
-    if not m:
-        return None
-    mm = int(m.group(1))
-    dd = int(m.group(2))
-    if not (1 <= mm <= 12 and 1 <= dd <= 31):
-        return None
-    return (mm, dd)
-
-
-async def _http_get_json_with_retry(
-    client: httpx.AsyncClient,
-    url: str,
-    headers: dict[str, str],
-    *,
-    timeout_sec: float,
-    max_retries: int = 3,
-) -> tuple[int, dict | None, str]:
-    """(status, json_or_none, text_snippet) with light retry for transient errors."""
-    last_snip = ""
-    for attempt in range(max_retries + 1):
-        try:
-            r = await client.get(url, headers=headers, timeout=timeout_sec)
-            status = r.status_code
-            last_snip = (r.text or "")[:400]
-
-            if status in (401, 403):
-                return status, None, last_snip
-
-            # transient
-            if status in (429, 500, 502, 503, 504):
-                if attempt < max_retries:
-                    await asyncio.sleep(0.9 * (2 ** attempt))
-                    continue
-
-            if not (200 <= status < 300):
-                return status, None, last_snip
-
-            try:
-                data = r.json()
-                if isinstance(data, dict):
-                    return status, data, last_snip
-                return status, None, last_snip
-            except Exception:
-                return status, None, last_snip
-
-        except Exception as e:
-            last_snip = str(e)
-            if attempt < max_retries:
-                await asyncio.sleep(0.9 * (2 ** attempt))
-                continue
-            return 0, None, last_snip
-
-    return 0, None, last_snip
-
-
-async def _fetch_quiz_boardlist_page(
-    client: httpx.AsyncClient,
-    *,
-    cafe_id: str,
-    menu_id: str,
-    page: int,
-    page_size: int,
-    sort_by: str = "TIME",
-    view_type: str = "L",
-) -> tuple[int, dict | None, str]:
-    url = f"https://apis.naver.com/cafe-web/cafe-boardlist-api/v1/cafes/{cafe_id}/menus/{menu_id}/articles"
-    params = {
-        "page": max(1, int(page)),
-        "pageSize": max(1, int(page_size)),
-        "sortBy": (sort_by or "TIME"),
-        "viewType": (view_type or "L"),
-    }
-    headers = _naver_quiz_headers(cafe_id=cafe_id, menu_id=menu_id, article_id=None)
-    # httpx: params를 직접 전달(URI 생성)
-    try:
-        r = await client.get(url, params=params, headers=headers, timeout=QUIZ_COMMENT_TIMEOUT_SEC)
-        status = r.status_code
-        snip = (r.text or "")[:400]
-        if not (200 <= status < 300):
-            return status, None, snip
-        try:
-            j = r.json()
-            return status, (j if isinstance(j, dict) else None), snip
-        except Exception:
-            return status, None, snip
-    except Exception as e:
-        return 0, None, str(e)
-
-
-def _extract_comment_items_meta(data: dict) -> tuple[list[dict] | None, dict]:
-    """댓글 응답 스키마를 최대한 유연하게 파싱한다.
-    반환: (items_or_none, meta)
-    - items_or_none: 파싱 실패 시 None, 파싱 성공 시 list(비어있을 수도 있음)
-    """
-    if not isinstance(data, dict):
-        return None, {}
-
-    comments = None
-
-    # 1) {"comments": {...}}
-    if isinstance(data.get("comments"), dict):
-        comments = data.get("comments")
-
-    # 2) {"result": {"comments": {...}}}
-    if comments is None and isinstance(data.get("result"), dict) and isinstance(data["result"].get("comments"), dict):
-        comments = data["result"].get("comments")
-
-    # 3) {"message":{"result":{"comments":{...}}}}
-    if comments is None and isinstance(data.get("message"), dict):
-        msg = data.get("message") or {}
-        if isinstance(msg.get("result"), dict) and isinstance(msg["result"].get("comments"), dict):
-            comments = msg["result"].get("comments")
-
-    if not isinstance(comments, dict):
-        return None, {}
-
-    # items key 후보
-    items = comments.get("items")
-    if not isinstance(items, list):
-        # 다른 이름 후보(예외 케이스 대비)
-        for k in ("commentList", "list", "comments", "data"):
-            if isinstance(comments.get(k), list):
-                items = comments.get(k)
-                break
-
-    if not isinstance(items, list):
-        return None, {}
-
-    meta = {}
-    for k in ("hasNext", "nextPage", "page", "pageSize", "totalCount"):
-        if k in comments:
-            meta[k] = comments.get(k)
-
-    # pageInfo 형태 지원
-    if isinstance(comments.get("pageInfo"), dict):
-        pi = comments.get("pageInfo") or {}
-        for k in ("hasNext", "nextPage", "page", "pageSize", "totalCount"):
-            if k in pi and k not in meta:
-                meta[k] = pi.get(k)
-
-    return [x for x in items if isinstance(x, dict)], meta
-
-
-def _flatten_comment_items(items: list[dict]) -> list[dict]:
-    out: list[dict] = []
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-        out.append(it)
-
-        # 대댓글/자식 댓글 후보 키들
-        for k in ("replies", "reply", "children", "childComments", "replyComments"):
-            v = it.get(k)
-            if isinstance(v, list):
-                for r in v:
-                    if isinstance(r, dict):
-                        out.append(r)
-    return out
-
-
-def _comment_is_visible(it: dict) -> bool:
-    # 블라인드/삭제 스킵(필드명은 케이스별 상이)
-    for k in ("deleted", "isDeleted", "del", "blind", "blindComment", "blindStatus", "removed"):
-        v = it.get(k)
-        if isinstance(v, bool) and v:
-            return False
-        if isinstance(v, str) and v.strip().lower() in ("y", "yes", "true", "1", "deleted", "blind"):
-            return False
-    return True
-
-
-def _extract_comment_nick_and_text(it: dict) -> tuple[str, str, int]:
-    """(nick, content, ts_ms)"""
-    content = str(it.get("content") or it.get("text") or it.get("body") or "").strip()
-
-    nick = ""
-    w = it.get("writer")
-    if isinstance(w, dict):
-        nick = str(w.get("nick") or w.get("nickName") or w.get("nickname") or "").strip()
-
-    # 일부 스키마는 writerInfo
-    if not nick:
-        w2 = it.get("writerInfo")
-        if isinstance(w2, dict):
-            nick = str(w2.get("nickName") or w2.get("nickname") or "").strip()
-
-    # 작성 시각 후보(ms)
-    ts = 0
-    for k in ("updateDate", "createdDate", "writeDate", "regDate", "timestamp"):
-        v = it.get(k)
-        try:
-            if v is None:
-                continue
-            n = int(v)
-            # sec → ms 보정
-            if n < 10**11:
-                n *= 1000
-            ts = n
-            break
-        except Exception:
-            continue
-
-    return nick, content, ts
-
-
-def _format_comment_page_url(base_url: str, page: int) -> str:
-    """댓글 URL 후보(base_url)가 1페이지 기준일 때, page에 맞게 변환."""
-    u = (base_url or "").strip()
-    if not u:
-        return u
-
-    # 1) Gateway 형태: .../comments/pages/1?...  → pages/{page}
-    if "/comments/pages/" in u:
-        return re.sub(r"/comments/pages/\d+", f"/comments/pages/{int(page)}", u)
-
-    # 2) Query 형태: ?page=1 → page={page}
-    try:
-        from urllib.parse import urlsplit, urlunsplit, parse_qs, urlencode
-        sp = urlsplit(u)
-        q = parse_qs(sp.query, keep_blank_values=True)
-        q["page"] = [str(int(page))]
-        new_query = urlencode(q, doseq=True)
-        return urlunsplit((sp.scheme, sp.netloc, sp.path, new_query, sp.fragment))
-    except Exception:
-        # regex fallback
-        if re.search(r"([?&]page=)\d+", u):
-            return re.sub(r"([?&]page=)\d+", rf"\g<1>{int(page)}", u)
-        if "?" in u:
-            return u + f"&page={int(page)}"
-        return u + f"?page={int(page)}"
-
-
-async def _fetch_all_comments_for_article(
-    client: httpx.AsyncClient,
-    *,
-    cafe_id: str,
-    menu_id: str,
-    article_id: str,
-) -> tuple[int, list[dict], str]:
-    """댓글 전체 수집.
-    반환: (http_status_or_0, items_flattened, error_message)
-    - status 200: 정상(댓글 0개여도 200)
-    - status 401/403: 권한/쿠키 문제
-    - status 0: 네트워크/파싱 등 예외
-    """
-    headers = _naver_quiz_headers(cafe_id=cafe_id, menu_id=menu_id, article_id=article_id)
-
-    chosen = None
-    chosen_meta = {}
-    first_status = 0
-    first_err = ""
-
-    # 1) 동작하는 댓글 엔드포인트 1개 선택(기존 코드의 후보 생성 로직을 재사용)
-    for cand in _build_comment_url_candidates(cafe_id, str(article_id)):
-        url1 = _format_comment_page_url(cand, 1)
-        st, j, snip = await _http_get_json_with_retry(client, url1, headers, timeout_sec=QUIZ_COMMENT_TIMEOUT_SEC, max_retries=2)
-        first_status = st or first_status
-        first_err = snip or first_err
-
-        if st in (401, 403):
-            return st, [], "권한 없음(쿠키 만료/게시판 권한 부족)"
-        if not j:
-            continue
-
-        items, meta = _extract_comment_items_meta(j)
-        if items is None:
-            continue
-
-        chosen = cand
-        chosen_meta = meta
-        break
-
-    if not chosen:
-        # 댓글이 0개라서 items가 []인 케이스도 있으므로, JSON 파싱이 되는 케이스를 다시 시도(빈 리스트 허용)
-        for cand in _build_comment_url_candidates(cafe_id, str(article_id)):
-            url1 = _format_comment_page_url(cand, 1)
-            st, j, snip = await _http_get_json_with_retry(client, url1, headers, timeout_sec=QUIZ_COMMENT_TIMEOUT_SEC, max_retries=2)
-            if st in (401, 403):
-                return st, [], "권한 없음(쿠키 만료/게시판 권한 부족)"
-            if not j:
-                continue
-            items, meta = _extract_comment_items_meta(j)
-            if isinstance(items, list):
-                chosen = cand
-                chosen_meta = meta
-                break
-
-    if not chosen:
-        return (first_status or 0), [], (first_err or "댓글 API 파싱 실패")
-
-    # 2) 페이지네이션 수집
-    all_items: list[dict] = []
-    page = 1
-    seen_pages = set()
-
-    while page <= max(1, QUIZ_COMMENT_MAX_PAGES):
-        if page in seen_pages:
-            # 무한루프 방지
-            break
-        seen_pages.add(page)
-
-        url = _format_comment_page_url(chosen, page)
-        st, j, snip = await _http_get_json_with_retry(client, url, headers, timeout_sec=QUIZ_COMMENT_TIMEOUT_SEC, max_retries=2)
-
-        if st in (401, 403):
-            return st, [], "권한 없음(쿠키 만료/게시판 권한 부족)"
-        if not j:
-            # 200인데 JSON이 비정상/빈 본문 등 → 중단
-            if st and (200 <= st < 300):
-                break
-            return st or 0, [], (snip or "댓글 요청 실패")
-
-        items, meta = _extract_comment_items_meta(j)
-        if items is None:
-            # 스키마가 달라졌다 → 중단
-            break
-
-        items2 = _flatten_comment_items(items)
-        # visible filter
-        items2 = [it for it in items2 if _comment_is_visible(it)]
-        if not items2:
-            break
-
-        all_items.extend(items2)
-
-        # 다음 페이지 판단
-        has_next = meta.get("hasNext")
-        next_page = meta.get("nextPage")
-        if isinstance(has_next, bool) and not has_next:
-            break
-
-        if isinstance(next_page, int) and next_page > page:
-            page = next_page
-        else:
-            page += 1
-
-    return 200, all_items, ""
-
-
-async def _gsheet_call_with_backoff(op_name: str, func, *args, **kwargs):
-    """gspread write quota(429)/서버(503) 대응용 지수 백오프."""
-    base = max(0.2, QUIZ_GSHEET_BACKOFF_BASE_SEC)
-    for attempt in range(max(1, QUIZ_GSHEET_MAX_RETRIES)):
-        try:
-            return func(*args, **kwargs)
-        except Exception as e:
-            msg = str(e)
-            low = msg.lower()
-            retriable = (
-                "[429" in low
-                or " 429" in low
-                or "quota" in low
-                or "rate" in low
-                or "too many" in low
-                or "[503" in low
-                or " 503" in low
-                or "unavailable" in low
-                or "backend error" in low
-            )
-            if (attempt >= QUIZ_GSHEET_MAX_RETRIES - 1) or (not retriable):
-                raise
-
-            sleep_s = min(QUIZ_GSHEET_BACKOFF_MAX_SEC, base * (2 ** attempt))
-            print(f"[GSHEET][QUIZ] {op_name} retry {attempt+1}/{QUIZ_GSHEET_MAX_RETRIES} after {sleep_s:.1f}s: {msg[:180]}")
-            try:
-                await asyncio.sleep(sleep_s)
-            except Exception:
-                pass
-
-    # unreachable
-    return func(*args, **kwargs)
-
-
-def get_quiz_ws():
-    """'퀴즈' 탭 워크시트 반환(없으면 생성 + 스키마 세팅)."""
-    client_gs = get_gs_client()
-    spreadsheet_id = os.getenv("SPREADSHEET_ID")
-    if not (client_gs and spreadsheet_id):
-        return None
-    try:
-        sh = client_gs.open_by_key(spreadsheet_id)
-        ws = _get_ws_by_name(sh, QUIZ_SHEET_NAME)
-        if not ws:
-            ws = sh.add_worksheet(title=QUIZ_SHEET_NAME, rows=2000, cols=25)
-        # 최소 컬럼 확보(L~U 정렬뷰 대비)
-        try:
-            ws.resize(cols=max(25, 21))
-        except Exception:
-            pass
-        return ws
-    except Exception as e:
-        print(f"[GSHEET][QUIZ] worksheet open/create error: {e}")
-        return None
-
-
-async def _ensure_quiz_schema(ws) -> None:
-    """퀴즈 시트 스키마/수식이 없으면 세팅(기존 값 최대한 유지)."""
-    if not ws:
-        return
-
-    # 기대 구조
-    header = ["nickname", "월 제출답", "화 제출답", "수 제출답", "목 제출답", "금 제출답", "토 제출답", "일 제출답", "주간 정답 횟수", "정답자 여부"]
-    # 수식은 가능한 ArrayFormula로 1회만 세팅
-    f_I4 = "=ARRAYFORMULA(IF(A4:A=\"\",,MMULT(--(B4:H=B$1:H$1),TRANSPOSE(COLUMN(B1:H1)^0))))"
-    f_J4 = "=ARRAYFORMULA(IF(A4:A=\"\",,IF(I4:I>0,1,0)))"
-    f_L4 = "=IFERROR(SORT(FILTER(A4:J, A4:A<>\"\"), 9, FALSE, 1, TRUE),)"  # 정렬뷰
-
-    # 현재 상태 읽기(최소 범위)
-    try:
-        top = ws.get("A1:U4")  # 1~4행(정답/헤더/수식)만 확인
-    except Exception:
-        top = []
-
-    def _cell(r: int, c: int) -> str:
-        try:
-            return str(top[r-1][c-1]) if len(top) >= r and len(top[r-1]) >= c else ""
-        except Exception:
-            return ""
-
-    updates = []
-
-    # A1 라벨(선택)
-    if not _cell(1, 1).strip():
-        updates.append({"range": "A1", "values": [["정답(월~일) 입력"]]})
-
-    # A3:J3 헤더
-    row3 = [(_cell(3, i) or "").strip() for i in range(1, 11)]
-    if row3[: len(header)] != header:
-        updates.append({"range": "A3:J3", "values": [header]})
-
-    # I4/J4/L4 수식
-    if not str(_cell(4, 9)).strip().startswith("="):
-        updates.append({"range": "I4", "values": [[f_I4]]})
-    if not str(_cell(4, 10)).strip().startswith("="):
-        updates.append({"range": "J4", "values": [[f_J4]]})
-    if not str(_cell(4, 12)).strip().startswith("="):
-        updates.append({"range": "L4", "values": [[f_L4]]})
-
-    # 정렬뷰 헤더(선택) L3:U3
-    sort_header = ["정렬뷰_nickname", "월", "화", "수", "목", "금", "토", "일", "주간정답", "정답여부"]
-    row3_l = [(_cell(3, 12 + i) or "").strip() for i in range(0, 10)]
-    if row3_l[: len(sort_header)] != sort_header:
-        updates.append({"range": "L3:U3", "values": [sort_header]})
-
-    if updates:
-        await _gsheet_call_with_backoff("quiz_schema.batch_update", ws.batch_update, updates, value_input_option="RAW")
-
-    # freeze(선택): 실패해도 무시
-    try:
-        ws.freeze(rows=3)
-    except Exception:
-        pass
-
-
-async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/quizcrawl M.DD : 해당 날짜(작성일 기준) 게시글 1개를 찾고 댓글 전체를 수집해 '퀴즈' 시트에 반영."""
-    if not is_admin(update):
-        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
-        return
-
-    # args 파싱
-    if not context.args:
-        await update.message.reply_text("사용법: /quizcrawl M.DD\n예) /quizcrawl 3.3")
-        return
-
-    md = _parse_md_arg(context.args[0])
-    if not md:
-        await update.message.reply_text("날짜 형식이 올바르지 않습니다. 예) /quizcrawl 3.3")
-        return
-
-    # (인스턴스 내부) chat_id+message_id dedup
-    try:
-        chat_id = int(update.effective_chat.id) if update.effective_chat else 0
-        msg_id = int(update.message.message_id) if update.message else 0
-        key = (chat_id, msg_id, "quizcrawl")
-        now_ts = time.time()
-        async with _QUIZ_RECENT_REQ_LOCK:
-            # expire
-            for k in list(_QUIZ_RECENT_REQ.keys()):
-                if (now_ts - _QUIZ_RECENT_REQ[k]) > QUIZ_REQ_DEDUP_TTL_SEC:
-                    _QUIZ_RECENT_REQ.pop(k, None)
-            if key in _QUIZ_RECENT_REQ:
-                return
-            _QUIZ_RECENT_REQ[key] = now_ts
-    except Exception:
-        pass
-
-    mm, dd = md
-    year = now_kst().year
-    try:
-        target_dt = datetime(year, mm, dd, tzinfo=KST)
-    except Exception:
-        await update.message.reply_text("존재하지 않는 날짜입니다. (예: 2.30 같은 입력)")
-        return
-
-    dow = target_dt.weekday()  # Mon=0..Sun=6
-    if not (0 <= dow <= 6):
-        await update.message.reply_text("요일 계산에 실패했습니다.")
-        return
-    day_col = _QUIZ_DOW_COLS[dow]
-
-    # 시트 준비
-    ws = get_quiz_ws()
-    if not ws:
-        await update.message.reply_text("구글시트(퀴즈 탭) 준비에 실패했습니다. SPREADSHEET_ID/권한을 확인하세요.")
-        return
-
-    try:
-        await _ensure_quiz_schema(ws)
-    except Exception as e:
-        await update.message.reply_text(f"퀴즈 시트 스키마 세팅 중 오류: {e}")
-        return
-
-    # 네이버 쿠키
-    cookie = _get_naver_quiz_cookie()
-    if not cookie:
-        await update.message.reply_text(
-            "NAVER_QUIZ_COOKIE(또는 기존 NAVER_COOKIE)가 비어있습니다.\n"
-            "브라우저에서 로그인 후 쿠키를 Render 환경변수에 넣어주세요."
-        )
-        return
-
-    cafe_id = QUIZ_CAFE_ID
-    menu_id = QUIZ_MENU_ID
-    pages = max(1, min(20, int(QUIZ_FIND_PAGES)))
-    page_size = max(1, min(50, int(QUIZ_FIND_PAGE_SIZE)))
-
-    await update.message.reply_text(
-        f"퀴즈 게시글을 찾는 중... (작성일 {mm}.{dd:02d}, 요일컬럼={day_col}, cafeId={cafe_id}, menuId={menu_id}, pages=1~{pages})\n"
-        "잠시만 기다려 주세요..."
-    )
-
-    found_article_id = ""
-    found_subject = ""
-    found_ts = None
-
-    try:
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            # 1) 게시글 찾기
-            for p in range(1, pages + 1):
-                st, j, snip = await _fetch_quiz_boardlist_page(
-                    client,
-                    cafe_id=cafe_id,
-                    menu_id=menu_id,
-                    page=p,
-                    page_size=page_size,
-                    sort_by="TIME",
-                    view_type="L",
-                )
-
-                if st in (401, 403):
-                    await update.message.reply_text(
-                        f"접근이 거부되었습니다. (HTTP {st})\n"
-                        "쿠키가 만료되었거나, 해당 게시판을 읽을 권한이 없는 계정일 수 있습니다.\n"
-                        "NAVER_QUIZ_COOKIE를 최신으로 갱신해 주세요."
-                    )
-                    return
-
-                if not j:
-                    await update.message.reply_text(f"글 목록 응답 파싱 실패 (page={p}, HTTP {st})\n응답 일부: {snip}")
-                    return
-
-                result = j.get("result") if isinstance(j, dict) else None
-                article_list = (result or {}).get("articleList") if isinstance(result, dict) else None
-                if not isinstance(article_list, list) or not article_list:
-                    break
-
-                for entry in article_list:
-                    if not isinstance(entry, dict):
-                        continue
-                    item = entry.get("item")
-                    if not isinstance(item, dict):
-                        continue
-                    aid = item.get("articleId")
-                    if not aid:
-                        continue
-                    wts = item.get("writeDateTimestamp")
-                    d = _ms_to_kst_date(wts)
-                    if not d:
-                        continue
-                    if (d.month == mm) and (d.day == dd):
-                        found_article_id = str(aid)
-                        found_subject = str(item.get("subject") or "").strip()
-                        found_ts = d
-                        break
-                if found_article_id:
-                    break
-
-            if not found_article_id:
-                await update.message.reply_text(f"해당 날짜({mm}.{dd:02d})의 게시글을 1~{pages}페이지에서 찾지 못했습니다.")
-                return
-
-            article_url = f"https://cafe.naver.com/ArticleRead.nhn?clubid={cafe_id}&articleid={found_article_id}"
-            print(f"[QUIZ] found articleId={found_article_id} date={found_ts} subject={found_subject}")
-
-            # 2) 댓글 전체 수집
-            st_c, items, err = await _fetch_all_comments_for_article(
-                client,
-                cafe_id=cafe_id,
-                menu_id=menu_id,
-                article_id=found_article_id,
-            )
-
-            if st_c in (401, 403):
-                await update.message.reply_text(
-                    f"댓글 접근이 거부되었습니다. (HTTP {st_c})\n"
-                    "쿠키가 만료되었거나 댓글 읽기 권한이 없는 계정일 수 있습니다.\n"
-                    "NAVER_QUIZ_COOKIE를 갱신해 주세요."
-                )
-                return
-
-            if st_c != 200 and not items:
-                await update.message.reply_text(f"댓글 수집 실패 (HTTP {st_c})\n{err}")
-                return
-
-    except Exception as e:
-        await update.message.reply_text(f"요청 중 오류가 발생했습니다: {e}")
-        return
-
-    # 3) 댓글 → (닉네임, 답안) 추출 + 중복 제거(첫 답안만)
-    # 작성시간 오름차순
-    parsed = []
-    for it in items:
-        nick, text, ts = _extract_comment_nick_and_text(it)
-        if not nick or not text:
-            continue
-        parsed.append((ts, nick, text))
-
-    parsed.sort(key=lambda x: (x[0], x[1]))
-
-    total_fetched = len(parsed)
-    valid_num = 0
-    dup_skip = 0
-    no_num = 0
-
-    seen_nick: set[str] = set()
-    nick_to_ans: dict[str, str] = {}
-
-    num_re = re.compile(r"\d+")
-    for ts, nick, text in parsed:
-        m = num_re.search(text)
-        if not m:
-            no_num += 1
-            continue
-        ans = m.group(0)
-        valid_num += 1
-        if nick in seen_nick:
-            dup_skip += 1
-            continue
-        seen_nick.add(nick)
-        nick_to_ans[nick] = ans
-
-    # 4) 시트 upsert (해당 요일 컬럼만)
-    #    - 기존 닉네임: 해당 요일 셀이 비어있을 때만 채움
-    #    - 신규 닉네임: 신규 행 append
-    try:
-        # 기존 닉네임 목록(A4:A)
-        existing_nicks_raw = ws.get("A4:A")
-        existing_nicks = []
-        for r in (existing_nicks_raw or []):
-            if not r:
-                continue
-            v = str(r[0]).strip()
-            if v:
-                existing_nicks.append(v)
-
-        nick_to_row = {nick: 4 + i for i, nick in enumerate(existing_nicks)}
-        last_existing = 3 + len(existing_nicks)
-
-        # 해당 요일 컬럼 값 읽기(한 번)
-        day_vals_raw = ws.get(f"{day_col}4:{day_col}{max(4, last_existing)}")
-        day_vals = []
-        for r in (day_vals_raw or []):
-            day_vals.append(str(r[0]).strip() if r else "")
-        # pad
-        if len(day_vals) < len(existing_nicks):
-            day_vals.extend([""] * (len(existing_nicks) - len(day_vals)))
-
-        updates = []
-        new_rows = []
-
-        skipped_already = 0
-
-        for nick, ans in nick_to_ans.items():
-            if nick in nick_to_row:
-                row_num = nick_to_row[nick]
-                idx0 = row_num - 4
-                cur = day_vals[idx0] if (0 <= idx0 < len(day_vals)) else ""
-                if cur:
-                    skipped_already += 1
-                    continue
-                updates.append({"range": f"{day_col}{row_num}", "values": [[ans]]})
-            else:
-                # A~H(8컬럼)만 채움
-                row = [""] * 8
-                row[0] = nick
-                # B~H 중 target 요일 위치
-                row[1 + dow] = ans
-                new_rows.append(row)
-
-        # 실제 반영(Write quota 절약)
-        if updates:
-            await _gsheet_call_with_backoff("quiz_upsert.batch_update", ws.batch_update, updates, value_input_option="RAW")
-        if new_rows:
-            await _gsheet_call_with_backoff("quiz_upsert.append_rows", ws.append_rows, new_rows, value_input_option="RAW", table_range="A4")
-
-        updated_cnt = len(updates)
-        inserted_cnt = len(new_rows)
-
-    except Exception as e:
-        await update.message.reply_text(f"구글시트 반영 중 오류가 발생했습니다: {e}")
-        return
-
-    # 5) 요약 응답
-    summary = (
-        f"✅ /quizcrawl 완료 ({mm}.{dd:02d} / {['월','화','수','목','금','토','일'][dow]})\n"
-        f"- 게시글: {found_subject or '(제목없음)'}\n"
-        f"- URL: {article_url}\n"
-        f"- 댓글(텍스트 파싱 대상): {total_fetched}개\n"
-        f"- 숫자 답안 포함 댓글: {valid_num}개\n"
-        f"- 중복 닉네임 스킵: {dup_skip}개\n"
-        f"- 숫자 없음 무시: {no_num}개\n"
-        f"- 시트 반영: 신규 {inserted_cnt}명 / 업데이트 {updated_cnt}명\n"
-        f"- 기존값 있어 스킵: {skipped_already}명\n"
-        f"- 반영 컬럼: {day_col}(월~일 제출답)"
-    )
-    await update.message.reply_text(summary)
-
-
-async def quiz_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/quiz_reset : '퀴즈' 탭의 제출답(B~H) 영역만 초기화."""
-    if not is_admin(update):
-        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
-        return
-
-    ws = get_quiz_ws()
-    if not ws:
-        await update.message.reply_text("구글시트(퀴즈 탭) 준비에 실패했습니다. SPREADSHEET_ID/권한을 확인하세요.")
-        return
-
-    try:
-        await _ensure_quiz_schema(ws)
-    except Exception:
-        pass
-
-    try:
-        # 닉네임 마지막 행 계산(가능하면 최소 범위만)
-        nicks_raw = ws.get("A4:A")
-        nicks = [r[0] for r in (nicks_raw or []) if r and str(r[0]).strip()]
-        last = 3 + len(nicks)
-        last = max(4, last)
-        rng = f"B4:H{last}"
-        await _gsheet_call_with_backoff("quiz_reset.batch_clear", ws.batch_clear, [rng])
-        await update.message.reply_text(f"✅ 퀴즈 제출답 영역 초기화 완료: {rng}")
-    except Exception as e:
-        await update.message.reply_text(f"초기화 중 오류가 발생했습니다: {e}")
 
 
 
@@ -9705,8 +8784,6 @@ def main():
     app.add_handler(CommandHandler("export_comment_zip", export_comment_zip))
     app.add_handler(CommandHandler("export_comment_zip_buttons", export_comment_zip_buttons))
     app.add_handler(CommandHandler("youtoo", youtoo))  # 네이버 카페 메뉴 글 수집 → youtoo 시트
-    app.add_handler(CommandHandler("quizcrawl", quizcrawl))
-    app.add_handler(CommandHandler("quiz_reset", quiz_reset))
 
     # 네이버 카페 자동 글쓰기(종목별 게시판)  ※ /cafe_soccer [tomorrow] 처럼 사용
     app.add_handler(CommandHandler("cafe_soccer", cafe_soccer))
