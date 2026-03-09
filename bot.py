@@ -2202,8 +2202,55 @@ def _log_httpx_exception(prefix: str, e: Exception) -> None:
 # ----------------------------
 # HTTP helpers (Mazgtv anti-bot 대응: 브라우저 헤더 + 쿠키 워밍업)
 # ----------------------------
-MAZ_BASE_URL = os.getenv("MAZ_BASE_URL", "https://litfusegroup.com/").rstrip("/")
-MAZ_LIST_API = os.getenv("MAZ_LIST_API", f"{MAZ_BASE_URL}/api/board/list")
+def _normalize_env_url(raw: str, fallback: str) -> str:
+    """환경변수 URL 문자열을 안전하게 정리한다.
+    - 실수로 '/MAZ_LIST_API=https://...' 또는 'MAZ_LIST_API=https://...' 형태로 넣은 경우 복구
+    - 양끝 공백/따옴표 제거
+    """
+    s = (raw or "").strip().strip('"').strip("'")
+    if not s:
+        return fallback
+
+    # Render 환경변수 값에 키 이름까지 넣는 실수 방지
+    for prefix in ("MAZ_LIST_API=", "/MAZ_LIST_API=", "MAZ_BASE_URL=", "/MAZ_BASE_URL="):
+        if s.startswith(prefix):
+            s = s[len(prefix):].strip()
+            break
+
+    # 선행 슬래시만 잘못 붙은 경우 제거 (/https://...)
+    if s.startswith("/http://") or s.startswith("/https://"):
+        s = s[1:]
+
+    return s or fallback
+
+
+MAZ_BASE_URL = _normalize_env_url(os.getenv("MAZ_BASE_URL", ""), "https://litfusegroup.com").rstrip("/")
+MAZ_LIST_API = _normalize_env_url(os.getenv("MAZ_LIST_API", ""), f"{MAZ_BASE_URL}/api/board/list")
+MAZ_DETAIL_API_TEMPLATE = _normalize_env_url(
+    os.getenv("MAZ_DETAIL_API_TEMPLATE", ""),
+    f"{MAZ_BASE_URL}/api/board/{{board_id}}",
+)
+
+
+def _build_maz_list_url(*, page: int, perpage: int, board_type: int, category: int, sort: str) -> str:
+    """MAZ_LIST_API가 이미 쿼리스트링을 포함해도 안전하게 목록 URL을 생성한다."""
+    from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+
+    base = (MAZ_LIST_API or "").strip()
+    parts = urlsplit(base)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+
+    # 코드 호출부에서 넘긴 값을 우선 적용
+    query.update({
+        "page": str(page),
+        "perpage": str(perpage),
+        "boardType": str(board_type),
+        "category": str(category),
+        "sort": sort,
+    })
+
+    new_query = urlencode(query, doseq=True)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
 
 
 def build_maz_list_params(*, page: int = 1, perpage: int = 15, type_: str = "event",
@@ -5728,10 +5775,6 @@ async def crawl_daum_news_common(
 
 # ───────────────── mazgtv 분석 공통 (내일 경기 → today/tomorrow 시트, JSON/API 버전) ─────────────────
 
-# 상세 API 실제 경로에 맞게 여기만 수정하면 됨
-MAZ_DETAIL_API_TEMPLATE = f"{MAZ_BASE_URL}/api/board/{{board_id}}"
-
-
 def _parse_game_start_date(game_start_at: str) -> date | None:
     """
     '2025-11-28T05:00:00' 같은 문자열에서 날짜(date)만 뽑는다.
@@ -5894,12 +5937,14 @@ async def crawl_maz_analysis_common(
             await _maz_warmup(client)
 
             for page in range(1, max_pages + 1):
-                list_url = (
-                    f"{MAZ_LIST_API}"
-                    f"?page={page}&perpage=20"
-                    f"&boardType={board_type}&category={category}"
-                    f"&sort=b.game_start_at+DESC,+b.created_at+DESC"
+                list_url = _build_maz_list_url(
+                    page=page,
+                    perpage=20,
+                    board_type=board_type,
+                    category=category,
+                    sort="b.game_start_at DESC, b.created_at DESC",
                 )
+                print(f"[MAZ][LIST_URL] page={page} url={list_url}")
 
                 r = await client.get(list_url, timeout=10.0)
                 r.raise_for_status()
@@ -8868,23 +8913,6 @@ def _ms_to_kst_date(ts_ms) -> datetime.date | None:
         return None
 
 
-
-def _ms_to_kst_dt(ts_ms) -> datetime | None:
-    """네이버 timestamp(ms 또는 sec) → KST datetime(aware)."""
-    try:
-        n = int(ts_ms)
-    except Exception:
-        return None
-    if n > 10**12:
-        sec = n / 1000.0
-    else:
-        sec = float(n)
-    try:
-        return datetime.fromtimestamp(sec, tz=timezone.utc).astimezone(KST)
-    except Exception:
-        return None
-
-
 def _parse_md_arg(s: str) -> tuple[int, int] | None:
     """입력 포맷: M.DD (0패딩 허용, 3.3 / 03.03 등)."""
     raw = (s or "").strip()
@@ -8896,49 +8924,6 @@ def _parse_md_arg(s: str) -> tuple[int, int] | None:
     if not (1 <= mm <= 12 and 1 <= dd <= 31):
         return None
     return (mm, dd)
-
-
-
-def _parse_hhmm(s: str) -> tuple[int, int] | None:
-    """'02:30', '14:30' 같은 HH:MM(또는 시간 서식) 문자열을 (hh, mm)로 파싱.
-    - '오전/오후', 'AM/PM', '02:30:00' 형태도 최대한 지원
-    - 숫자(0~1) 형태(시트 시간 serial)도 지원(예: 0.1041666...)
-    """
-    raw = str(s or "").strip()
-    if not raw:
-        return None
-
-    # 1) 구글시트가 시간 serial(0~1)로 내려주는 경우 대비
-    try:
-        if re.fullmatch(r"\d+(?:\.\d+)?", raw):
-            f = float(raw)
-            if 0.0 <= f < 1.0:
-                total_minutes = int(round(f * 24 * 60))
-                hh = (total_minutes // 60) % 24
-                mm = total_minutes % 60
-                return (hh, mm)
-    except Exception:
-        pass
-
-    low = raw.lower()
-    is_pm = ("pm" in low) or ("오후" in raw)
-    is_am = ("am" in low) or ("오전" in raw)
-
-    m = re.search(r"(\d{1,2})\s*:\s*(\d{1,2})", raw)
-    if not m:
-        return None
-
-    hh = int(m.group(1))
-    mm = int(m.group(2))
-
-    if is_pm and hh < 12:
-        hh += 12
-    if is_am and hh == 12:
-        hh = 0
-
-    if not (0 <= hh <= 23 and 0 <= mm <= 59):
-        return None
-    return (hh, mm)
 
 
 async def _http_get_json_with_retry(
@@ -9120,7 +9105,7 @@ def _extract_comment_nick_and_text(it: dict) -> tuple[str, str, int]:
 
     # 작성 시각 후보(ms)
     ts = 0
-    for k in ("createdDate", "writeDate", "regDate", "updateDate", "timestamp"):
+    for k in ("updateDate", "createdDate", "writeDate", "regDate", "timestamp"):
         v = it.get(k)
         try:
             if v is None:
@@ -9328,56 +9313,62 @@ def get_quiz_ws():
 
 
 async def _ensure_quiz_schema(ws) -> None:
-    """
-    (중요) 퀴즈 시트의 서식/헤더는 사용자가 직접 관리합니다.
-
-    다만, '주간 정답 횟수(I열)' 자동 계산이 필요하므로 /quizcrawl 실행 시
-    I4 셀에 ArrayFormula가 없거나 텍스트로 들어가 있어(앞에 ' 가 붙는 경우 포함) 동작하지 않으면
-    아래 수식을 1회 자동으로 세팅합니다.
-
-    이 외 범위(A열 헤더/정렬뷰 등)는 건드리지 않습니다.
-    """
+    """퀴즈 시트 스키마/수식이 없으면 세팅(기존 값 최대한 유지)."""
     if not ws:
         return
 
-    # I4: 주간 정답 횟수(ArrayFormula)
-    desired = "=ARRAYFORMULA(IF(A4:A=\"\",\"\",MMULT(--((TO_TEXT(B4:H)=TO_TEXT(B$1:H$1))*(B$1:H$1<>\"\")),TRANSPOSE(COLUMN(B$1:H$1)^0))))"
+    # 기대 구조
+    header = ["nickname", "월 제출답", "화 제출답", "수 제출답", "목 제출답", "금 제출답", "토 제출답", "일 제출답", "주간 정답 횟수", "정답자 여부"]
+    # 수식은 가능한 ArrayFormula로 1회만 세팅
+    f_I4 = "=ARRAYFORMULA(IF(A4:A=\"\",,MMULT(--(B4:H=B$1:H$1),TRANSPOSE(COLUMN(B1:H1)^0))))"
+    f_J4 = "=ARRAYFORMULA(IF(A4:A=\"\",,IF(I4:I>0,1,0)))"
+    f_L4 = "=IFERROR(SORT(FILTER(A4:J, A4:A<>\"\"), 9, FALSE, 1, TRUE),)"  # 정렬뷰
 
-    def _get_single(rng: str, render: str) -> str:
-        try:
-            v = ws.get(rng, value_render_option=render)
-            if v and isinstance(v, list) and v[0] and isinstance(v[0], list) and len(v[0]) >= 1:
-                return str(v[0][0] if v[0][0] is not None else "")
-        except Exception:
-            pass
-        return ""
-
-    def _norm(s: str) -> str:
-        return "".join((s or "").split())
-
+    # 현재 상태 읽기(최소 범위)
     try:
-        f_cell = _get_single("I4", "FORMULA").strip()
-        v_cell = _get_single("I4", "FORMATTED_VALUE").strip()
+        top = ws.get("A1:U4")  # 1~4행(정답/헤더/수식)만 확인
+    except Exception:
+        top = []
 
-        # FORMULA 렌더는 수식(또는 텍스트)을 그대로 돌려주고,
-        # FORMATTED_VALUE 렌더는 '진짜 수식'이면 계산 결과를 돌려줍니다.
-        # (텍스트로 들어간 수식은 FORMATTED_VALUE에서도 '='로 시작)
-        is_text_formula = f_cell.startswith("=") and v_cell.startswith("=")
-        has_any_formula = f_cell.startswith("=")
-        needs = (not has_any_formula) or is_text_formula or (_norm(f_cell) != _norm(desired))
+    def _cell(r: int, c: int) -> str:
+        try:
+            return str(top[r-1][c-1]) if len(top) >= r and len(top[r-1]) >= c else ""
+        except Exception:
+            return ""
 
-        if needs:
-            updates = [{"range": "I4", "values": [[desired]]}]
-            await _gsheet_call_with_backoff(
-                "quiz_schema.I4",
-                ws.batch_update,
-                updates,
-                value_input_option="USER_ENTERED",
-            )
-            print("[GSHEET][QUIZ] I4 ArrayFormula ensured.")
-    except Exception as e:
-        print(f"[GSHEET][QUIZ] ensure I4 formula error: {e}")
-        return
+    updates = []
+
+    # A1 라벨(선택)
+    if not _cell(1, 1).strip():
+        updates.append({"range": "A1", "values": [["정답(월~일) 입력"]]})
+
+    # A3:J3 헤더
+    row3 = [(_cell(3, i) or "").strip() for i in range(1, 11)]
+    if row3[: len(header)] != header:
+        updates.append({"range": "A3:J3", "values": [header]})
+
+    # I4/J4/L4 수식
+    if not str(_cell(4, 9)).strip().startswith("="):
+        updates.append({"range": "I4", "values": [[f_I4]]})
+    if not str(_cell(4, 10)).strip().startswith("="):
+        updates.append({"range": "J4", "values": [[f_J4]]})
+    if not str(_cell(4, 12)).strip().startswith("="):
+        updates.append({"range": "L4", "values": [[f_L4]]})
+
+    # 정렬뷰 헤더(선택) L3:U3
+    sort_header = ["정렬뷰_nickname", "월", "화", "수", "목", "금", "토", "일", "주간정답", "정답여부"]
+    row3_l = [(_cell(3, 12 + i) or "").strip() for i in range(0, 10)]
+    if row3_l[: len(sort_header)] != sort_header:
+        updates.append({"range": "L3:U3", "values": [sort_header]})
+
+    if updates:
+        await _gsheet_call_with_backoff("quiz_schema.batch_update", ws.batch_update, updates, value_input_option="RAW")
+
+    # freeze(선택): 실패해도 무시
+    try:
+        ws.freeze(rows=3)
+    except Exception:
+        pass
 
 
 async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9433,38 +9424,11 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("구글시트(퀴즈 탭) 준비에 실패했습니다. SPREADSHEET_ID/권한을 확인하세요.")
         return
 
-    # I4(주간 정답 횟수) ArrayFormula 최소 세팅
-    # - 텍스트로 들어간 수식('=...') 때문에 계산이 안 되는 경우를 자동 복구
-    # - 다른 범위(헤더/정렬뷰)는 건드리지 않음
     try:
         await _ensure_quiz_schema(ws)
-    except Exception:
-        pass
-
-    # 퀴즈 마감시간(B2:H2) 로딩 (해당 요일 컬럼)
-    # - 값이 비어있으면 마감시간 필터를 적용하지 않습니다.
-    # - 값이 있지만 형식이 올바르지 않으면(예: '2시30분') 안전을 위해 중단합니다.
-    deadline_raw = ""
-    deadline_hm: tuple[int, int] | None = None
-    try:
-        row2 = ws.get("B2:H2", value_render_option="FORMATTED_VALUE")
-        if row2 and isinstance(row2, list) and len(row2) >= 1 and isinstance(row2[0], list):
-            row = row2[0]
-            if len(row) > dow:
-                deadline_raw = str(row[dow] if row[dow] is not None else "").strip()
     except Exception as e:
-        print(f"[GSHEET][QUIZ] deadline read error: {e}")
-
-    if deadline_raw:
-        deadline_hm = _parse_hhmm(deadline_raw)
-        if not deadline_hm:
-            await update.message.reply_text(
-                "퀴즈 시트의 마감시간(B2:H2) 형식이 올바르지 않습니다.\n"
-                f"- 현재 값({day_col}2): {deadline_raw}\n"
-                "형식 예: 02:30, 14:30"
-            )
-            return
-
+        await update.message.reply_text(f"퀴즈 시트 스키마 세팅 중 오류: {e}")
+        return
 
     # 네이버 쿠키
     cookie = _get_naver_quiz_cookie()
@@ -9488,7 +9452,6 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     found_article_id = ""
     found_subject = ""
     found_ts = None
-    found_write_dt = None
 
     try:
         async with httpx.AsyncClient(follow_redirects=True) as client:
@@ -9538,7 +9501,6 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         found_article_id = str(aid)
                         found_subject = str(item.get("subject") or "").strip()
                         found_ts = d
-                        found_write_dt = _ms_to_kst_dt(wts)
                         break
                 if found_article_id:
                     break
@@ -9574,42 +9536,11 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"요청 중 오류가 발생했습니다: {e}")
         return
 
-    # 2.5) 마감시간 적용 (퀴즈!B2:H2)
-    # - 마감시간이 게시글 작성일의 '다음날'일 수 있음:
-    #   게시글 작성 시각(HH:MM)보다 마감 HH:MM 이 작으면, 다음날로 간주합니다.
-    deadline_cutoff_ms: int | None = None
-    deadline_cutoff_kst = ""
-    if deadline_hm and found_ts:
-        hh, mi = deadline_hm
-        cutoff_dt = datetime(found_ts.year, found_ts.month, found_ts.day, hh, mi, tzinfo=KST)
-        try:
-            if found_write_dt:
-                post_hm = (found_write_dt.hour, found_write_dt.minute)
-                if (hh, mi) < post_hm:
-                    cutoff_dt = cutoff_dt + timedelta(days=1)
-        except Exception:
-            pass
-
-        try:
-            deadline_cutoff_ms = int(cutoff_dt.astimezone(timezone.utc).timestamp() * 1000)
-        except Exception:
-            deadline_cutoff_ms = None
-
-        deadline_cutoff_kst = cutoff_dt.strftime("%Y-%m-%d %H:%M")
-        print(f"[QUIZ] deadline {day_col}2='{deadline_raw}' => cutoff={deadline_cutoff_kst} KST")
-
     # 3) 댓글 → (닉네임, 답안) 추출 + 중복 제거(첫 답안만)
     # 작성시간 오름차순
     parsed = []
-    deadline_skip = 0
     for it in items:
         nick, text, ts = _extract_comment_nick_and_text(it)
-
-        # 마감시간 이후 댓글은 제외
-        if deadline_cutoff_ms and ts and ts > deadline_cutoff_ms:
-            deadline_skip += 1
-            continue
-
         if not nick or not text:
             continue
         parsed.append((ts, nick, text))
@@ -9712,13 +9643,11 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- 기존값 있어 스킵: {skipped_already}명\n"
         f"- 반영 컬럼: {day_col}(월~일 제출답)"
     )
-    if deadline_cutoff_kst:
-        summary += f"\n- 마감시간({day_col}2): {deadline_raw} (cutoff={deadline_cutoff_kst} KST / 이후 제외 {deadline_skip}개)"
     await update.message.reply_text(summary)
 
 
 async def quiz_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/quiz_reset : '퀴즈' 탭의 닉네임(A열) + 제출답(B~H) 데이터를 초기화."""
+    """/quiz_reset : '퀴즈' 탭의 제출답(B~H) 영역만 초기화."""
     if not is_admin(update):
         await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
         return
@@ -9729,12 +9658,19 @@ async def quiz_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        # 데이터 영역 전체 초기화 (A4~H) — 닉네임도 함께 초기화
-        last = int(getattr(ws, "row_count", 2000) or 2000)
+        await _ensure_quiz_schema(ws)
+    except Exception:
+        pass
+
+    try:
+        # 닉네임 마지막 행 계산(가능하면 최소 범위만)
+        nicks_raw = ws.get("A4:A")
+        nicks = [r[0] for r in (nicks_raw or []) if r and str(r[0]).strip()]
+        last = 3 + len(nicks)
         last = max(4, last)
-        rng = f"A4:H{last}"
+        rng = f"B4:H{last}"
         await _gsheet_call_with_backoff("quiz_reset.batch_clear", ws.batch_clear, [rng])
-        await update.message.reply_text(f"✅ 퀴즈 데이터 초기화 완료: {rng}")
+        await update.message.reply_text(f"✅ 퀴즈 제출답 영역 초기화 완료: {rng}")
     except Exception as e:
         await update.message.reply_text(f"초기화 중 오류가 발생했습니다: {e}")
 
