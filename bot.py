@@ -8757,6 +8757,986 @@ async def youtoo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Quiz crawl (네이버 카페 퀴즈 이벤트 댓글 수집 → 구글시트 '퀴즈' 탭 적재)
+#  - 기존 기능 영향 최소화를 위해 별도 쿠키/헤더/시트 스키마를 사용한다.
+# ─────────────────────────────────────────────────────────────────────────────
+
+QUIZ_CAFE_ID = (os.getenv("NAVER_QUIZ_CAFE_ID") or "28534281").strip()
+QUIZ_MENU_ID = (os.getenv("NAVER_QUIZ_MENU_ID") or "6").strip()
+QUIZ_FIND_PAGES = int((os.getenv("NAVER_QUIZ_FIND_PAGES") or "5").strip() or "5")
+QUIZ_FIND_PAGE_SIZE = int((os.getenv("NAVER_QUIZ_PAGE_SIZE") or "15").strip() or "15")
+QUIZ_SHEET_NAME = (os.getenv("QUIZ_SHEET_NAME") or "퀴즈").strip()
+
+# 시트 재시도(429/503) 백오프
+QUIZ_GSHEET_MAX_RETRIES = int(os.getenv("QUIZ_GSHEET_MAX_RETRIES", "6"))
+QUIZ_GSHEET_BACKOFF_BASE_SEC = float(os.getenv("QUIZ_GSHEET_BACKOFF_BASE_SEC", "1.6"))
+QUIZ_GSHEET_BACKOFF_MAX_SEC = float(os.getenv("QUIZ_GSHEET_BACKOFF_MAX_SEC", "35"))
+
+# 댓글 수집 안전장치
+QUIZ_COMMENT_MAX_PAGES = int(os.getenv("QUIZ_COMMENT_MAX_PAGES", "200"))
+QUIZ_COMMENT_TIMEOUT_SEC = float(os.getenv("QUIZ_COMMENT_TIMEOUT_SEC", "18"))
+
+# 요일 컬럼(월~일)
+_QUIZ_DOW_COLS = ["B", "C", "D", "E", "F", "G", "H"]
+
+# (선택) 명령어 중복 실행 방지(인스턴스 내부)
+_QUIZ_RECENT_REQ: dict[tuple[int, int, str], float] = {}
+_QUIZ_RECENT_REQ_LOCK = asyncio.Lock()
+QUIZ_REQ_DEDUP_TTL_SEC = int(os.getenv("QUIZ_REQ_DEDUP_TTL_SEC", "120"))
+
+
+def _normalize_cookie_str(ck: str) -> str:
+    """Render 환경변수 쿠키 문자열 정규화."""
+    ck = (ck or "").strip()
+    if not ck:
+        return ""
+
+    # Render 환경변수에 따옴표로 감싸 넣은 경우 제거
+    if (ck.startswith('"') and ck.endswith('"')) or (ck.startswith("'") and ck.endswith("'")):
+        ck = ck[1:-1].strip()
+
+    if ck.lower().startswith("cookie:"):
+        ck = ck.split(":", 1)[1].strip()
+
+    # 줄바꿈/연속 공백 제거
+    ck = " ".join(ck.splitlines()).strip()
+    return ck
+
+
+def _get_naver_quiz_cookie() -> str:
+    """퀴즈 기능 전용 쿠키 우선순위:
+    1) NAVER_QUIZ_COOKIE
+    2) 기존 쿠키(_get_naver_web_cookie 폴백)
+    """
+    ck = _normalize_cookie_str(os.getenv("NAVER_QUIZ_COOKIE", ""))
+    if ck:
+        return ck
+    # 기존 기능 유지: 다른 기능 쿠키를 건드리지 않기 위해 폴백만 사용
+    try:
+        return _get_naver_web_cookie()
+    except Exception:
+        return ""
+
+
+def _naver_quiz_headers(*, cafe_id: str, menu_id: str, article_id: str | None = None) -> dict[str, str]:
+    """퀴즈 기능 전용 헤더(쿠키/리퍼러 분리)."""
+    cookie = _get_naver_quiz_cookie()
+    ua = (
+        (os.getenv("NAVER_USER_AGENT") or "").strip()
+        or (os.getenv("MAZ_USER_AGENT") or "").strip()
+        or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    )
+
+    if article_id:
+        # 댓글/본문 쪽 referer는 읽기 URL 형태가 더 안전
+        referer = f"https://cafe.naver.com/ArticleRead.nhn?clubid={cafe_id}&articleid={article_id}"
+    else:
+        referer = f"https://cafe.naver.com/ArticleList.nhn?search.clubid={cafe_id}&search.menuid={menu_id}"
+
+    headers = {
+        "User-Agent": ua,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": referer,
+        "Origin": "https://cafe.naver.com",
+        "Connection": "keep-alive",
+    }
+    if cookie:
+        headers["Cookie"] = cookie
+    return headers
+
+
+def _ms_to_kst_date(ts_ms) -> datetime.date | None:
+    """네이버 writeDateTimestamp(ms 또는 sec) → KST date."""
+    try:
+        n = int(ts_ms)
+    except Exception:
+        return None
+    if n > 10**12:
+        sec = n / 1000.0
+    else:
+        sec = float(n)
+    try:
+        dt = datetime.fromtimestamp(sec, tz=timezone.utc).astimezone(KST)
+        return dt.date()
+    except Exception:
+        return None
+
+
+
+def _ms_to_kst_dt(ts_ms) -> datetime | None:
+    """네이버 timestamp(ms 또는 sec) → KST datetime(aware)."""
+    try:
+        n = int(ts_ms)
+    except Exception:
+        return None
+    if n > 10**12:
+        sec = n / 1000.0
+    else:
+        sec = float(n)
+    try:
+        return datetime.fromtimestamp(sec, tz=timezone.utc).astimezone(KST)
+    except Exception:
+        return None
+
+
+def _parse_md_arg(s: str) -> tuple[int, int] | None:
+    """입력 포맷: M.DD (0패딩 허용, 3.3 / 03.03 등)."""
+    raw = (s or "").strip()
+    m = re.match(r"^\s*(\d{1,2})\s*[./\-]\s*(\d{1,2})\s*$", raw)
+    if not m:
+        return None
+    mm = int(m.group(1))
+    dd = int(m.group(2))
+    if not (1 <= mm <= 12 and 1 <= dd <= 31):
+        return None
+    return (mm, dd)
+
+
+
+def _parse_hhmm(s: str) -> tuple[int, int] | None:
+    """'02:30', '14:30' 같은 HH:MM(또는 시간 서식) 문자열을 (hh, mm)로 파싱.
+    - '오전/오후', 'AM/PM', '02:30:00' 형태도 최대한 지원
+    - 숫자(0~1) 형태(시트 시간 serial)도 지원(예: 0.1041666...)
+    """
+    raw = str(s or "").strip()
+    if not raw:
+        return None
+
+    # 1) 구글시트가 시간 serial(0~1)로 내려주는 경우 대비
+    try:
+        if re.fullmatch(r"\d+(?:\.\d+)?", raw):
+            f = float(raw)
+            if 0.0 <= f < 1.0:
+                total_minutes = int(round(f * 24 * 60))
+                hh = (total_minutes // 60) % 24
+                mm = total_minutes % 60
+                return (hh, mm)
+    except Exception:
+        pass
+
+    low = raw.lower()
+    is_pm = ("pm" in low) or ("오후" in raw)
+    is_am = ("am" in low) or ("오전" in raw)
+
+    m = re.search(r"(\d{1,2})\s*:\s*(\d{1,2})", raw)
+    if not m:
+        return None
+
+    hh = int(m.group(1))
+    mm = int(m.group(2))
+
+    if is_pm and hh < 12:
+        hh += 12
+    if is_am and hh == 12:
+        hh = 0
+
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        return None
+    return (hh, mm)
+
+
+async def _http_get_json_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict[str, str],
+    *,
+    timeout_sec: float,
+    max_retries: int = 3,
+) -> tuple[int, dict | None, str]:
+    """(status, json_or_none, text_snippet) with light retry for transient errors."""
+    last_snip = ""
+    for attempt in range(max_retries + 1):
+        try:
+            r = await client.get(url, headers=headers, timeout=timeout_sec)
+            status = r.status_code
+            last_snip = (r.text or "")[:400]
+
+            if status in (401, 403):
+                return status, None, last_snip
+
+            # transient
+            if status in (429, 500, 502, 503, 504):
+                if attempt < max_retries:
+                    await asyncio.sleep(0.9 * (2 ** attempt))
+                    continue
+
+            if not (200 <= status < 300):
+                return status, None, last_snip
+
+            try:
+                data = r.json()
+                if isinstance(data, dict):
+                    return status, data, last_snip
+                return status, None, last_snip
+            except Exception:
+                return status, None, last_snip
+
+        except Exception as e:
+            last_snip = str(e)
+            if attempt < max_retries:
+                await asyncio.sleep(0.9 * (2 ** attempt))
+                continue
+            return 0, None, last_snip
+
+    return 0, None, last_snip
+
+
+async def _fetch_quiz_boardlist_page(
+    client: httpx.AsyncClient,
+    *,
+    cafe_id: str,
+    menu_id: str,
+    page: int,
+    page_size: int,
+    sort_by: str = "TIME",
+    view_type: str = "L",
+) -> tuple[int, dict | None, str]:
+    url = f"https://apis.naver.com/cafe-web/cafe-boardlist-api/v1/cafes/{cafe_id}/menus/{menu_id}/articles"
+    params = {
+        "page": max(1, int(page)),
+        "pageSize": max(1, int(page_size)),
+        "sortBy": (sort_by or "TIME"),
+        "viewType": (view_type or "L"),
+    }
+    headers = _naver_quiz_headers(cafe_id=cafe_id, menu_id=menu_id, article_id=None)
+    # httpx: params를 직접 전달(URI 생성)
+    try:
+        r = await client.get(url, params=params, headers=headers, timeout=QUIZ_COMMENT_TIMEOUT_SEC)
+        status = r.status_code
+        snip = (r.text or "")[:400]
+        if not (200 <= status < 300):
+            return status, None, snip
+        try:
+            j = r.json()
+            return status, (j if isinstance(j, dict) else None), snip
+        except Exception:
+            return status, None, snip
+    except Exception as e:
+        return 0, None, str(e)
+
+
+def _extract_comment_items_meta(data: dict) -> tuple[list[dict] | None, dict]:
+    """댓글 응답 스키마를 최대한 유연하게 파싱한다.
+    반환: (items_or_none, meta)
+    - items_or_none: 파싱 실패 시 None, 파싱 성공 시 list(비어있을 수도 있음)
+    """
+    if not isinstance(data, dict):
+        return None, {}
+
+    comments = None
+
+    # 1) {"comments": {...}}
+    if isinstance(data.get("comments"), dict):
+        comments = data.get("comments")
+
+    # 2) {"result": {"comments": {...}}}
+    if comments is None and isinstance(data.get("result"), dict) and isinstance(data["result"].get("comments"), dict):
+        comments = data["result"].get("comments")
+
+    # 3) {"message":{"result":{"comments":{...}}}}
+    if comments is None and isinstance(data.get("message"), dict):
+        msg = data.get("message") or {}
+        if isinstance(msg.get("result"), dict) and isinstance(msg["result"].get("comments"), dict):
+            comments = msg["result"].get("comments")
+
+    if not isinstance(comments, dict):
+        return None, {}
+
+    # items key 후보
+    items = comments.get("items")
+    if not isinstance(items, list):
+        # 다른 이름 후보(예외 케이스 대비)
+        for k in ("commentList", "list", "comments", "data"):
+            if isinstance(comments.get(k), list):
+                items = comments.get(k)
+                break
+
+    if not isinstance(items, list):
+        return None, {}
+
+    meta = {}
+    for k in ("hasNext", "nextPage", "page", "pageSize", "totalCount"):
+        if k in comments:
+            meta[k] = comments.get(k)
+
+    # pageInfo 형태 지원
+    if isinstance(comments.get("pageInfo"), dict):
+        pi = comments.get("pageInfo") or {}
+        for k in ("hasNext", "nextPage", "page", "pageSize", "totalCount"):
+            if k in pi and k not in meta:
+                meta[k] = pi.get(k)
+
+    return [x for x in items if isinstance(x, dict)], meta
+
+
+def _flatten_comment_items(items: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        out.append(it)
+
+        # 대댓글/자식 댓글 후보 키들
+        for k in ("replies", "reply", "children", "childComments", "replyComments"):
+            v = it.get(k)
+            if isinstance(v, list):
+                for r in v:
+                    if isinstance(r, dict):
+                        out.append(r)
+    return out
+
+
+def _comment_is_visible(it: dict) -> bool:
+    # 블라인드/삭제 스킵(필드명은 케이스별 상이)
+    for k in ("deleted", "isDeleted", "del", "blind", "blindComment", "blindStatus", "removed"):
+        v = it.get(k)
+        if isinstance(v, bool) and v:
+            return False
+        if isinstance(v, str) and v.strip().lower() in ("y", "yes", "true", "1", "deleted", "blind"):
+            return False
+    return True
+
+
+def _extract_comment_nick_and_text(it: dict) -> tuple[str, str, int]:
+    """(nick, content, ts_ms)"""
+    content = str(it.get("content") or it.get("text") or it.get("body") or "").strip()
+
+    nick = ""
+    w = it.get("writer")
+    if isinstance(w, dict):
+        nick = str(w.get("nick") or w.get("nickName") or w.get("nickname") or "").strip()
+
+    # 일부 스키마는 writerInfo
+    if not nick:
+        w2 = it.get("writerInfo")
+        if isinstance(w2, dict):
+            nick = str(w2.get("nickName") or w2.get("nickname") or "").strip()
+
+    # 작성 시각 후보(ms)
+    ts = 0
+    for k in ("createdDate", "writeDate", "regDate", "updateDate", "timestamp"):
+        v = it.get(k)
+        try:
+            if v is None:
+                continue
+            n = int(v)
+            # sec → ms 보정
+            if n < 10**11:
+                n *= 1000
+            ts = n
+            break
+        except Exception:
+            continue
+
+    return nick, content, ts
+
+
+def _format_comment_page_url(base_url: str, page: int) -> str:
+    """댓글 URL 후보(base_url)가 1페이지 기준일 때, page에 맞게 변환."""
+    u = (base_url or "").strip()
+    if not u:
+        return u
+
+    # 1) Gateway 형태: .../comments/pages/1?...  → pages/{page}
+    if "/comments/pages/" in u:
+        return re.sub(r"/comments/pages/\d+", f"/comments/pages/{int(page)}", u)
+
+    # 2) Query 형태: ?page=1 → page={page}
+    try:
+        from urllib.parse import urlsplit, urlunsplit, parse_qs, urlencode
+        sp = urlsplit(u)
+        q = parse_qs(sp.query, keep_blank_values=True)
+        q["page"] = [str(int(page))]
+        new_query = urlencode(q, doseq=True)
+        return urlunsplit((sp.scheme, sp.netloc, sp.path, new_query, sp.fragment))
+    except Exception:
+        # regex fallback
+        if re.search(r"([?&]page=)\d+", u):
+            return re.sub(r"([?&]page=)\d+", rf"\g<1>{int(page)}", u)
+        if "?" in u:
+            return u + f"&page={int(page)}"
+        return u + f"?page={int(page)}"
+
+
+async def _fetch_all_comments_for_article(
+    client: httpx.AsyncClient,
+    *,
+    cafe_id: str,
+    menu_id: str,
+    article_id: str,
+) -> tuple[int, list[dict], str]:
+    """댓글 전체 수집.
+    반환: (http_status_or_0, items_flattened, error_message)
+    - status 200: 정상(댓글 0개여도 200)
+    - status 401/403: 권한/쿠키 문제
+    - status 0: 네트워크/파싱 등 예외
+    """
+    headers = _naver_quiz_headers(cafe_id=cafe_id, menu_id=menu_id, article_id=article_id)
+
+    chosen = None
+    chosen_meta = {}
+    first_status = 0
+    first_err = ""
+
+    # 1) 동작하는 댓글 엔드포인트 1개 선택(기존 코드의 후보 생성 로직을 재사용)
+    for cand in _build_comment_url_candidates(cafe_id, str(article_id)):
+        url1 = _format_comment_page_url(cand, 1)
+        st, j, snip = await _http_get_json_with_retry(client, url1, headers, timeout_sec=QUIZ_COMMENT_TIMEOUT_SEC, max_retries=2)
+        first_status = st or first_status
+        first_err = snip or first_err
+
+        if st in (401, 403):
+            return st, [], "권한 없음(쿠키 만료/게시판 권한 부족)"
+        if not j:
+            continue
+
+        items, meta = _extract_comment_items_meta(j)
+        if items is None:
+            continue
+
+        chosen = cand
+        chosen_meta = meta
+        break
+
+    if not chosen:
+        # 댓글이 0개라서 items가 []인 케이스도 있으므로, JSON 파싱이 되는 케이스를 다시 시도(빈 리스트 허용)
+        for cand in _build_comment_url_candidates(cafe_id, str(article_id)):
+            url1 = _format_comment_page_url(cand, 1)
+            st, j, snip = await _http_get_json_with_retry(client, url1, headers, timeout_sec=QUIZ_COMMENT_TIMEOUT_SEC, max_retries=2)
+            if st in (401, 403):
+                return st, [], "권한 없음(쿠키 만료/게시판 권한 부족)"
+            if not j:
+                continue
+            items, meta = _extract_comment_items_meta(j)
+            if isinstance(items, list):
+                chosen = cand
+                chosen_meta = meta
+                break
+
+    if not chosen:
+        return (first_status or 0), [], (first_err or "댓글 API 파싱 실패")
+
+    # 2) 페이지네이션 수집
+    all_items: list[dict] = []
+    page = 1
+    seen_pages = set()
+
+    while page <= max(1, QUIZ_COMMENT_MAX_PAGES):
+        if page in seen_pages:
+            # 무한루프 방지
+            break
+        seen_pages.add(page)
+
+        url = _format_comment_page_url(chosen, page)
+        st, j, snip = await _http_get_json_with_retry(client, url, headers, timeout_sec=QUIZ_COMMENT_TIMEOUT_SEC, max_retries=2)
+
+        if st in (401, 403):
+            return st, [], "권한 없음(쿠키 만료/게시판 권한 부족)"
+        if not j:
+            # 200인데 JSON이 비정상/빈 본문 등 → 중단
+            if st and (200 <= st < 300):
+                break
+            return st or 0, [], (snip or "댓글 요청 실패")
+
+        items, meta = _extract_comment_items_meta(j)
+        if items is None:
+            # 스키마가 달라졌다 → 중단
+            break
+
+        items2 = _flatten_comment_items(items)
+        # visible filter
+        items2 = [it for it in items2 if _comment_is_visible(it)]
+        if not items2:
+            break
+
+        all_items.extend(items2)
+
+        # 다음 페이지 판단
+        has_next = meta.get("hasNext")
+        next_page = meta.get("nextPage")
+        if isinstance(has_next, bool) and not has_next:
+            break
+
+        if isinstance(next_page, int) and next_page > page:
+            page = next_page
+        else:
+            page += 1
+
+    return 200, all_items, ""
+
+
+async def _gsheet_call_with_backoff(op_name: str, func, *args, **kwargs):
+    """gspread write quota(429)/서버(503) 대응용 지수 백오프."""
+    base = max(0.2, QUIZ_GSHEET_BACKOFF_BASE_SEC)
+    for attempt in range(max(1, QUIZ_GSHEET_MAX_RETRIES)):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            msg = str(e)
+            low = msg.lower()
+            retriable = (
+                "[429" in low
+                or " 429" in low
+                or "quota" in low
+                or "rate" in low
+                or "too many" in low
+                or "[503" in low
+                or " 503" in low
+                or "unavailable" in low
+                or "backend error" in low
+            )
+            if (attempt >= QUIZ_GSHEET_MAX_RETRIES - 1) or (not retriable):
+                raise
+
+            sleep_s = min(QUIZ_GSHEET_BACKOFF_MAX_SEC, base * (2 ** attempt))
+            print(f"[GSHEET][QUIZ] {op_name} retry {attempt+1}/{QUIZ_GSHEET_MAX_RETRIES} after {sleep_s:.1f}s: {msg[:180]}")
+            try:
+                await asyncio.sleep(sleep_s)
+            except Exception:
+                pass
+
+    # unreachable
+    return func(*args, **kwargs)
+
+
+def get_quiz_ws():
+    """'퀴즈' 탭 워크시트 반환(없으면 생성 + 스키마 세팅)."""
+    client_gs = get_gs_client()
+    spreadsheet_id = os.getenv("SPREADSHEET_ID")
+    if not (client_gs and spreadsheet_id):
+        return None
+    try:
+        sh = client_gs.open_by_key(spreadsheet_id)
+        ws = _get_ws_by_name(sh, QUIZ_SHEET_NAME)
+        if not ws:
+            ws = sh.add_worksheet(title=QUIZ_SHEET_NAME, rows=2000, cols=25)
+        # 최소 컬럼 확보(L~U 정렬뷰 대비)
+        try:
+            ws.resize(cols=max(25, 21))
+        except Exception:
+            pass
+        return ws
+    except Exception as e:
+        print(f"[GSHEET][QUIZ] worksheet open/create error: {e}")
+        return None
+
+
+async def _ensure_quiz_schema(ws) -> None:
+    """
+    (중요) 퀴즈 시트의 서식/헤더는 사용자가 직접 관리합니다.
+
+    다만, '주간 정답 횟수(I열)' 자동 계산이 필요하므로 /quizcrawl 실행 시
+    I4 셀에 ArrayFormula가 없거나 텍스트로 들어가 있어(앞에 ' 가 붙는 경우 포함) 동작하지 않으면
+    아래 수식을 1회 자동으로 세팅합니다.
+
+    이 외 범위(A열 헤더/정렬뷰 등)는 건드리지 않습니다.
+    """
+    if not ws:
+        return
+
+    # I4: 주간 정답 횟수(ArrayFormula)
+    desired = "=ARRAYFORMULA(IF(A4:A=\"\",\"\",MMULT(--((TO_TEXT(B4:H)=TO_TEXT(B$1:H$1))*(B$1:H$1<>\"\")),TRANSPOSE(COLUMN(B$1:H$1)^0))))"
+
+    def _get_single(rng: str, render: str) -> str:
+        try:
+            v = ws.get(rng, value_render_option=render)
+            if v and isinstance(v, list) and v[0] and isinstance(v[0], list) and len(v[0]) >= 1:
+                return str(v[0][0] if v[0][0] is not None else "")
+        except Exception:
+            pass
+        return ""
+
+    def _norm(s: str) -> str:
+        return "".join((s or "").split())
+
+    try:
+        f_cell = _get_single("I4", "FORMULA").strip()
+        v_cell = _get_single("I4", "FORMATTED_VALUE").strip()
+
+        # FORMULA 렌더는 수식(또는 텍스트)을 그대로 돌려주고,
+        # FORMATTED_VALUE 렌더는 '진짜 수식'이면 계산 결과를 돌려줍니다.
+        # (텍스트로 들어간 수식은 FORMATTED_VALUE에서도 '='로 시작)
+        is_text_formula = f_cell.startswith("=") and v_cell.startswith("=")
+        has_any_formula = f_cell.startswith("=")
+        needs = (not has_any_formula) or is_text_formula or (_norm(f_cell) != _norm(desired))
+
+        if needs:
+            updates = [{"range": "I4", "values": [[desired]]}]
+            await _gsheet_call_with_backoff(
+                "quiz_schema.I4",
+                ws.batch_update,
+                updates,
+                value_input_option="USER_ENTERED",
+            )
+            print("[GSHEET][QUIZ] I4 ArrayFormula ensured.")
+    except Exception as e:
+        print(f"[GSHEET][QUIZ] ensure I4 formula error: {e}")
+        return
+
+
+async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/quizcrawl M.DD : 해당 날짜(작성일 기준) 게시글 1개를 찾고 댓글 전체를 수집해 '퀴즈' 시트에 반영."""
+    if not is_admin(update):
+        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+
+    # args 파싱
+    if not context.args:
+        await update.message.reply_text("사용법: /quizcrawl M.DD\n예) /quizcrawl 3.3")
+        return
+
+    md = _parse_md_arg(context.args[0])
+    if not md:
+        await update.message.reply_text("날짜 형식이 올바르지 않습니다. 예) /quizcrawl 3.3")
+        return
+
+    # (인스턴스 내부) chat_id+message_id dedup
+    try:
+        chat_id = int(update.effective_chat.id) if update.effective_chat else 0
+        msg_id = int(update.message.message_id) if update.message else 0
+        key = (chat_id, msg_id, "quizcrawl")
+        now_ts = time.time()
+        async with _QUIZ_RECENT_REQ_LOCK:
+            # expire
+            for k in list(_QUIZ_RECENT_REQ.keys()):
+                if (now_ts - _QUIZ_RECENT_REQ[k]) > QUIZ_REQ_DEDUP_TTL_SEC:
+                    _QUIZ_RECENT_REQ.pop(k, None)
+            if key in _QUIZ_RECENT_REQ:
+                return
+            _QUIZ_RECENT_REQ[key] = now_ts
+    except Exception:
+        pass
+
+    mm, dd = md
+    year = now_kst().year
+    try:
+        target_dt = datetime(year, mm, dd, tzinfo=KST)
+    except Exception:
+        await update.message.reply_text("존재하지 않는 날짜입니다. (예: 2.30 같은 입력)")
+        return
+
+    dow = target_dt.weekday()  # Mon=0..Sun=6
+    if not (0 <= dow <= 6):
+        await update.message.reply_text("요일 계산에 실패했습니다.")
+        return
+    day_col = _QUIZ_DOW_COLS[dow]
+
+    # 시트 준비
+    ws = get_quiz_ws()
+    if not ws:
+        await update.message.reply_text("구글시트(퀴즈 탭) 준비에 실패했습니다. SPREADSHEET_ID/권한을 확인하세요.")
+        return
+
+    # I4(주간 정답 횟수) ArrayFormula 최소 세팅
+    # - 텍스트로 들어간 수식('=...') 때문에 계산이 안 되는 경우를 자동 복구
+    # - 다른 범위(헤더/정렬뷰)는 건드리지 않음
+    try:
+        await _ensure_quiz_schema(ws)
+    except Exception:
+        pass
+
+    # 퀴즈 마감시간(B2:H2) 로딩 (해당 요일 컬럼)
+    # - 값이 비어있으면 마감시간 필터를 적용하지 않습니다.
+    # - 값이 있지만 형식이 올바르지 않으면(예: '2시30분') 안전을 위해 중단합니다.
+    deadline_raw = ""
+    deadline_hm: tuple[int, int] | None = None
+    try:
+        row2 = ws.get("B2:H2", value_render_option="FORMATTED_VALUE")
+        if row2 and isinstance(row2, list) and len(row2) >= 1 and isinstance(row2[0], list):
+            row = row2[0]
+            if len(row) > dow:
+                deadline_raw = str(row[dow] if row[dow] is not None else "").strip()
+    except Exception as e:
+        print(f"[GSHEET][QUIZ] deadline read error: {e}")
+
+    if deadline_raw:
+        deadline_hm = _parse_hhmm(deadline_raw)
+        if not deadline_hm:
+            await update.message.reply_text(
+                "퀴즈 시트의 마감시간(B2:H2) 형식이 올바르지 않습니다.\n"
+                f"- 현재 값({day_col}2): {deadline_raw}\n"
+                "형식 예: 02:30, 14:30"
+            )
+            return
+
+
+    # 네이버 쿠키
+    cookie = _get_naver_quiz_cookie()
+    if not cookie:
+        await update.message.reply_text(
+            "NAVER_QUIZ_COOKIE(또는 기존 NAVER_COOKIE)가 비어있습니다.\n"
+            "브라우저에서 로그인 후 쿠키를 Render 환경변수에 넣어주세요."
+        )
+        return
+
+    cafe_id = QUIZ_CAFE_ID
+    menu_id = QUIZ_MENU_ID
+    pages = max(1, min(20, int(QUIZ_FIND_PAGES)))
+    page_size = max(1, min(50, int(QUIZ_FIND_PAGE_SIZE)))
+
+    await update.message.reply_text(
+        f"퀴즈 게시글을 찾는 중... (작성일 {mm}.{dd:02d}, 요일컬럼={day_col}, cafeId={cafe_id}, menuId={menu_id}, pages=1~{pages})\n"
+        "잠시만 기다려 주세요..."
+    )
+
+    found_article_id = ""
+    found_subject = ""
+    found_ts = None
+    found_write_dt = None
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            # 1) 게시글 찾기
+            for p in range(1, pages + 1):
+                st, j, snip = await _fetch_quiz_boardlist_page(
+                    client,
+                    cafe_id=cafe_id,
+                    menu_id=menu_id,
+                    page=p,
+                    page_size=page_size,
+                    sort_by="TIME",
+                    view_type="L",
+                )
+
+                if st in (401, 403):
+                    await update.message.reply_text(
+                        f"접근이 거부되었습니다. (HTTP {st})\n"
+                        "쿠키가 만료되었거나, 해당 게시판을 읽을 권한이 없는 계정일 수 있습니다.\n"
+                        "NAVER_QUIZ_COOKIE를 최신으로 갱신해 주세요."
+                    )
+                    return
+
+                if not j:
+                    await update.message.reply_text(f"글 목록 응답 파싱 실패 (page={p}, HTTP {st})\n응답 일부: {snip}")
+                    return
+
+                result = j.get("result") if isinstance(j, dict) else None
+                article_list = (result or {}).get("articleList") if isinstance(result, dict) else None
+                if not isinstance(article_list, list) or not article_list:
+                    break
+
+                for entry in article_list:
+                    if not isinstance(entry, dict):
+                        continue
+                    item = entry.get("item")
+                    if not isinstance(item, dict):
+                        continue
+                    aid = item.get("articleId")
+                    if not aid:
+                        continue
+                    wts = item.get("writeDateTimestamp")
+                    d = _ms_to_kst_date(wts)
+                    if not d:
+                        continue
+                    if (d.month == mm) and (d.day == dd):
+                        found_article_id = str(aid)
+                        found_subject = str(item.get("subject") or "").strip()
+                        found_ts = d
+                        found_write_dt = _ms_to_kst_dt(wts)
+                        break
+                if found_article_id:
+                    break
+
+            if not found_article_id:
+                await update.message.reply_text(f"해당 날짜({mm}.{dd:02d})의 게시글을 1~{pages}페이지에서 찾지 못했습니다.")
+                return
+
+            article_url = f"https://cafe.naver.com/ArticleRead.nhn?clubid={cafe_id}&articleid={found_article_id}"
+            print(f"[QUIZ] found articleId={found_article_id} date={found_ts} subject={found_subject}")
+
+            # 2) 댓글 전체 수집
+            st_c, items, err = await _fetch_all_comments_for_article(
+                client,
+                cafe_id=cafe_id,
+                menu_id=menu_id,
+                article_id=found_article_id,
+            )
+
+            if st_c in (401, 403):
+                await update.message.reply_text(
+                    f"댓글 접근이 거부되었습니다. (HTTP {st_c})\n"
+                    "쿠키가 만료되었거나 댓글 읽기 권한이 없는 계정일 수 있습니다.\n"
+                    "NAVER_QUIZ_COOKIE를 갱신해 주세요."
+                )
+                return
+
+            if st_c != 200 and not items:
+                await update.message.reply_text(f"댓글 수집 실패 (HTTP {st_c})\n{err}")
+                return
+
+    except Exception as e:
+        await update.message.reply_text(f"요청 중 오류가 발생했습니다: {e}")
+        return
+
+    # 2.5) 마감시간 적용 (퀴즈!B2:H2)
+    # - 마감시간이 게시글 작성일의 '다음날'일 수 있음:
+    #   게시글 작성 시각(HH:MM)보다 마감 HH:MM 이 작으면, 다음날로 간주합니다.
+    deadline_cutoff_ms: int | None = None
+    deadline_cutoff_kst = ""
+    if deadline_hm and found_ts:
+        hh, mi = deadline_hm
+        cutoff_dt = datetime(found_ts.year, found_ts.month, found_ts.day, hh, mi, tzinfo=KST)
+        try:
+            if found_write_dt:
+                post_hm = (found_write_dt.hour, found_write_dt.minute)
+                if (hh, mi) < post_hm:
+                    cutoff_dt = cutoff_dt + timedelta(days=1)
+        except Exception:
+            pass
+
+        try:
+            deadline_cutoff_ms = int(cutoff_dt.astimezone(timezone.utc).timestamp() * 1000)
+        except Exception:
+            deadline_cutoff_ms = None
+
+        deadline_cutoff_kst = cutoff_dt.strftime("%Y-%m-%d %H:%M")
+        print(f"[QUIZ] deadline {day_col}2='{deadline_raw}' => cutoff={deadline_cutoff_kst} KST")
+
+    # 3) 댓글 → (닉네임, 답안) 추출 + 중복 제거(첫 답안만)
+    # 작성시간 오름차순
+    parsed = []
+    deadline_skip = 0
+    for it in items:
+        nick, text, ts = _extract_comment_nick_and_text(it)
+
+        # 마감시간 이후 댓글은 제외
+        if deadline_cutoff_ms and ts and ts > deadline_cutoff_ms:
+            deadline_skip += 1
+            continue
+
+        if not nick or not text:
+            continue
+        parsed.append((ts, nick, text))
+
+    parsed.sort(key=lambda x: (x[0], x[1]))
+
+    total_fetched = len(parsed)
+    valid_num = 0
+    dup_skip = 0
+    no_num = 0
+
+    seen_nick: set[str] = set()
+    nick_to_ans: dict[str, str] = {}
+
+    num_re = re.compile(r"\d+")
+    for ts, nick, text in parsed:
+        m = num_re.search(text)
+        if not m:
+            no_num += 1
+            continue
+        ans = m.group(0)
+        valid_num += 1
+        if nick in seen_nick:
+            dup_skip += 1
+            continue
+        seen_nick.add(nick)
+        nick_to_ans[nick] = ans
+
+    # 4) 시트 upsert (해당 요일 컬럼만)
+    #    - 기존 닉네임: 해당 요일 셀이 비어있을 때만 채움
+    #    - 신규 닉네임: 신규 행 append
+    try:
+        # 기존 닉네임 목록(A4:A)
+        existing_nicks_raw = ws.get("A4:A")
+        existing_nicks = []
+        for r in (existing_nicks_raw or []):
+            if not r:
+                continue
+            v = str(r[0]).strip()
+            if v:
+                existing_nicks.append(v)
+
+        nick_to_row = {nick: 4 + i for i, nick in enumerate(existing_nicks)}
+        last_existing = 3 + len(existing_nicks)
+
+        # 해당 요일 컬럼 값 읽기(한 번)
+        day_vals_raw = ws.get(f"{day_col}4:{day_col}{max(4, last_existing)}")
+        day_vals = []
+        for r in (day_vals_raw or []):
+            day_vals.append(str(r[0]).strip() if r else "")
+        # pad
+        if len(day_vals) < len(existing_nicks):
+            day_vals.extend([""] * (len(existing_nicks) - len(day_vals)))
+
+        updates = []
+        new_rows = []
+
+        skipped_already = 0
+
+        for nick, ans in nick_to_ans.items():
+            if nick in nick_to_row:
+                row_num = nick_to_row[nick]
+                idx0 = row_num - 4
+                cur = day_vals[idx0] if (0 <= idx0 < len(day_vals)) else ""
+                if cur:
+                    skipped_already += 1
+                    continue
+                updates.append({"range": f"{day_col}{row_num}", "values": [[ans]]})
+            else:
+                # A~H(8컬럼)만 채움
+                row = [""] * 8
+                row[0] = nick
+                # B~H 중 target 요일 위치
+                row[1 + dow] = ans
+                new_rows.append(row)
+
+        # 실제 반영(Write quota 절약)
+        if updates:
+            await _gsheet_call_with_backoff("quiz_upsert.batch_update", ws.batch_update, updates, value_input_option="RAW")
+        if new_rows:
+            await _gsheet_call_with_backoff("quiz_upsert.append_rows", ws.append_rows, new_rows, value_input_option="RAW", table_range="A4")
+
+        updated_cnt = len(updates)
+        inserted_cnt = len(new_rows)
+
+    except Exception as e:
+        await update.message.reply_text(f"구글시트 반영 중 오류가 발생했습니다: {e}")
+        return
+
+    # 5) 요약 응답
+    summary = (
+        f"✅ /quizcrawl 완료 ({mm}.{dd:02d} / {['월','화','수','목','금','토','일'][dow]})\n"
+        f"- 게시글: {found_subject or '(제목없음)'}\n"
+        f"- URL: {article_url}\n"
+        f"- 댓글(텍스트 파싱 대상): {total_fetched}개\n"
+        f"- 숫자 답안 포함 댓글: {valid_num}개\n"
+        f"- 중복 닉네임 스킵: {dup_skip}개\n"
+        f"- 숫자 없음 무시: {no_num}개\n"
+        f"- 시트 반영: 신규 {inserted_cnt}명 / 업데이트 {updated_cnt}명\n"
+        f"- 기존값 있어 스킵: {skipped_already}명\n"
+        f"- 반영 컬럼: {day_col}(월~일 제출답)"
+    )
+    if deadline_cutoff_kst:
+        summary += f"\n- 마감시간({day_col}2): {deadline_raw} (cutoff={deadline_cutoff_kst} KST / 이후 제외 {deadline_skip}개)"
+    await update.message.reply_text(summary)
+
+
+async def quiz_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/quiz_reset : '퀴즈' 탭의 닉네임(A열) + 제출답(B~H) 데이터를 초기화."""
+    if not is_admin(update):
+        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+
+    ws = get_quiz_ws()
+    if not ws:
+        await update.message.reply_text("구글시트(퀴즈 탭) 준비에 실패했습니다. SPREADSHEET_ID/권한을 확인하세요.")
+        return
+
+    try:
+        # 데이터 영역 전체 초기화 (A4~H) — 닉네임도 함께 초기화
+        last = int(getattr(ws, "row_count", 2000) or 2000)
+        last = max(4, last)
+        rng = f"A4:H{last}"
+        await _gsheet_call_with_backoff("quiz_reset.batch_clear", ws.batch_clear, [rng])
+        await update.message.reply_text(f"✅ 퀴즈 데이터 초기화 완료: {rng}")
+    except Exception as e:
+        await update.message.reply_text(f"초기화 중 오류가 발생했습니다: {e}")
+
+
+
 def main():
     reload_analysis_from_sheet()
     reload_news_from_sheet()
@@ -8834,6 +9814,10 @@ def main():
 
 
 
+
+    # 퀴즈 이벤트 댓글 수집
+    app.add_handler(CommandHandler("quizcrawl", quizcrawl))
+    app.add_handler(CommandHandler("quiz_reset", quiz_reset))
 
     app.add_handler(CallbackQueryHandler(on_callback))
 
