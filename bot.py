@@ -9338,7 +9338,10 @@ async def _ensure_quiz_schema(ws) -> None:
         return
 
     # I4: 주간 정답 횟수(ArrayFormula)
-    desired = "=ARRAYFORMULA(IF(A4:A=\"\",\"\",MMULT(--((TO_TEXT(B4:H)=TO_TEXT(B$1:H$1))*(B$1:H$1<>\"\")),TRANSPOSE(COLUMN(B$1:H$1)^0))))"
+    # - B1:H1 정답칸은 단일 정답(예: 2) 또는 복수 정답(예: 2,3)을 허용
+    # - 공백이 섞인 "2, 3" 형태도 허용
+    # - 각 회원 답안(B4:H)은 단일 숫자라고 가정하고, 해당 값이 정답 리스트 안에 포함되면 1점으로 계산
+    desired = "=ARRAYFORMULA(IF(A4:A=\"\",\"\",MMULT(--((B4:H<>\"\")*(B$1:H$1<>\"\")*IFERROR(ISNUMBER(SEARCH(\",\"&REGEXREPLACE(TO_TEXT(B4:H),\"\\s+\",\"\")&\",\",\",\"&REGEXREPLACE(TO_TEXT(B$1:H$1),\"\\s+\",\"\")&\",\")),FALSE)),TRANSPOSE(COLUMN(B$1:H$1)^0))))"
 
     def _get_single(rng: str, render: str) -> str:
         try:
