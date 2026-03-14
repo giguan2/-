@@ -6,7 +6,8 @@ import re as _re_simple
 from telegram.error import BadRequest
 
 # --- Time helpers ---
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 KST = timezone(timedelta(hours=9))
 
@@ -2376,7 +2377,7 @@ def is_admin(update: Update) -> bool:
 
 def get_kst_now() -> datetime:
     """한국 시간 기준 현재 시각 (UTC+9)"""
-    return datetime.utcnow() + timedelta(hours=9)
+    return datetime.now(ZoneInfo("Asia/Seoul"))
 
 
 def get_date_labels():
