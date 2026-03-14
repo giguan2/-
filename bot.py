@@ -6,8 +6,7 @@ import re as _re_simple
 from telegram.error import BadRequest
 
 # --- Time helpers ---
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
 
 KST = timezone(timedelta(hours=9))
 
@@ -1681,6 +1680,57 @@ def get_cafe_log_ws():
         return None
 
 
+async def _append_cafe_log_row_safe(ws_log, row: list[str]) -> bool:
+    """cafe_log append_row를 안전하게 수행한다.
+
+    - Google Sheets가 일시적으로 503/429를 반환해도 지수 백오프로 재시도
+    - 끝까지 실패해도 본 작업(네이버 카페 업로드)은 계속 진행되도록 False만 반환
+    """
+    if ws_log is None:
+        return False
+
+    retries = int(os.getenv("CAFE_LOG_APPEND_RETRIES", "5"))
+    base_delay = float(os.getenv("CAFE_LOG_APPEND_BACKOFF_BASE_SEC", "1.5"))
+    max_delay = float(os.getenv("CAFE_LOG_APPEND_BACKOFF_MAX_SEC", "20"))
+
+    def _is_retryable(err: Exception) -> bool:
+        msg = str(err)
+        retry_markers = [
+            "503",
+            "429",
+            "The service is currently unavailable",
+            "Quota exceeded",
+            "Internal error encountered",
+            "backendError",
+            "try again later",
+        ]
+        return any(marker in msg for marker in retry_markers)
+
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            await asyncio.to_thread(
+                ws_log.append_row,
+                row,
+                value_input_option="RAW",
+                table_range="A1",
+            )
+            return True
+        except Exception as e:
+            last_err = e
+            if _is_retryable(e) and attempt < retries:
+                delay = min(max_delay, base_delay * (2 ** attempt))
+                print(f"[CAFE_LOG] append retry {attempt + 1}/{retries} after {delay:.1f}s: {e}")
+                await asyncio.sleep(delay)
+                continue
+            print(f"[CAFE_LOG] append failed: {e}")
+            break
+
+    if last_err:
+        print(f"[CAFE_LOG] giving up append after retries: {last_err}")
+    return False
+
+
 def get_news_cafe_queue_ws():
     """news_cafe_queue 워크시트 반환(없으면 생성 + 헤더 세팅)."""
     client_gs = get_gs_client()
@@ -2075,10 +2125,9 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
     for (sid, dayv, sportv, titlev, contentv, createdv, menuid, row_idx) in to_post:
         if not menuid:
             fail_cnt += 1
-            ws_log.append_row(
+            await _append_cafe_log_row_safe(
+                ws_log,
                 [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), "NO_MENU_ID", titlev, "", ""],
-                value_input_option="RAW",
-                table_range="A1",
             )
             continue
 
@@ -2086,10 +2135,9 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
         if not content_txt:
             fail_cnt += 1
             status = "NO_BODY" if mode == "deep" else "NO_SIMPLE"
-            ws_log.append_row(
+            await _append_cafe_log_row_safe(
+                ws_log,
                 [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), status, titlev, "", ""],
-                value_input_option="RAW",
-                table_range="A1",
             )
             continue
 
@@ -2134,10 +2182,9 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
                 deep_url = article_url if mode == "deep" else ""
 
                 ok_cnt += 1
-                ws_log.append_row(
+                await _append_cafe_log_row_safe(
+                    ws_log,
                     [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, article_id, posted_at, "OK", subject, url, deep_url],
-                    value_input_option="RAW",
-                    table_range="A1",
                 )
                 # export 시트에도 업로드된 링크를 기록(가능할 때만)
                 try:
@@ -2166,10 +2213,9 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
                 continue
 
             fail_cnt += 1
-            ws_log.append_row(
+            await _append_cafe_log_row_safe(
+                ws_log,
                 [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), info, subject, "", ""],
-                value_input_option="RAW",
-                table_range="A1",
             )
             break
 
@@ -2377,7 +2423,7 @@ def is_admin(update: Update) -> bool:
 
 def get_kst_now() -> datetime:
     """한국 시간 기준 현재 시각 (UTC+9)"""
-    return datetime.now(ZoneInfo("Asia/Seoul"))
+    return datetime.utcnow() + timedelta(hours=9)
 
 
 def get_date_labels():
@@ -3415,12 +3461,6 @@ def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
 
     저장 포맷(항상 EXPORT_HEADER 순서):
       day, sport, src_id, title, body, createdAt, simple, cafe_title, cafe_url, comments, cafe_url_deep, deep_comments
-
-    중요:
-      - 크롤링 단계에서 comments/deep_comments OpenAI 자동 생성을 기본적으로 하지 않는다.
-      - 대량 경기일 때 OpenAI 호출이 수십~수백 회 발생하며, 몇 시간씩 멈춘 것처럼 보일 수 있기 때문이다.
-      - 필요하면 /export_comment_fill 로 나중에 채운다.
-      - 환경변수 EXPORT_COMMENT_AUTOFILL_ON_APPEND=1 이면 예전처럼 append 시 자동 생성 가능.
     """
     if not rows:
         return True
@@ -3428,8 +3468,6 @@ def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
     ws = get_export_ws(sheet_name)
     if not ws:
         return False
-
-    autofill_on_append = (os.getenv("EXPORT_COMMENT_AUTOFILL_ON_APPEND", "0").strip().lower() in ("1", "true", "yes", "on"))
 
     # 컬럼 인덱스(헤더명 기반)
     def _h(name: str, fallback: int) -> int:
@@ -3488,6 +3526,7 @@ def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
             if len(legacy) > 10:
                 rr[i_cafe_url_deep] = legacy[10]
 
+        day = rr[i_day] if i_day < len(rr) else ""
         sport_label = rr[i_sport] if i_sport < len(rr) else ""
         title = rr[i_title] if i_title < len(rr) else ""
         body = rr[i_body] if i_body < len(rr) else ""
@@ -3502,28 +3541,28 @@ def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
             simple_txt = (rr[i_simple] if i_simple < len(rr) else "") or ""
             base_title = (simple_txt.splitlines()[0] if simple_txt else "").strip()
 
-        # comments / deep_comments는 기본적으로 빈칸 유지 (나중에 /export_comment_fill 로 채움)
-        # 단, 명시적으로 환경변수 켠 경우에만 예전 자동 생성 로직 사용
-        if autofill_on_append:
-            if i_comments < len(rr) and (not str(rr[i_comments]).strip()):
-                comments, deep_comments = generate_export_comments_pair(
+        # comments(심플용) 생성/보정
+        if i_comments < len(rr) and (not str(rr[i_comments]).strip()):
+            comments, deep_comments = generate_export_comments_pair(
+                title=base_title,
+                sport_label=str(sport_label or "").strip(),
+                body_hint=str(body or "").strip(),
+            )
+            rr[i_comments] = (comments or "").strip()
+            # deep_comments도 동시에 채워주되, 이미 값이 있으면 유지
+            if i_deep_comments < len(rr) and (not str(rr[i_deep_comments]).strip()):
+                rr[i_deep_comments] = (deep_comments or "").strip()
+        else:
+            # comments가 이미 있고 deep_comments만 비어있으면 deep만 생성
+            if i_deep_comments < len(rr) and (not str(rr[i_deep_comments]).strip()):
+                deep_comments = generate_export_comments(
                     title=base_title,
                     sport_label=str(sport_label or "").strip(),
+                    mode="deep",
                     body_hint=str(body or "").strip(),
+                    avoid_text=str(rr[i_comments] if i_comments < len(rr) else ""),
                 )
-                rr[i_comments] = (comments or "").strip()
-                if i_deep_comments < len(rr) and (not str(rr[i_deep_comments]).strip()):
-                    rr[i_deep_comments] = (deep_comments or "").strip()
-            else:
-                if i_deep_comments < len(rr) and (not str(rr[i_deep_comments]).strip()):
-                    deep_comments = generate_export_comments(
-                        title=base_title,
-                        sport_label=str(sport_label or "").strip(),
-                        mode="deep",
-                        body_hint=str(body or "").strip(),
-                        avoid_text=str(rr[i_comments] if i_comments < len(rr) else ""),
-                    )
-                    rr[i_deep_comments] = (deep_comments or "").strip()
+                rr[i_deep_comments] = (deep_comments or "").strip()
 
         # rr 길이 보정
         if len(rr) < len(EXPORT_HEADER):
@@ -9276,63 +9315,14 @@ def get_quiz_ws():
 
 
 async def _ensure_quiz_schema(ws) -> None:
-    """퀴즈 시트 스키마/수식이 없으면 세팅(기존 값 최대한 유지)."""
-    if not ws:
-        return
+    """
+    (중요) 퀴즈 시트의 서식/수식은 사용자가 직접 관리합니다.
+    - 이전 버전: A1~U4(정답/헤더/수식/정렬뷰)를 자동 세팅/수정
+    - 현재 버전: 크롤링/리셋 시 **시트 서식/수식/헤더를 절대 건드리지 않도록** 자동 세팅을 중단
 
-    # 기대 구조
-    header = ["nickname", "월 제출답", "화 제출답", "수 제출답", "목 제출답", "금 제출답", "토 제출답", "일 제출답", "주간 정답 횟수", "정답자 여부"]
-    # 수식은 가능한 ArrayFormula로 1회만 세팅
-    f_I4 = "=ARRAYFORMULA(IF(A4:A=\"\",,MMULT(--(B4:H=B$1:H$1),TRANSPOSE(COLUMN(B1:H1)^0))))"
-    f_J4 = "=ARRAYFORMULA(IF(A4:A=\"\",,IF(I4:I>0,1,0)))"
-    f_L4 = "=IFERROR(SORT(FILTER(A4:J, A4:A<>\"\"), 9, FALSE, 1, TRUE),)"  # 정렬뷰
-
-    # 현재 상태 읽기(최소 범위)
-    try:
-        top = ws.get("A1:U4")  # 1~4행(정답/헤더/수식)만 확인
-    except Exception:
-        top = []
-
-    def _cell(r: int, c: int) -> str:
-        try:
-            return str(top[r-1][c-1]) if len(top) >= r and len(top[r-1]) >= c else ""
-        except Exception:
-            return ""
-
-    updates = []
-
-    # A1 라벨(선택)
-    if not _cell(1, 1).strip():
-        updates.append({"range": "A1", "values": [["정답(월~일) 입력"]]})
-
-    # A3:J3 헤더
-    row3 = [(_cell(3, i) or "").strip() for i in range(1, 11)]
-    if row3[: len(header)] != header:
-        updates.append({"range": "A3:J3", "values": [header]})
-
-    # I4/J4/L4 수식
-    if not str(_cell(4, 9)).strip().startswith("="):
-        updates.append({"range": "I4", "values": [[f_I4]]})
-    if not str(_cell(4, 10)).strip().startswith("="):
-        updates.append({"range": "J4", "values": [[f_J4]]})
-    if not str(_cell(4, 12)).strip().startswith("="):
-        updates.append({"range": "L4", "values": [[f_L4]]})
-
-    # 정렬뷰 헤더(선택) L3:U3
-    sort_header = ["정렬뷰_nickname", "월", "화", "수", "목", "금", "토", "일", "주간정답", "정답여부"]
-    row3_l = [(_cell(3, 12 + i) or "").strip() for i in range(0, 10)]
-    if row3_l[: len(sort_header)] != sort_header:
-        updates.append({"range": "L3:U3", "values": [sort_header]})
-
-    if updates:
-        await _gsheet_call_with_backoff("quiz_schema.batch_update", ws.batch_update, updates, value_input_option="RAW")
-
-    # freeze(선택): 실패해도 무시
-    try:
-        ws.freeze(rows=3)
-    except Exception:
-        pass
-
+    필요하면 구글시트에서 직접 수식/헤더/정렬뷰를 작성하세요.
+    """
+    return
 
 async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/quizcrawl M.DD : 해당 날짜(작성일 기준) 게시글 1개를 찾고 댓글 전체를 수집해 '퀴즈' 시트에 반영."""
@@ -9385,12 +9375,6 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ws = get_quiz_ws()
     if not ws:
         await update.message.reply_text("구글시트(퀴즈 탭) 준비에 실패했습니다. SPREADSHEET_ID/권한을 확인하세요.")
-        return
-
-    try:
-        await _ensure_quiz_schema(ws)
-    except Exception as e:
-        await update.message.reply_text(f"퀴즈 시트 스키마 세팅 중 오류: {e}")
         return
 
     # 네이버 쿠키
@@ -9610,7 +9594,7 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def quiz_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/quiz_reset : '퀴즈' 탭의 제출답(B~H) 영역만 초기화."""
+    """/quiz_reset : '퀴즈' 탭의 닉네임(A열) + 제출답(B~H) 데이터를 초기화."""
     if not is_admin(update):
         await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
         return
@@ -9621,19 +9605,12 @@ async def quiz_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        await _ensure_quiz_schema(ws)
-    except Exception:
-        pass
-
-    try:
-        # 닉네임 마지막 행 계산(가능하면 최소 범위만)
-        nicks_raw = ws.get("A4:A")
-        nicks = [r[0] for r in (nicks_raw or []) if r and str(r[0]).strip()]
-        last = 3 + len(nicks)
+        # 데이터 영역 전체 초기화 (A4~H) — 닉네임도 함께 초기화
+        last = int(getattr(ws, "row_count", 2000) or 2000)
         last = max(4, last)
-        rng = f"B4:H{last}"
+        rng = f"A4:H{last}"
         await _gsheet_call_with_backoff("quiz_reset.batch_clear", ws.batch_clear, [rng])
-        await update.message.reply_text(f"✅ 퀴즈 제출답 영역 초기화 완료: {rng}")
+        await update.message.reply_text(f"✅ 퀴즈 데이터 초기화 완료: {rng}")
     except Exception as e:
         await update.message.reply_text(f"초기화 중 오류가 발생했습니다: {e}")
 
