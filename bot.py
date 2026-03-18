@@ -4331,13 +4331,29 @@ def build_reply_keyboard() -> ReplyKeyboardMarkup:
 
 
 def build_main_inline_menu() -> InlineKeyboardMarkup:
-    """채널/DM 공통 메인 인라인 메뉴."""
+    """DM 전용 메인 인라인 메뉴(callback 기반)."""
     today_str, tomorrow_str = get_date_labels()
     buttons = [
         [InlineKeyboardButton("📺 실시간 무료 중계", url="https://goat-tv.com")],
         [InlineKeyboardButton(f"📌 {today_str} 경기 분석픽", callback_data="analysis_root:today")],
         [InlineKeyboardButton(f"📌 {tomorrow_str} 경기 분석픽", callback_data="analysis_root:tomorrow")],
         [InlineKeyboardButton("📰 스포츠 뉴스 요약", callback_data="news_root")],
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_channel_inline_menu(bot_username: str) -> InlineKeyboardMarkup:
+    """채널 전용 메인 인라인 메뉴(deep link 기반)."""
+    today_str, tomorrow_str = get_date_labels()
+    username = (bot_username or "").strip().lstrip("@")
+    if not username:
+        username = (BOT_USERNAME or "").strip().lstrip("@")
+
+    buttons = [
+        [InlineKeyboardButton("📺 실시간 무료 중계", url="https://goat-tv.com")],
+        [InlineKeyboardButton(f"📌 {today_str} 경기 분석픽", url=f"https://t.me/{username}?start=analysis_today")],
+        [InlineKeyboardButton(f"📌 {tomorrow_str} 경기 분석픽", url=f"https://t.me/{username}?start=analysis_tomorrow")],
+        [InlineKeyboardButton("📰 스포츠 뉴스 요약", url=f"https://t.me/{username}?start=news")],
     ]
     return InlineKeyboardMarkup(buttons)
 
@@ -4454,16 +4470,41 @@ def build_news_list_menu(sport: str, per_page: int = 10) -> InlineKeyboardMarkup
     buttons.append([InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")])
     return InlineKeyboardMarkup(buttons)
 
-async def send_main_menu(chat_id: int | str, context: ContextTypes.DEFAULT_TYPE, preview: bool = False):
-    """
-    채널/DM 공통으로 '텍스트 + 메인 메뉴 버튼' 전송.
-    """
+async def _resolve_bot_username(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """deep link 생성에 사용할 봇 username을 우선순위대로 반환."""
+    username = (os.getenv("BOT_USERNAME") or "").strip().lstrip("@")
+    if username:
+        return username
+
+    username = (BOT_USERNAME or "").strip().lstrip("@")
+    if username:
+        return username
+
+    me = await context.bot.get_me()
+    return (getattr(me, "username", "") or "").strip().lstrip("@")
+
+
+async def send_main_menu(
+    chat_id: int | str,
+    context: ContextTypes.DEFAULT_TYPE,
+    preview: bool = False,
+    channel_mode: bool = False,
+):
+    """메인 메뉴 전송. channel_mode=True면 deep link 메뉴를 사용한다."""
+    reply_markup = build_main_inline_menu()
+    if channel_mode:
+        username = await _resolve_bot_username(context)
+        if not username:
+            raise RuntimeError("BOT_USERNAME을 확인할 수 없어 채널용 deep link 메뉴를 만들 수 없습니다.")
+        reply_markup = build_channel_inline_menu(username)
+
     msg = await context.bot.send_message(
         chat_id=chat_id,
         text=get_menu_caption(),
-        reply_markup=build_main_inline_menu(),
+        reply_markup=reply_markup,
     )
     return msg
+
 
 
 # ───────────────── 핸들러들 ─────────────────
@@ -4472,25 +4513,26 @@ async def send_main_menu(chat_id: int | str, context: ContextTypes.DEFAULT_TYPE,
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     args = context.args
-    mode = args[0] if args else None
+    mode = (args[0] if args else None) or ""
+    mode = mode.strip().lower()
 
     today_str, tomorrow_str = get_date_labels()
 
-    if mode == "today":
+    if mode in ("today", "analysis_today"):
         await update.message.reply_text(
             f"{today_str} 경기 분석픽 메뉴입니다. 종목을 선택하세요 👇",
             reply_markup=build_analysis_category_menu("today"),
         )
         return
 
-    if mode == "tomorrow":
+    if mode in ("tomorrow", "analysis_tomorrow"):
         await update.message.reply_text(
             f"{tomorrow_str} 경기 분석픽 메뉴입니다. 종목을 선택하세요 👇",
             reply_markup=build_analysis_category_menu("tomorrow"),
         )
         return
 
-    if mode == "news":
+    if mode in ("news", "news_root"):
         await update.message.reply_text(
             "스포츠 뉴스 요약입니다. 종목을 선택하세요 👇",
             reply_markup=build_news_category_menu(),
@@ -4499,12 +4541,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "스포츠봇입니다.\n"
-        "아래에는 채널에 올라갈 메뉴와 동일한 레이아웃 미리보기를 보여줄게.\n"
+        "아래에는 DM에서 바로 사용할 메뉴 미리보기를 보여줄게.\n"
         "실제 채널 배포는 /publish 명령으로 진행하면 돼.",
         reply_markup=build_reply_keyboard(),
     )
 
     await send_main_menu(chat_id, context, preview=True)
+
 
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4541,7 +4584,7 @@ async def publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    msg = await send_main_menu(CHANNEL_ID, context, preview=False)
+    msg = await send_main_menu(CHANNEL_ID, context, preview=False, channel_mode=True)
 
     await context.bot.pin_chat_message(
         chat_id=CHANNEL_ID,
@@ -7469,15 +7512,26 @@ async def _safe_edit_message_reply_markup(q, *args, **kwargs):
 # 4) 인라인 버튼 콜백 처리 (분석/뉴스 팝업)
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if q:
-        # callback query는 생성 후 짧은 시간 내에 answer 해야 오류가 안 난다.
+    if not q:
+        return
+
+    # callback query는 생성 후 짧은 시간 내에 answer 해야 오류가 안 난다.
+    try:
+        await q.answer()
+    except BadRequest as e:
+        if "Query is too old" in str(e) or "query id is invalid" in str(e):
+            pass
+        else:
+            raise
+
+    chat_type = getattr(getattr(q.message, "chat", None), "type", "")
+    if chat_type == "channel":
         try:
-            await q.answer()
-        except BadRequest as e:
-            if "Query is too old" in str(e) or "query id is invalid" in str(e):
-                pass
-            else:
-                raise
+            await q.answer("채널 메뉴는 개인 봇 창에서 이용해 주세요.", show_alert=True)
+        except BadRequest:
+            pass
+        return
+
     data = q.data or ""
     # 아무 동작 안 하는 더미
     if data == "noop":
