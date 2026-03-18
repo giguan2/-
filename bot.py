@@ -390,7 +390,7 @@ def _fix_korean_josa(text: str) -> str:
 def _postprocess_site_body_text(text: str, *, footer_line: str = "") -> str:
     """
     사이트용 body(E열) 최종 후처리(⚠️ 안전장치):
-    - '고트티비/GOATTV/goat-tv' 등 브랜드/사이트명 언급 제거(띄어쓰기/하이픈/대소문자 변형 포함)
+    - '올블랙/allblack1' 등 브랜드/사이트명 언급 제거(띄어쓰기/하이픈/대소문자 변형 포함)
     - 매치업 구분자(vs/VS/v.s./대) 제거 → 공백으로 연결
     - 개행 구조는 유지하면서 불필요한 공백만 정리
     - (선택) footer_line을 해시태그 블록 앞(있으면) 또는 끝에 1회 삽입
@@ -405,16 +405,16 @@ def _postprocess_site_body_text(text: str, *, footer_line: str = "") -> str:
         out = str(text)
 
     # 1) 브랜드/사이트명 제거(한글/영문/하이픈/띄어쓰기 변형 포함)
-    #   - "고트티비", "고트 티비", "고트-티비", "고트TV" 등
+    #   - "올블랙", "올 블랙", "올-블랙" 등
     out = re.sub(
-        r"(고트\s*[-_]?\s*티비|고트티비|고트\s*TV)\s*(?:\.com)?\s*"
+        r"(올\s*[-_]?\s*블랙|올블랙)\s*(?:\.com)?\s*"
         r"(?:의|에서도|에서|도|을|를|은|는|이|가|에|와|과)?",
         "",
         out,
         flags=re.I,
     )
-    #   - "GOATTV", "GOAT TV", "goat-tv.com" 등
-    out = re.sub(r"(GOAT\s*TV|GOATTV|GOAT[-_\s]*TV|goat[-_\s]*tv(?:\.com)?)", "", out, flags=re.I)
+    #   - "allblack1", "all black 1", "allblack1.com" 등
+    out = re.sub(r"(ALLBLACK\s*1|ALLBLACK1|ALLBLACK[-_\s]*1|allblack[-_\s]*1(?:\.com)?)", "", out, flags=re.I)
 
     # 1-b) 브랜드 제거 후 어색한 접속/조사 흔적 최소 보정(과도한 문장 변형은 피함)
     out = out.replace("스포츠분석과 정보를", "스포츠분석 정보를")
@@ -4334,7 +4334,7 @@ def build_main_inline_menu() -> InlineKeyboardMarkup:
     """DM 전용 메인 인라인 메뉴(callback 기반)."""
     today_str, tomorrow_str = get_date_labels()
     buttons = [
-        [InlineKeyboardButton("📺 실시간 무료 중계", url="https://goat-tv.com")],
+        [InlineKeyboardButton("📺 실시간 무료 중계", url="https://allblack1.com")],
         [InlineKeyboardButton(f"📌 {today_str} 경기 분석픽", callback_data="analysis_root:today")],
         [InlineKeyboardButton(f"📌 {tomorrow_str} 경기 분석픽", callback_data="analysis_root:tomorrow")],
         [InlineKeyboardButton("📰 스포츠 뉴스 요약", callback_data="news_root")],
@@ -4350,7 +4350,7 @@ def build_channel_inline_menu(bot_username: str) -> InlineKeyboardMarkup:
         username = (BOT_USERNAME or "").strip().lstrip("@")
 
     buttons = [
-        [InlineKeyboardButton("📺 실시간 무료 중계", url="https://goat-tv.com")],
+        [InlineKeyboardButton("📺 실시간 무료 중계", url="https://allblack1.com")],
         [InlineKeyboardButton(f"📌 {today_str} 경기 분석픽", url=f"https://t.me/{username}?start=analysis_today")],
         [InlineKeyboardButton(f"📌 {tomorrow_str} 경기 분석픽", url=f"https://t.me/{username}?start=analysis_tomorrow")],
         [InlineKeyboardButton("📰 스포츠 뉴스 요약", url=f"https://t.me/{username}?start=news")],
@@ -5295,7 +5295,7 @@ def rewrite_for_site_openai(
     - 매치업 표기에서 'vs/VS/대' 같은 구분자 사용 금지(팀명 공백 연결)
 
     ⚠️ 금지
-    - '고트티비', 'GOATTV', 'goat-tv' 등 특정 사이트/브랜드명 언급 금지
+    - '올블랙', 'allblack1' 등 특정 사이트/브랜드명 언급 금지
     """
     client_oa = get_openai_client()
 
@@ -5343,7 +5343,7 @@ def rewrite_for_site_openai(
 - 문장 흐름은 자연스럽게, 단락을 명확히 분리
 - 아래 섹션 구성은 유지하되, 원문에 없는 섹션 정보는 과장하지 말 것
 - '스포츠분석' 키워드를 본문에 **1~2회** 자연스럽게 포함 (과도한 반복 금지)
-- '고트티비/GOATTV/goat-tv' 등 특정 사이트/브랜드명은 **절대** 언급하지 말 것
+- '올블랙/allblack1' 등 특정 사이트/브랜드명은 **절대** 언급하지 말 것
 - 매치업 표기에서 'vs', 'VS', '대' 같은 구분자를 사용하지 말 것.
   → 예: '{home_label} {away_label}' 처럼 **팀명을 공백으로만 연결**해 표기할 것
 - 섹션 제목에 '팀1/팀2'라는 표현을 절대 쓰지 말고, **반드시 팀명**을 넣어라
@@ -7718,7 +7718,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = f"📌 경기 분석 – {title}\n\n{summary}"
 
         buttons = [
-            [InlineKeyboardButton("📺 스포츠 무료 중계", url="https://goat-tv.com")],
+            [InlineKeyboardButton("📺 스포츠 무료 중계", url="https://allblack1.com")],
             [InlineKeyboardButton("📝 분석글 더 보기", callback_data=f"analysis_root:{key}")],
             [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
         ]
@@ -7757,7 +7757,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = f"📰 뉴스 요약 – {title}\n\n{summary}"
 
         buttons = [
-            [InlineKeyboardButton("📺 스포츠무료중계", url="https://goat-tv.com")],
+            [InlineKeyboardButton("📺 스포츠무료중계", url="https://allblack1.com")],
             [InlineKeyboardButton("📰 다른 뉴스 보기", callback_data="news_root")],
             [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
         ]
