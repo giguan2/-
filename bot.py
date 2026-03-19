@@ -390,7 +390,7 @@ def _fix_korean_josa(text: str) -> str:
 def _postprocess_site_body_text(text: str, *, footer_line: str = "") -> str:
     """
     사이트용 body(E열) 최종 후처리(⚠️ 안전장치):
-    - '올블랙/allblack1' 등 브랜드/사이트명 언급 제거(띄어쓰기/하이픈/대소문자 변형 포함)
+    - '고트티비/GOATTV/goat-tv' 등 브랜드/사이트명 언급 제거(띄어쓰기/하이픈/대소문자 변형 포함)
     - 매치업 구분자(vs/VS/v.s./대) 제거 → 공백으로 연결
     - 개행 구조는 유지하면서 불필요한 공백만 정리
     - (선택) footer_line을 해시태그 블록 앞(있으면) 또는 끝에 1회 삽입
@@ -405,16 +405,16 @@ def _postprocess_site_body_text(text: str, *, footer_line: str = "") -> str:
         out = str(text)
 
     # 1) 브랜드/사이트명 제거(한글/영문/하이픈/띄어쓰기 변형 포함)
-    #   - "올블랙", "올 블랙", "올-블랙" 등
+    #   - "고트티비", "고트 티비", "고트-티비", "고트TV" 등
     out = re.sub(
-        r"(올\s*[-_]?\s*블랙|올블랙)\s*(?:\.com)?\s*"
+        r"(고트\s*[-_]?\s*티비|고트티비|고트\s*TV)\s*(?:\.com)?\s*"
         r"(?:의|에서도|에서|도|을|를|은|는|이|가|에|와|과)?",
         "",
         out,
         flags=re.I,
     )
-    #   - "allblack1", "all black 1", "allblack1.com" 등
-    out = re.sub(r"(ALLBLACK\s*1|ALLBLACK1|ALLBLACK[-_\s]*1|allblack[-_\s]*1(?:\.com)?)", "", out, flags=re.I)
+    #   - "GOATTV", "GOAT TV", "goat-tv.com" 등
+    out = re.sub(r"(GOAT\s*TV|GOATTV|GOAT[-_\s]*TV|goat[-_\s]*tv(?:\.com)?)", "", out, flags=re.I)
 
     # 1-b) 브랜드 제거 후 어색한 접속/조사 흔적 최소 보정(과도한 문장 변형은 피함)
     out = out.replace("스포츠분석과 정보를", "스포츠분석 정보를")
@@ -4331,29 +4331,13 @@ def build_reply_keyboard() -> ReplyKeyboardMarkup:
 
 
 def build_main_inline_menu() -> InlineKeyboardMarkup:
-    """DM 전용 메인 인라인 메뉴(callback 기반)."""
+    """채널/DM 공통 메인 인라인 메뉴."""
     today_str, tomorrow_str = get_date_labels()
     buttons = [
-        [InlineKeyboardButton("📺 실시간 무료 중계", url="https://allblack1.com")],
+        [InlineKeyboardButton("📺 실시간 무료 중계", url="https://goat-tv.com")],
         [InlineKeyboardButton(f"📌 {today_str} 경기 분석픽", callback_data="analysis_root:today")],
         [InlineKeyboardButton(f"📌 {tomorrow_str} 경기 분석픽", callback_data="analysis_root:tomorrow")],
         [InlineKeyboardButton("📰 스포츠 뉴스 요약", callback_data="news_root")],
-    ]
-    return InlineKeyboardMarkup(buttons)
-
-
-def build_channel_inline_menu(bot_username: str) -> InlineKeyboardMarkup:
-    """채널 전용 메인 인라인 메뉴(deep link 기반)."""
-    today_str, tomorrow_str = get_date_labels()
-    username = (bot_username or "").strip().lstrip("@")
-    if not username:
-        username = (BOT_USERNAME or "").strip().lstrip("@")
-
-    buttons = [
-        [InlineKeyboardButton("📺 실시간 무료 중계", url="https://allblack1.com")],
-        [InlineKeyboardButton(f"📌 {today_str} 경기 분석픽", url=f"https://t.me/{username}?start=analysis_today")],
-        [InlineKeyboardButton(f"📌 {tomorrow_str} 경기 분석픽", url=f"https://t.me/{username}?start=analysis_tomorrow")],
-        [InlineKeyboardButton("📰 스포츠 뉴스 요약", url=f"https://t.me/{username}?start=news")],
     ]
     return InlineKeyboardMarkup(buttons)
 
@@ -4470,41 +4454,16 @@ def build_news_list_menu(sport: str, per_page: int = 10) -> InlineKeyboardMarkup
     buttons.append([InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")])
     return InlineKeyboardMarkup(buttons)
 
-async def _resolve_bot_username(context: ContextTypes.DEFAULT_TYPE) -> str:
-    """deep link 생성에 사용할 봇 username을 우선순위대로 반환."""
-    username = (os.getenv("BOT_USERNAME") or "").strip().lstrip("@")
-    if username:
-        return username
-
-    username = (BOT_USERNAME or "").strip().lstrip("@")
-    if username:
-        return username
-
-    me = await context.bot.get_me()
-    return (getattr(me, "username", "") or "").strip().lstrip("@")
-
-
-async def send_main_menu(
-    chat_id: int | str,
-    context: ContextTypes.DEFAULT_TYPE,
-    preview: bool = False,
-    channel_mode: bool = False,
-):
-    """메인 메뉴 전송. channel_mode=True면 deep link 메뉴를 사용한다."""
-    reply_markup = build_main_inline_menu()
-    if channel_mode:
-        username = await _resolve_bot_username(context)
-        if not username:
-            raise RuntimeError("BOT_USERNAME을 확인할 수 없어 채널용 deep link 메뉴를 만들 수 없습니다.")
-        reply_markup = build_channel_inline_menu(username)
-
+async def send_main_menu(chat_id: int | str, context: ContextTypes.DEFAULT_TYPE, preview: bool = False):
+    """
+    채널/DM 공통으로 '텍스트 + 메인 메뉴 버튼' 전송.
+    """
     msg = await context.bot.send_message(
         chat_id=chat_id,
         text=get_menu_caption(),
-        reply_markup=reply_markup,
+        reply_markup=build_main_inline_menu(),
     )
     return msg
-
 
 
 # ───────────────── 핸들러들 ─────────────────
@@ -4513,26 +4472,25 @@ async def send_main_menu(
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     args = context.args
-    mode = (args[0] if args else None) or ""
-    mode = mode.strip().lower()
+    mode = args[0] if args else None
 
     today_str, tomorrow_str = get_date_labels()
 
-    if mode in ("today", "analysis_today"):
+    if mode == "today":
         await update.message.reply_text(
             f"{today_str} 경기 분석픽 메뉴입니다. 종목을 선택하세요 👇",
             reply_markup=build_analysis_category_menu("today"),
         )
         return
 
-    if mode in ("tomorrow", "analysis_tomorrow"):
+    if mode == "tomorrow":
         await update.message.reply_text(
             f"{tomorrow_str} 경기 분석픽 메뉴입니다. 종목을 선택하세요 👇",
             reply_markup=build_analysis_category_menu("tomorrow"),
         )
         return
 
-    if mode in ("news", "news_root"):
+    if mode == "news":
         await update.message.reply_text(
             "스포츠 뉴스 요약입니다. 종목을 선택하세요 👇",
             reply_markup=build_news_category_menu(),
@@ -4541,13 +4499,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "스포츠봇입니다.\n"
-        "아래에는 DM에서 바로 사용할 메뉴 미리보기를 보여줄게.\n"
+        "아래에는 채널에 올라갈 메뉴와 동일한 레이아웃 미리보기를 보여줄게.\n"
         "실제 채널 배포는 /publish 명령으로 진행하면 돼.",
         reply_markup=build_reply_keyboard(),
     )
 
     await send_main_menu(chat_id, context, preview=True)
-
 
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4584,7 +4541,7 @@ async def publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    msg = await send_main_menu(CHANNEL_ID, context, preview=False, channel_mode=True)
+    msg = await send_main_menu(CHANNEL_ID, context, preview=False)
 
     await context.bot.pin_chat_message(
         chat_id=CHANNEL_ID,
@@ -5295,7 +5252,7 @@ def rewrite_for_site_openai(
     - 매치업 표기에서 'vs/VS/대' 같은 구분자 사용 금지(팀명 공백 연결)
 
     ⚠️ 금지
-    - '올블랙', 'allblack1' 등 특정 사이트/브랜드명 언급 금지
+    - '고트티비', 'GOATTV', 'goat-tv' 등 특정 사이트/브랜드명 언급 금지
     """
     client_oa = get_openai_client()
 
@@ -5343,7 +5300,7 @@ def rewrite_for_site_openai(
 - 문장 흐름은 자연스럽게, 단락을 명확히 분리
 - 아래 섹션 구성은 유지하되, 원문에 없는 섹션 정보는 과장하지 말 것
 - '스포츠분석' 키워드를 본문에 **1~2회** 자연스럽게 포함 (과도한 반복 금지)
-- '올블랙/allblack1' 등 특정 사이트/브랜드명은 **절대** 언급하지 말 것
+- '고트티비/GOATTV/goat-tv' 등 특정 사이트/브랜드명은 **절대** 언급하지 말 것
 - 매치업 표기에서 'vs', 'VS', '대' 같은 구분자를 사용하지 말 것.
   → 예: '{home_label} {away_label}' 처럼 **팀명을 공백으로만 연결**해 표기할 것
 - 섹션 제목에 '팀1/팀2'라는 표현을 절대 쓰지 말고, **반드시 팀명**을 넣어라
@@ -7512,26 +7469,15 @@ async def _safe_edit_message_reply_markup(q, *args, **kwargs):
 # 4) 인라인 버튼 콜백 처리 (분석/뉴스 팝업)
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q:
-        return
-
-    # callback query는 생성 후 짧은 시간 내에 answer 해야 오류가 안 난다.
-    try:
-        await q.answer()
-    except BadRequest as e:
-        if "Query is too old" in str(e) or "query id is invalid" in str(e):
-            pass
-        else:
-            raise
-
-    chat_type = getattr(getattr(q.message, "chat", None), "type", "")
-    if chat_type == "channel":
+    if q:
+        # callback query는 생성 후 짧은 시간 내에 answer 해야 오류가 안 난다.
         try:
-            await q.answer("채널 메뉴는 개인 봇 창에서 이용해 주세요.", show_alert=True)
-        except BadRequest:
-            pass
-        return
-
+            await q.answer()
+        except BadRequest as e:
+            if "Query is too old" in str(e) or "query id is invalid" in str(e):
+                pass
+            else:
+                raise
     data = q.data or ""
     # 아무 동작 안 하는 더미
     if data == "noop":
@@ -7718,7 +7664,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = f"📌 경기 분석 – {title}\n\n{summary}"
 
         buttons = [
-            [InlineKeyboardButton("📺 스포츠 무료 중계", url="https://allblack1.com")],
+            [InlineKeyboardButton("📺 스포츠 무료 중계", url="https://goat-tv.com")],
             [InlineKeyboardButton("📝 분석글 더 보기", callback_data=f"analysis_root:{key}")],
             [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
         ]
@@ -7757,7 +7703,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = f"📰 뉴스 요약 – {title}\n\n{summary}"
 
         buttons = [
-            [InlineKeyboardButton("📺 스포츠무료중계", url="https://allblack1.com")],
+            [InlineKeyboardButton("📺 스포츠무료중계", url="https://goat-tv.com")],
             [InlineKeyboardButton("📰 다른 뉴스 보기", callback_data="news_root")],
             [InlineKeyboardButton("◀ 메인 메뉴로", callback_data="back_main")],
         ]
@@ -8093,15 +8039,22 @@ YOUTOO_AUTO_HEADER = [
     "첫댓글시간",
     "게시시간(날짜)",
     "별명",
+    "본문내용",
+    "본문길이",
+    "본문20자미만",
 ]
 
-# ✅ 수기 입력 컬럼 (L~M) - 봇이 절대 덮어쓰지 않음
+# 본문 길이 판정 기준(공백 제외 글자 수)
+YOUTOO_SHORT_BODY_MIN_LEN = max(1, int(os.getenv("YOUTOO_SHORT_BODY_MIN_LEN", "20")))
+YOUTOO_BODY_PREVIEW_MAX_CHARS = max(50, int(os.getenv("YOUTOO_BODY_PREVIEW_MAX_CHARS", "2000")))
+
+# ✅ 수기 입력 컬럼 (O~P) - 봇이 절대 덮어쓰지 않음
 YOUTOO_MANUAL_HEADER = [
     "적중건제출여부",
     "지급여부",
 ]
 
-# 전체 헤더(A~M)
+# 전체 헤더(A~P)
 YOUTOO_HEADER = YOUTOO_AUTO_HEADER + YOUTOO_MANUAL_HEADER
 
 def _col_letter(n: int) -> str:
@@ -8113,8 +8066,103 @@ def _col_letter(n: int) -> str:
         s = chr(65 + r) + s
     return s
 
-# 자동 갱신 범위(A~K)의 끝 컬럼(기본: K)
+# 자동 갱신 범위(A~N)의 끝 컬럼
 YOUTOO_AUTO_END_COL = _col_letter(len(YOUTOO_AUTO_HEADER))
+
+_YOUTOO_SHORT_BG = {"red": 1.0, "green": 0.949, "blue": 0.8}  # 연노랑
+_YOUTOO_NORMAL_BG = {"red": 1.0, "green": 1.0, "blue": 1.0}
+
+
+def _youtoo_effective_body_len(text: str) -> int:
+    """공백/줄바꿈을 제외한 실질 본문 길이."""
+    s = str(text or "")
+    s = re.sub(r"\s+", "", s)
+    return len(s)
+
+
+def _youtoo_trim_body_preview(text: str) -> str:
+    s = str(text or "").strip()
+    if len(s) <= YOUTOO_BODY_PREVIEW_MAX_CHARS:
+        return s
+    return s[: YOUTOO_BODY_PREVIEW_MAX_CHARS - 3].rstrip() + "..."
+
+
+def _youtoo_is_short_row(row: list[str]) -> bool:
+    try:
+        idx = YOUTOO_AUTO_HEADER.index("본문20자미만")
+    except ValueError:
+        return False
+    try:
+        return str((row[idx] if idx < len(row) else "") or "").strip().upper() == "Y"
+    except Exception:
+        return False
+
+
+def _youtoo_apply_row_backgrounds(ws, row_states: list[tuple[int, bool]]) -> None:
+    """자동 수집 구간(A~N)만 배경색 반영.
+
+    - 본문20자미만=Y  -> 노란색
+    - 그 외           -> 흰색
+    수기 컬럼(O~P)은 건드리지 않는다.
+    """
+    if not row_states:
+        return
+
+    try:
+        sheet_id = getattr(ws, "id", None)
+        if sheet_id is None:
+            sheet_id = (getattr(ws, "_properties", {}) or {}).get("sheetId")
+        sheet_id = int(sheet_id)
+    except Exception as e:
+        print(f"[GSHEET][YOUTOO] sheetId 확인 실패: {e}")
+        return
+
+    try:
+        sh = getattr(ws, "spreadsheet", None)
+        if sh is None:
+            print("[GSHEET][YOUTOO] spreadsheet handle 없음")
+            return
+
+        requests = []
+        seen_rows: set[int] = set()
+        auto_col_count = len(YOUTOO_AUTO_HEADER)
+
+        for row_num, is_short in row_states:
+            try:
+                rn = int(row_num)
+            except Exception:
+                continue
+            if rn < 2 or rn in seen_rows:
+                continue
+            seen_rows.add(rn)
+
+            color = _YOUTOO_SHORT_BG if is_short else _YOUTOO_NORMAL_BG
+            requests.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": rn - 1,
+                        "endRowIndex": rn,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": auto_col_count,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "backgroundColor": color,
+                        }
+                    },
+                    "fields": "userEnteredFormat.backgroundColor",
+                }
+            })
+
+        if not requests:
+            return
+
+        chunk_size = 100
+        for i in range(0, len(requests), chunk_size):
+            sh.batch_update({"requests": requests[i:i + chunk_size]})
+    except Exception as e:
+        print(f"[GSHEET][YOUTOO] 배경색 적용 실패: {e}")
 
 # 과거 버전/표기 차이 호환(자동 마이그레이션용)
 _YOUTOO_COL_ALIASES: dict[str, list[str]] = {
@@ -8141,8 +8189,8 @@ def _youtoo_find_header_index(old_header: list[str], col: str) -> int | None:
 def ensure_youtoo_header(ws) -> None:
     """youtoo 시트 헤더를 최신 스펙으로 맞춘다.
 
-    - A~K: 봇이 자동 수집/갱신하는 컬럼
-    - L~M: 사람이 수기로 입력하는 컬럼(적중건제출여부/지급여부) → ✅ 봇이 절대 덮어쓰지 않음
+    - A~N: 봇이 자동 수집/갱신하는 컬럼
+    - O~P: 사람이 수기로 입력하는 컬럼(적중건제출여부/지급여부) → ✅ 봇이 절대 덮어쓰지 않음
 
     헤더가 어긋난 과거 버전(구/신 헤더 혼재)도 가능한 범위 내에서 자동 마이그레이션한다.
     """
@@ -8178,14 +8226,14 @@ def ensure_youtoo_header(ws) -> None:
     auto_len = len(YOUTOO_AUTO_HEADER)
     auto_match = [str(c).strip() for c in header[:auto_len]] == YOUTOO_AUTO_HEADER
 
-    # ✅ A~K 헤더가 이미 맞으면: L/M 헤더만 보정하고(필요 시) 끝낸다. (수기 데이터 보호)
+    # ✅ A~N 헤더가 이미 맞으면: O/P 헤더만 보정하고(필요 시) 끝낸다. (수기 데이터 보호)
     if auto_match:
         # 헤더 배열 길이 보정
         if len(header) < len(YOUTOO_HEADER):
             header += [""] * (len(YOUTOO_HEADER) - len(header))
 
         for i, name in enumerate(YOUTOO_MANUAL_HEADER):
-            col_idx_1based = auto_len + 1 + i  # L=12, M=13
+            col_idx_1based = auto_len + 1 + i  # O=15, P=16
             cur = str(header[auto_len + i] or "").strip()
             if cur == name:
                 continue
@@ -8209,7 +8257,7 @@ def ensure_youtoo_header(ws) -> None:
         for col_name in YOUTOO_HEADER:
             idx = _youtoo_find_header_index(old_header, col_name)
             if idx is None:
-                # 헤더명이 비어있던 경우를 대비해, L/M은 "위치 기반"으로도 복원 시도
+                # 헤더명이 비어있던 경우를 대비해, O/P는 "위치 기반"으로도 복원 시도
                 if col_name in YOUTOO_MANUAL_HEADER:
                     pos = YOUTOO_HEADER.index(col_name)
                     nr.append(rp[pos] if pos < len(rp) else "")
@@ -8336,6 +8384,7 @@ def upsert_youtoo_rows_top(rows: list[list[str]]) -> tuple[bool, int, int]:
     updated = 0
     to_insert: list[list[str]] = []
     seen: set[str] = set()
+    updated_row_states: list[tuple[int, bool]] = []
 
     # 1) 기존 행 업데이트(삽입 전에 수행해야 row index가 흔들리지 않음)
     for r in rows:
@@ -8358,10 +8407,15 @@ def upsert_youtoo_rows_top(rows: list[list[str]]) -> tuple[bool, int, int]:
                 rr_auto = rr[: len(YOUTOO_AUTO_HEADER)]
                 ws.update(f"A{row_num}:{YOUTOO_AUTO_END_COL}{row_num}", [rr_auto], value_input_option="RAW")
                 updated += 1
+                updated_row_states.append((row_num, _youtoo_is_short_row(rr)))
             except Exception as e:
                 print(f"[GSHEET][YOUTOO] update 실패(src_id={sid}): {e}")
         else:
             to_insert.append(rr)
+
+    # ✅ 업데이트 행은 삽입 전에 색 반영해야 row 번호가 안 틀어짐.
+    if updated_row_states:
+        _youtoo_apply_row_backgrounds(ws, updated_row_states)
 
     inserted = 0
     if to_insert:
@@ -8369,6 +8423,8 @@ def upsert_youtoo_rows_top(rows: list[list[str]]) -> tuple[bool, int, int]:
             # ✅ 신규는 맨 위(2행)에 넣어서 최신이 위로 오게 한다.
             ws.insert_rows(to_insert, row=2, value_input_option="RAW")
             inserted = len(to_insert)
+            inserted_row_states = [(2 + i, _youtoo_is_short_row(rr)) for i, rr in enumerate(to_insert)]
+            _youtoo_apply_row_backgrounds(ws, inserted_row_states)
         except Exception as e:
             print(f"[GSHEET][YOUTOO] insert_rows 오류: {e}")
             return False, inserted, updated
@@ -8662,6 +8718,203 @@ async def _fetch_first_comment(
         return (content, nick, t)
 
     return ("", "", "")
+
+
+def _build_article_url_candidates(cafe_id: str, article_id: str, menu_id: str) -> list[str]:
+    """게시글 본문(JSON) 후보 URL 리스트."""
+    base_variants = [
+        f"https://apis.naver.com/cafe-web/cafe-articleapi/cafes/{cafe_id}/articles/{article_id}",
+        f"https://apis.naver.com/cafe-web/cafe-articleapi/v2/cafes/{cafe_id}/articles/{article_id}",
+        f"https://apis.naver.com/cafe-web/cafe-articleapi/v2.1/cafes/{cafe_id}/articles/{article_id}",
+    ]
+
+    qs_list = [
+        f"fromList=true&menuId={menu_id}&useCafeId=true",
+        f"fromList=true&menuId={menu_id}",
+        "useCafeId=true",
+        "",
+    ]
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for base in base_variants:
+        for qs in qs_list:
+            u = _append_qs(base, qs) if qs else base
+            if u not in seen:
+                out.append(u)
+                seen.add(u)
+    return out
+
+
+def _extract_article_obj(data: dict | None) -> dict | None:
+    if not isinstance(data, dict):
+        return None
+
+    candidates = [
+        data.get("article"),
+        (data.get("result") or {}).get("article") if isinstance(data.get("result"), dict) else None,
+        ((data.get("message") or {}).get("result") or {}).get("article")
+        if isinstance(data.get("message"), dict) and isinstance((data.get("message") or {}).get("result"), dict)
+        else None,
+    ]
+    for c in candidates:
+        if isinstance(c, dict):
+            return c
+    return None
+
+
+def _collect_naver_article_text_candidates(obj, out: list[str]) -> None:
+    """article payload 내부에서 본문성 텍스트만 재귀적으로 모은다."""
+    wanted_keys = {
+        "content", "text", "plaintext", "value", "title", "caption",
+        "description", "summary", "alt", "name", "line",
+    }
+    skip_keys = {
+        "url", "link", "src", "path", "image", "originalimage", "thumbnail",
+        "video", "author", "nick", "nickname", "id", "articleid", "menuid",
+        "cafeid", "updatedate", "createdate", "date", "from", "type", "service",
+    }
+
+    if isinstance(obj, str):
+        s = obj.strip()
+        if s:
+            out.append(s)
+        return
+
+    if isinstance(obj, list):
+        for x in obj:
+            _collect_naver_article_text_candidates(x, out)
+        return
+
+    if not isinstance(obj, dict):
+        return
+
+    for k, v in obj.items():
+        kl = str(k or "").strip().lower()
+        if kl in skip_keys:
+            continue
+        if kl in wanted_keys:
+            if isinstance(v, str):
+                s = v.strip()
+                if s:
+                    out.append(s)
+                continue
+            if isinstance(v, (list, dict)):
+                _collect_naver_article_text_candidates(v, out)
+                continue
+        if isinstance(v, (dict, list)):
+            _collect_naver_article_text_candidates(v, out)
+
+
+def _clean_naver_article_text(text: str) -> str:
+    s = html.unescape(str(text or ""))
+    if not s:
+        return ""
+
+    s = re.sub(r"<br\s*/?>", "\n", s, flags=re.I)
+    s = re.sub(r"</?(?:p|div|li|ul|ol|blockquote|h[1-6]|table|tr|td|th)[^>]*>", "\n", s, flags=re.I)
+    s = re.sub(r"<[^>]+>", " ", s)
+
+    try:
+        soup = BeautifulSoup(s, "html.parser")
+        s = soup.get_text("\n", strip=True)
+    except Exception:
+        pass
+
+    lines: list[str] = []
+    prev = None
+    for raw in s.replace("\r", "\n").split("\n"):
+        line = re.sub(r"\s+", " ", raw or "").strip()
+        if not line:
+            continue
+        if line == prev:
+            continue
+        lines.append(line)
+        prev = line
+
+    return "\n".join(lines).strip()
+
+
+def _extract_article_body_text(data: dict | None) -> tuple[str, bool]:
+    """(body_text, fetched_ok)
+
+    fetched_ok=True 는 본문 API 응답 파싱까지 성공했다는 뜻이다.
+    본문이 실제로 비어 있으면 text는 빈 문자열일 수 있다.
+    """
+    article = _extract_article_obj(data)
+    if not isinstance(article, dict):
+        return "", False
+
+    direct_candidates = [
+        article.get("content"),
+        article.get("memo"),
+        article.get("articleContent"),
+        article.get("contentHtml"),
+        article.get("contentText"),
+        article.get("summary"),
+    ]
+    for cand in direct_candidates:
+        if isinstance(cand, str) and cand.strip():
+            return _clean_naver_article_text(cand), True
+
+    parts: list[str] = []
+    content_elements = article.get("contentElements")
+    if isinstance(content_elements, list):
+        for el in content_elements:
+            if not isinstance(el, dict):
+                continue
+            payload = el.get("json") if isinstance(el.get("json"), dict) else el
+            _collect_naver_article_text_candidates(payload, parts)
+
+    if not parts:
+        _collect_naver_article_text_candidates(article, parts)
+
+    text = _clean_naver_article_text("\n".join(parts)) if parts else ""
+    return text, True
+
+
+async def _fetch_article_body_text(
+    client: httpx.AsyncClient,
+    *,
+    cafe_id: str,
+    menu_id: str,
+    article_id: str,
+) -> tuple[str, bool]:
+    """네이버 카페 게시글 본문을 가져온다.
+
+    반환: (body_text, fetched_ok)
+    - fetched_ok=False : 본문 API 요청/파싱 자체가 실패
+    - fetched_ok=True  : 응답 파싱 성공(본문이 빈 문자열일 수 있음)
+    """
+    headers = _naver_web_headers(cafe_id, menu_id)
+    headers.update({
+        "Referer": f"https://cafe.naver.com/ArticleRead.nhn?clubid={cafe_id}&articleid={article_id}",
+        "X-Requested-With": "XMLHttpRequest",
+    })
+
+    for url in _build_article_url_candidates(cafe_id, article_id, menu_id):
+        try:
+            r = await client.get(url, headers=headers, timeout=15.0)
+        except Exception:
+            continue
+
+        if r.status_code in (401, 403):
+            return "", False
+        if not (200 <= r.status_code < 300):
+            continue
+
+        try:
+            data = r.json()
+        except Exception:
+            continue
+
+        body_text, ok = _extract_article_body_text(data)
+        if ok:
+            return body_text, True
+
+    return "", False
+
+
 async def youtoo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/youtoo 명령어:
     네이버 카페(기본: 18677861) 메뉴(기본: 20) 글 목록을 가져와 구글시트 youtoo 탭에 저장한다.
@@ -8747,6 +9000,8 @@ async def youtoo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     new_rows: list[list[str]] = []
     seen: set[str] = set()
+    short_body_rows = 0
+    body_fetch_fail = 0
 
     sort_by = NAVER_CAFE_WEB_SORT_BY
     view_type = NAVER_CAFE_WEB_VIEW_TYPE
@@ -8834,10 +9089,50 @@ async def youtoo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             cookie=cookie,
                         )
 
+                    # 본문(20자 미만 여부 판정용)
+                    body_text = ""
+                    body_len = 0
+                    body_short = ""
+                    body_ok = False
+                    try:
+                        body_text, body_ok = await _fetch_article_body_text(
+                            client,
+                            cafe_id=cafe_id,
+                            menu_id=menu_id,
+                            article_id=str(article_id),
+                        )
+                    except Exception as e:
+                        print(f"[YOUTOO] 본문 추출 실패(article_id={article_id}): {e}")
+                        body_text, body_ok = "", False
+
+                    if body_ok:
+                        body_text = _youtoo_trim_body_preview(body_text)
+                        body_len = _youtoo_effective_body_len(body_text)
+                        if body_len < YOUTOO_SHORT_BODY_MIN_LEN:
+                            body_short = "Y"
+                            short_body_rows += 1
+                    else:
+                        body_fetch_fail += 1
+
                     # 본문 링크(카페 별칭 URL 기반)
                     link = f"{NAVER_CAFE_BASE_URL}/{article_id}"
 
-                    new_rows.append([src_id, subject, comment_cnt, read_cnt, like_cnt, link, first_comment, first_comment_nick, first_comment_time, posted_at, nick])
+                    new_rows.append([
+                        src_id,
+                        subject,
+                        comment_cnt,
+                        read_cnt,
+                        like_cnt,
+                        link,
+                        first_comment,
+                        first_comment_nick,
+                        first_comment_time,
+                        posted_at,
+                        nick,
+                        body_text,
+                        str(body_len) if body_ok else "",
+                        body_short,
+                    ])
 
         # 시트 저장 (✅ 신규는 상단 삽입 / 기존은 덮어쓰기)
         inserted = 0
@@ -8853,6 +9148,8 @@ async def youtoo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"- 신규 추가(상단): {inserted}건\n"
             f"- 기존 업데이트: {updated}건\n"
             f"- 수집: {len(new_rows)}건\n"
+            f"- 본문 {YOUTOO_SHORT_BODY_MIN_LEN}자 미만(노란색): {short_body_rows}건\n"
+            f"- 본문 추출 실패: {body_fetch_fail}건\n"
             f"- 대상 페이지: {start_page}~{start_page + pages - 1} (pageSize={page_size})"
         )
 
