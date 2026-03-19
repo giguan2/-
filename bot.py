@@ -1099,6 +1099,7 @@ import requests
 import httpx
 
 import traceback
+import unicodedata
 # ───────────────── 네이버 카페 자동 글쓰기 (추후: '네이버 카페 자동 글쓰기') ─────────────────
 # 공식 문서:
 # - 네이버 로그인 토큰 발급/갱신: https://nid.naver.com/oauth2.0/token
@@ -8073,15 +8074,71 @@ _YOUTOO_SHORT_BG = {"red": 1.0, "green": 0.949, "blue": 0.8}  # 연노랑
 _YOUTOO_NORMAL_BG = {"red": 1.0, "green": 1.0, "blue": 1.0}
 
 
+_YOUTOO_URL_RE = re.compile(r"https?://\S+|www\.\S+", re.I)
+_YOUTOO_HASHTAG_TOKEN_RE = re.compile(r"(?<!\w)#[^\s#]+")
+_YOUTOO_TEMPLATE_ONLY_LINES = {
+    "픽", "최종픽", "추천픽", "무료픽", "주력픽", "부주력픽", "분석", "분석픽",
+    "배팅포인트", "핵심포인트", "핵심포인트요약", "승부예측", "pick",
+}
+
+
+def _youtoo_normalize_chars_only(text: str) -> str:
+    """길이 판정용: 공백/줄바꿈/해시태그/URL/기호를 제거하고 실제 글자만 남긴다."""
+    s = unicodedata.normalize("NFKC", str(text or ""))
+    s = _YOUTOO_URL_RE.sub(" ", s)
+    s = _YOUTOO_HASHTAG_TOKEN_RE.sub(" ", s)
+    return "".join(ch for ch in s if ch.isalnum())
+
+
+def _youtoo_is_noise_line(line: str) -> bool:
+    """본문 길이/미리보기에서 제외할 양식성 라인인지 판정."""
+    s = unicodedata.normalize("NFKC", str(line or "")).strip()
+    if not s:
+        return True
+
+    # 해시태그, URL, 이모지/기호만 있는 라인은 제외
+    chars_only = _youtoo_normalize_chars_only(s)
+    if not chars_only:
+        return True
+
+    # 짧은 양식 라벨(예: '📌 픽', '최종 픽')은 제외
+    key = chars_only.lower()
+    if key in _YOUTOO_TEMPLATE_ONLY_LINES:
+        return True
+
+    return False
+
+
+def _youtoo_prepare_body_text(text: str) -> str:
+    """시트 저장용 본문 정리.
+
+    - 빈 줄/중복 줄 제거
+    - 해시태그 전용 줄, URL 전용 줄, 기호/이모지 전용 줄 제거
+    - 짧은 양식성 라벨 줄(예: '📌 픽') 제거
+    """
+    s = str(text or "").replace("\r", "\n")
+    lines: list[str] = []
+    prev = None
+    for raw in s.split("\n"):
+        line = re.sub(r"\s+", " ", raw or "").strip()
+        if not line:
+            continue
+        if _youtoo_is_noise_line(line):
+            continue
+        if line == prev:
+            continue
+        lines.append(line)
+        prev = line
+    return "\n".join(lines).strip()
+
+
 def _youtoo_effective_body_len(text: str) -> int:
-    """공백/줄바꿈을 제외한 실질 본문 길이."""
-    s = str(text or "")
-    s = re.sub(r"\s+", "", s)
-    return len(s)
+    """공백/줄바꿈/해시태그/양식 기호를 제외한 실질 본문 길이."""
+    return len(_youtoo_normalize_chars_only(_youtoo_prepare_body_text(text)))
 
 
 def _youtoo_trim_body_preview(text: str) -> str:
-    s = str(text or "").strip()
+    s = _youtoo_prepare_body_text(text)
     if len(s) <= YOUTOO_BODY_PREVIEW_MAX_CHARS:
         return s
     return s[: YOUTOO_BODY_PREVIEW_MAX_CHARS - 3].rstrip() + "..."
@@ -9106,8 +9163,8 @@ async def youtoo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         body_text, body_ok = "", False
 
                     if body_ok:
-                        body_text = _youtoo_trim_body_preview(body_text)
                         body_len = _youtoo_effective_body_len(body_text)
+                        body_text = _youtoo_trim_body_preview(body_text)
                         if body_len < YOUTOO_SHORT_BODY_MIN_LEN:
                             body_short = "Y"
                             short_body_rows += 1
