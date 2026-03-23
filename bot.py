@@ -8381,6 +8381,54 @@ async def _youtoo_apply_row_backgrounds(ws, row_states: list[tuple[int, bool]]) 
     except Exception as e:
         print(f"[GSHEET][YOUTOO] 배경색 적용 실패: {e}")
 
+
+async def _youtoo_insert_blank_rows(ws, *, start_row: int, count: int) -> None:
+    """시트 전체 행을 실제로 삽입해서 O/P 수기 컬럼도 함께 아래로 밀어낸다.
+
+    gspread.insert_rows(values=...)는 환경에 따라 trailing empty cell(O/P)가 기대와 다르게
+    처리되는 경우가 있어, youtoo 신규 행은 먼저 '빈 행'을 물리적으로 삽입한 뒤
+    A~N 자동 수집 컬럼만 채워 넣는다.
+    """
+    if count <= 0:
+        return
+
+    try:
+        sheet_id = getattr(ws, "id", None)
+        if sheet_id is None:
+            sheet_id = (getattr(ws, "_properties", {}) or {}).get("sheetId")
+        sheet_id = int(sheet_id)
+    except Exception as e:
+        raise RuntimeError(f"sheetId 확인 실패: {e}")
+
+    sh = getattr(ws, "spreadsheet", None)
+    if sh is None:
+        raise RuntimeError("spreadsheet handle 없음")
+
+    start_index = max(1, int(start_row)) - 1
+    end_index = start_index + int(count)
+
+    req = {
+        "requests": [
+            {
+                "insertDimension": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": "ROWS",
+                        "startIndex": start_index,
+                        "endIndex": end_index,
+                    },
+                    "inheritFromBefore": False,
+                }
+            }
+        ]
+    }
+
+    await _youtoo_gsheet_call_with_backoff(
+        "insert_blank_rows.batch_update",
+        sh.batch_update,
+        req,
+    )
+
 # 과거 버전/표기 차이 호환(자동 마이그레이션용)
 _YOUTOO_COL_ALIASES: dict[str, list[str]] = {
     "첫댓글내용": ["첫댓글"],
@@ -8692,15 +8740,45 @@ async def upsert_youtoo_rows_top(rows: list[list[str]]) -> tuple[bool, int, int]
 
     if to_insert:
         try:
-            await _youtoo_gsheet_call_with_backoff(
-                "upsert.insert_rows",
-                ws.insert_rows,
-                to_insert,
-                row=2,
-                value_input_option="RAW",
-            )
+            # ✅ 먼저 '빈 행' 자체를 삽입해서 O/P 수기 컬럼도 기존 행과 함께 아래로 밀어낸다.
+            #    그 다음 새로 생긴 상단 행들의 A~N 자동 컬럼만 채워 넣어, O/P는 빈 셀로 유지한다.
+            await _youtoo_insert_blank_rows(ws, start_row=2, count=len(to_insert))
+
+            insert_updates: list[dict] = []
+            inserted_row_states: list[tuple[int, bool]] = []
+            for i, rr in enumerate(to_insert):
+                row_num = 2 + i
+                insert_updates.append({
+                    "range": f"A{row_num}:{YOUTOO_AUTO_END_COL}{row_num}",
+                    "values": [rr[:auto_len]],
+                })
+                inserted_row_states.append((row_num, _youtoo_is_short_row(rr)))
+
+            for start in range(0, len(insert_updates), YOUTOO_GSHEET_BATCH_CHUNK):
+                chunk = insert_updates[start:start + YOUTOO_GSHEET_BATCH_CHUNK]
+                try:
+                    await _youtoo_gsheet_call_with_backoff(
+                        "upsert.insert_fill.batch_update",
+                        ws.batch_update,
+                        chunk,
+                        value_input_option="RAW",
+                    )
+                except Exception as batch_err:
+                    print(f"[GSHEET][YOUTOO] insert fill batch_update 실패 → 단건 폴백: {batch_err}")
+                    for item in chunk:
+                        try:
+                            await _youtoo_gsheet_call_with_backoff(
+                                "upsert.insert_fill.update",
+                                ws.update,
+                                range_name=item["range"],
+                                values=item["values"],
+                                value_input_option="RAW",
+                            )
+                        except Exception as e:
+                            print(f"[GSHEET][YOUTOO] insert fill 실패(range={item['range']}): {e}")
+                            raise
+
             inserted = len(to_insert)
-            inserted_row_states = [(2 + i, _youtoo_is_short_row(rr)) for i, rr in enumerate(to_insert)]
             await _youtoo_apply_row_backgrounds(ws, inserted_row_states)
         except Exception as e:
             print(f"[GSHEET][YOUTOO] insert_rows 오류: {e}")
