@@ -8381,54 +8381,6 @@ async def _youtoo_apply_row_backgrounds(ws, row_states: list[tuple[int, bool]]) 
     except Exception as e:
         print(f"[GSHEET][YOUTOO] 배경색 적용 실패: {e}")
 
-
-async def _youtoo_insert_blank_rows(ws, *, start_row: int, count: int) -> None:
-    """시트 전체 행을 실제로 삽입해서 O/P 수기 컬럼도 함께 아래로 밀어낸다.
-
-    gspread.insert_rows(values=...)는 환경에 따라 trailing empty cell(O/P)가 기대와 다르게
-    처리되는 경우가 있어, youtoo 신규 행은 먼저 '빈 행'을 물리적으로 삽입한 뒤
-    A~N 자동 수집 컬럼만 채워 넣는다.
-    """
-    if count <= 0:
-        return
-
-    try:
-        sheet_id = getattr(ws, "id", None)
-        if sheet_id is None:
-            sheet_id = (getattr(ws, "_properties", {}) or {}).get("sheetId")
-        sheet_id = int(sheet_id)
-    except Exception as e:
-        raise RuntimeError(f"sheetId 확인 실패: {e}")
-
-    sh = getattr(ws, "spreadsheet", None)
-    if sh is None:
-        raise RuntimeError("spreadsheet handle 없음")
-
-    start_index = max(1, int(start_row)) - 1
-    end_index = start_index + int(count)
-
-    req = {
-        "requests": [
-            {
-                "insertDimension": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "dimension": "ROWS",
-                        "startIndex": start_index,
-                        "endIndex": end_index,
-                    },
-                    "inheritFromBefore": False,
-                }
-            }
-        ]
-    }
-
-    await _youtoo_gsheet_call_with_backoff(
-        "insert_blank_rows.batch_update",
-        sh.batch_update,
-        req,
-    )
-
 # 과거 버전/표기 차이 호환(자동 마이그레이션용)
 _YOUTOO_COL_ALIASES: dict[str, list[str]] = {
     "첫댓글내용": ["첫댓글"],
@@ -8740,45 +8692,15 @@ async def upsert_youtoo_rows_top(rows: list[list[str]]) -> tuple[bool, int, int]
 
     if to_insert:
         try:
-            # ✅ 먼저 '빈 행' 자체를 삽입해서 O/P 수기 컬럼도 기존 행과 함께 아래로 밀어낸다.
-            #    그 다음 새로 생긴 상단 행들의 A~N 자동 컬럼만 채워 넣어, O/P는 빈 셀로 유지한다.
-            await _youtoo_insert_blank_rows(ws, start_row=2, count=len(to_insert))
-
-            insert_updates: list[dict] = []
-            inserted_row_states: list[tuple[int, bool]] = []
-            for i, rr in enumerate(to_insert):
-                row_num = 2 + i
-                insert_updates.append({
-                    "range": f"A{row_num}:{YOUTOO_AUTO_END_COL}{row_num}",
-                    "values": [rr[:auto_len]],
-                })
-                inserted_row_states.append((row_num, _youtoo_is_short_row(rr)))
-
-            for start in range(0, len(insert_updates), YOUTOO_GSHEET_BATCH_CHUNK):
-                chunk = insert_updates[start:start + YOUTOO_GSHEET_BATCH_CHUNK]
-                try:
-                    await _youtoo_gsheet_call_with_backoff(
-                        "upsert.insert_fill.batch_update",
-                        ws.batch_update,
-                        chunk,
-                        value_input_option="RAW",
-                    )
-                except Exception as batch_err:
-                    print(f"[GSHEET][YOUTOO] insert fill batch_update 실패 → 단건 폴백: {batch_err}")
-                    for item in chunk:
-                        try:
-                            await _youtoo_gsheet_call_with_backoff(
-                                "upsert.insert_fill.update",
-                                ws.update,
-                                range_name=item["range"],
-                                values=item["values"],
-                                value_input_option="RAW",
-                            )
-                        except Exception as e:
-                            print(f"[GSHEET][YOUTOO] insert fill 실패(range={item['range']}): {e}")
-                            raise
-
+            await _youtoo_gsheet_call_with_backoff(
+                "upsert.insert_rows",
+                ws.insert_rows,
+                to_insert,
+                row=2,
+                value_input_option="RAW",
+            )
             inserted = len(to_insert)
+            inserted_row_states = [(2 + i, _youtoo_is_short_row(rr)) for i, rr in enumerate(to_insert)]
             await _youtoo_apply_row_backgrounds(ws, inserted_row_states)
         except Exception as e:
             print(f"[GSHEET][YOUTOO] insert_rows 오류: {e}")
@@ -10068,6 +9990,105 @@ async def _ensure_quiz_schema(ws) -> None:
     """
     return
 
+def _quiz_norm_compact(s: str) -> str:
+    s = str(s or "").strip().lower()
+    if not s:
+        return ""
+    s = s.replace("\u200b", "")
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = s.replace("&nbsp;", " ")
+    s = re.sub(r"[\s\r\n\t]+", "", s)
+    return re.sub(r"[^0-9a-z가-힣]+", "", s)
+
+
+def _quiz_clean_choice_text(s: str) -> str:
+    s = str(s or "").strip()
+    if not s:
+        return ""
+    s = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", s)
+    s = re.split(r"\s+(?:이벤트|마감|퀴즈|정답|댓글|참여|응모)\b", s, maxsplit=1)[0]
+    s = re.sub(r"\s+", " ", s).strip(" -_/|")
+    return s
+
+
+def _build_quiz_subject_choice_map(subject: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    subj = str(subject or "").strip()
+    if not subj:
+        return out
+
+    compact_subj = _quiz_norm_compact(subj)
+    if ("홀짝" in compact_subj) or ("oddeven" in compact_subj) or ("oddseven" in compact_subj):
+        for alias in ("홀", "홀수", "odd"):
+            out[_quiz_norm_compact(alias)] = "홀"
+        for alias in ("짝", "짝수", "even"):
+            out[_quiz_norm_compact(alias)] = "짝"
+
+    m = re.search(r"(.+?)\s*(?:vs\.?|v\.?|대)\s*(.+)", subj, flags=re.I)
+    if not m:
+        return out
+
+    for raw in (_quiz_clean_choice_text(m.group(1)), _quiz_clean_choice_text(m.group(2))):
+        if not raw:
+            continue
+        canonical = raw
+        aliases = {raw, raw.replace(" ", "")}
+        short = re.sub(r"\b(?:fc|bc|sc|afc|cf|utd|united)\b", "", raw, flags=re.I)
+        short = re.sub(r"\s+", " ", short).strip()
+        if short and len(short) >= 2:
+            aliases.add(short)
+            aliases.add(short.replace(" ", ""))
+        for alias in aliases:
+            key = _quiz_norm_compact(alias)
+            if key:
+                out[key] = canonical
+    return out
+
+
+def _parse_quiz_answer(text: str, subject_choice_map: dict[str, str] | None = None) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+
+    compact = _quiz_norm_compact(raw)
+    if not compact:
+        return ""
+
+    if subject_choice_map:
+        direct = subject_choice_map.get(compact)
+        if direct:
+            return direct
+        for k, v in subject_choice_map.items():
+            if not k:
+                continue
+            if compact.startswith(k) or compact.endswith(k):
+                return v
+
+    if compact in {"홀짝", "oddeven", "oddseven"}:
+        return ""
+
+    has_hol = ("홀" in compact) or ("odd" in compact)
+    has_jjak = ("짝" in compact) or ("even" in compact)
+
+    if has_hol and not has_jjak:
+        if compact.startswith(("홀", "홀수", "odd")) or compact.endswith(("홀", "odd")):
+            return "홀"
+    if has_jjak and not has_hol:
+        if compact.startswith(("짝", "짝수", "even")) or compact.endswith(("짝", "even")):
+            return "짝"
+    if has_hol and has_jjak:
+        if compact.endswith(("홀", "odd")):
+            return "홀"
+        if compact.endswith(("짝", "even")):
+            return "짝"
+
+    m = re.search(r"\d+", compact)
+    if m:
+        return m.group(0)
+
+    return ""
+
+
 async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/quizcrawl M.DD : 해당 날짜(작성일 기준) 게시글 1개를 찾고 댓글 전체를 수집해 '퀴즈' 시트에 반영."""
     if not is_admin(update):
@@ -10239,21 +10260,23 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parsed.sort(key=lambda x: (x[0], x[1]))
 
     total_fetched = len(parsed)
-    valid_num = 0
+    valid_ans = 0
     dup_skip = 0
-    no_num = 0
+    no_ans = 0
 
     seen_nick: set[str] = set()
     nick_to_ans: dict[str, str] = {}
+    ignored_samples: list[str] = []
+    subject_choice_map = _build_quiz_subject_choice_map(found_subject)
 
-    num_re = re.compile(r"\d+")
     for ts, nick, text in parsed:
-        m = num_re.search(text)
-        if not m:
-            no_num += 1
+        ans = _parse_quiz_answer(text, subject_choice_map=subject_choice_map)
+        if not ans:
+            no_ans += 1
+            if len(ignored_samples) < 5:
+                ignored_samples.append(str(text).strip().replace("\n", " ")[:60])
             continue
-        ans = m.group(0)
-        valid_num += 1
+        valid_ans += 1
         if nick in seen_nick:
             dup_skip += 1
             continue
@@ -10327,13 +10350,15 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- 게시글: {found_subject or '(제목없음)'}\n"
         f"- URL: {article_url}\n"
         f"- 댓글(텍스트 파싱 대상): {total_fetched}개\n"
-        f"- 숫자 답안 포함 댓글: {valid_num}개\n"
+        f"- 유효 답안 댓글: {valid_ans}개\n"
         f"- 중복 닉네임 스킵: {dup_skip}개\n"
-        f"- 숫자 없음 무시: {no_num}개\n"
+        f"- 답안 인식 실패 무시: {no_ans}개\n"
         f"- 시트 반영: 신규 {inserted_cnt}명 / 업데이트 {updated_cnt}명\n"
         f"- 기존값 있어 스킵: {skipped_already}명\n"
         f"- 반영 컬럼: {day_col}(월~일 제출답)"
     )
+    if ignored_samples:
+        summary += "\n- 미인식 댓글 예시: " + " / ".join(ignored_samples[:3])
     await update.message.reply_text(summary)
 
 
