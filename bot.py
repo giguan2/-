@@ -1,7 +1,7 @@
 from __future__ import annotations
 from bs4 import BeautifulSoup
 import html
-
+from collections import Counter
 import re as _re_simple
 from telegram.error import BadRequest
 
