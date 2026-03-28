@@ -1,7 +1,7 @@
 from __future__ import annotations
 from bs4 import BeautifulSoup
 import html
-from collections import Counter
+
 import re as _re_simple
 from telegram.error import BadRequest
 
@@ -15,7 +15,7 @@ def now_kst() -> datetime:
     return datetime.now(KST)
 
 
-def extract_simple_from_body(body: str) -> str:
+def extract_simple_from_body(body: str, allow_ai_rewrite: bool = True) -> str:
     """서술형 body에서 '핵심 포인트 요약'을 한 줄로 압축해 반환.
     - [핵심 포인트 요약] / 핵심 포인트 요약 / 핵심포인트요약 등 다양한 표기 지원
     - HTML(<br>, <p>)이 섞여 있어도 처리
@@ -83,7 +83,7 @@ def extract_simple_from_body(body: str) -> str:
 
     # OpenAI로 1문장 재작성 (불릿이 2개 이상일 때만)
     client_oa = get_openai_client()
-    if client_oa and len(cleaned) >= 2:
+    if allow_ai_rewrite and client_oa and len(cleaned) >= 2:
         try:
             bullets_txt = "\n".join([f"- {b}" for b in cleaned[:6]])
             prompt = f'''아래 "핵심 포인트 요약" 불릿들을 의미를 유지한 채 자연스러운 한국어 1문장으로 재작성해줘.
@@ -716,7 +716,7 @@ def _slug_tag(s: str) -> str:
     s = re.sub(r"[^\w가-힣]+", "", s)
     # 너무 긴 경우 잘라내기
     return s[:15]
-def build_dynamic_cafe_simple(title: str, body: str, *, sport: str = "", seed: str = "", home_team: str = "", away_team: str = "") -> str:
+def build_dynamic_cafe_simple(title: str, body: str, *, sport: str = "", seed: str = "", home_team: str = "", away_team: str = "", use_openai_core: bool = True) -> str:
     """export_* 시트 G열(simple) 생성(요약형)
     목표:
     - body 전체 복사 금지
@@ -775,7 +775,7 @@ def build_dynamic_cafe_simple(title: str, body: str, *, sport: str = "", seed: s
         theme = rng.choice(["세트피스", "압박", "전환", "수비", "역습", "피지컬"])
 
     # 요약: 핵심포인트 1문장(없으면 본문 첫 문장들)
-    core_one = (extract_simple_from_body(body_nopick) or "").strip()
+    core_one = (extract_simple_from_body(body_nopick, allow_ai_rewrite=use_openai_core) or "").strip()
 
     # 요약에 픽 관련 라인 들어가면 제거
     if core_one:
@@ -1099,6 +1099,7 @@ import requests
 import httpx
 
 import traceback
+import unicodedata
 # ───────────────── 네이버 카페 자동 글쓰기 (추후: '네이버 카페 자동 글쓰기') ─────────────────
 # 공식 문서:
 # - 네이버 로그인 토큰 발급/갱신: https://nid.naver.com/oauth2.0/token
@@ -1126,22 +1127,12 @@ NAVER_CAFE_MENU_ID_BASEBALL = (os.getenv("NAVER_CAFE_MENU_ID_BASEBALL") or "").s
 NAVER_CAFE_MENU_ID_BASKETBALL = (os.getenv("NAVER_CAFE_MENU_ID_BASKETBALL") or "").strip()
 NAVER_CAFE_MENU_ID_VOLLEYBALL = (os.getenv("NAVER_CAFE_MENU_ID_VOLLEYBALL") or "").strip()
 
-# 야구 리그별 게시판(menuid). 비어있으면 BASEBALL 메뉴로 폴백.
-NAVER_CAFE_MENU_ID_MLB = (os.getenv("NAVER_CAFE_MENU_ID_MLB") or "").strip()
-NAVER_CAFE_MENU_ID_KBO = (os.getenv("NAVER_CAFE_MENU_ID_KBO") or "").strip()
-NAVER_CAFE_MENU_ID_NPB = (os.getenv("NAVER_CAFE_MENU_ID_NPB") or "").strip()
-
 # 심층 분석 게시판(menuid) - 기본값(요청 반영): 축구45/농구46/야구47/배구48
 # 필요하면 환경변수로 덮어쓸 수 있음.
 NAVER_CAFE_MENU_ID_DEEP_SOCCER = (os.getenv("NAVER_CAFE_MENU_ID_DEEP_SOCCER") or "45").strip()
 NAVER_CAFE_MENU_ID_DEEP_BASKETBALL = (os.getenv("NAVER_CAFE_MENU_ID_DEEP_BASKETBALL") or "46").strip()
 NAVER_CAFE_MENU_ID_DEEP_BASEBALL = (os.getenv("NAVER_CAFE_MENU_ID_DEEP_BASEBALL") or "47").strip()
 NAVER_CAFE_MENU_ID_DEEP_VOLLEYBALL = (os.getenv("NAVER_CAFE_MENU_ID_DEEP_VOLLEYBALL") or "48").strip()
-
-# 야구 리그별 심층 게시판(menuid). 비어있으면 DEEP_BASEBALL 메뉴로 폴백.
-NAVER_CAFE_MENU_ID_DEEP_MLB = (os.getenv("NAVER_CAFE_MENU_ID_DEEP_MLB") or "").strip()
-NAVER_CAFE_MENU_ID_DEEP_KBO = (os.getenv("NAVER_CAFE_MENU_ID_DEEP_KBO") or "").strip()
-NAVER_CAFE_MENU_ID_DEEP_NPB = (os.getenv("NAVER_CAFE_MENU_ID_DEEP_NPB") or "").strip()
 
 # 예: {"soccer":"10","baseball":"20","basketball":"30","volleyball":"40"}
 NAVER_CAFE_MENU_MAP_RAW = (os.getenv("NAVER_CAFE_MENU_MAP") or "").strip()
@@ -1217,34 +1208,6 @@ def _naver_menu_id_for_sport_deep(sport: str) -> str:
         return NAVER_CAFE_MENU_ID_DEEP_VOLLEYBALL
     # 알 수 없는 값이면(혹시 모를 확장) 단일 메뉴 폴백
     return NAVER_CAFE_MENU_ID
-
-
-def _naver_menu_id_for_league_or_sport(sport_key: str, league_key: str = "", mode: str = "simple") -> str:
-    """리그별 menuId가 있으면 우선 사용하고, 없으면 종목별 menuId로 폴백."""
-    sk = (sport_key or "").strip().lower()
-    lk = (league_key or "").strip().lower()
-    md = (mode or "simple").strip().lower()
-
-    if md == "deep":
-        if lk == "mlb" and NAVER_CAFE_MENU_ID_DEEP_MLB:
-            return NAVER_CAFE_MENU_ID_DEEP_MLB
-        if lk == "kbo" and NAVER_CAFE_MENU_ID_DEEP_KBO:
-            return NAVER_CAFE_MENU_ID_DEEP_KBO
-        if lk == "npb" and NAVER_CAFE_MENU_ID_DEEP_NPB:
-            return NAVER_CAFE_MENU_ID_DEEP_NPB
-        if sk in {"mlb", "kbo", "npb"}:
-            sk = "baseball"
-        return _naver_menu_id_for_sport_deep(sk)
-
-    if lk == "mlb" and NAVER_CAFE_MENU_ID_MLB:
-        return NAVER_CAFE_MENU_ID_MLB
-    if lk == "kbo" and NAVER_CAFE_MENU_ID_KBO:
-        return NAVER_CAFE_MENU_ID_KBO
-    if lk == "npb" and NAVER_CAFE_MENU_ID_NPB:
-        return NAVER_CAFE_MENU_ID_NPB
-    if sk in {"mlb", "kbo", "npb"}:
-        sk = "baseball"
-    return _naver_menu_id_for_sport(sk)
 
 def _naver_have_config() -> bool:
     return bool(NAVER_CLIENT_ID and NAVER_CLIENT_SECRET and NAVER_REFRESH_TOKEN and NAVER_CAFE_CLUBID)
@@ -1948,30 +1911,17 @@ def _load_posted_src_ids(ws_log) -> set:
     return {k.split("|", 1)[0] for k in keys if "|" in k}
 
 
-def _cafe_row_league_key(sport_value: str, title_value: str = "") -> str:
-    """행의 리그 키(mlb/kbo/npb)를 sport/title 기준으로 추론한다."""
-    sv = (sport_value or "").strip().lower()
-    tv = (title_value or "").strip().lower()
-    text = f"{sv} {tv}".strip()
-
-    if any(x in text for x in ("npb", "일본야구", "일야")):
-        return "npb"
-    if any(x in text for x in ("kbo", "국내야구", "크보")):
-        return "kbo"
-    if any(x in text for x in ("mlb", "해외야구", "메이저리그", "메이저")):
-        return "mlb"
-    return ""
-
-
 def _cafe_sport_match(sport_value: str, sport_filter: str) -> bool:
     """export 시트의 sport 값이 명령어 sport_filter(축구/야구/농구/배구)와 매칭되는지 판정."""
     sv = (sport_value or "").strip().lower()
     sf = (sport_filter or "").strip().lower()
     if not sf:
         return True
+    # 같은 값이면 바로 통과
     if sv == sf:
         return True
 
+    # 명령어 필터별 허용 sport 값(시트에서 쓰는 리그명까지 포함)
     aliases = {
         "soccer": {
             "soccer", "football",
@@ -1990,6 +1940,7 @@ def _cafe_sport_match(sport_value: str, sport_filter: str) -> bool:
             "v리그", "vleague", "kovo", "프로배구", "남자배구", "여자배구", "vnl", "avc",
         },
     }
+    # sport_filter가 한글로 들어오는 경우도 대비
     sf_norm = {
         "축구": "soccer",
         "야구": "baseball",
@@ -1999,29 +1950,6 @@ def _cafe_sport_match(sport_value: str, sport_filter: str) -> bool:
 
     allowed = aliases.get(sf_norm, {sf_norm})
     return sv in allowed
-
-
-def _cafe_export_row_match(sport_value: str, title_value: str, sport_filter: str) -> bool:
-    """종목 필터 + 야구 리그 단일 필터(mlb/kbo/npb)까지 판정."""
-    sf = (sport_filter or "").strip().lower()
-    if not sf:
-        return True
-
-    sf_norm = {
-        "축구": "soccer",
-        "야구": "baseball",
-        "농구": "basketball",
-        "배구": "volleyball",
-        "메이저": "mlb",
-        "메이저리그": "mlb",
-        "크보": "kbo",
-        "일본야구": "npb",
-        "일야": "npb",
-    }.get(sf, sf)
-
-    if sf_norm in {"mlb", "kbo", "npb"}:
-        return _cafe_row_league_key(sport_value, title_value) == sf_norm
-    return _cafe_sport_match(sport_value, sf_norm)
 
 
 async def _cafe_parse_which_arg(context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -2041,18 +1969,6 @@ async def cafe_baseball(update: Update, context: ContextTypes.DEFAULT_TYPE):
     which = await _cafe_parse_which_arg(context)
     return await cafe_post_from_export(update, context, which, sport_filter="baseball")
 
-async def cafe_mlb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    which = await _cafe_parse_which_arg(context)
-    return await cafe_post_from_export(update, context, which, sport_filter="mlb")
-
-async def cafe_kbo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    which = await _cafe_parse_which_arg(context)
-    return await cafe_post_from_export(update, context, which, sport_filter="kbo")
-
-async def cafe_npb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    which = await _cafe_parse_which_arg(context)
-    return await cafe_post_from_export(update, context, which, sport_filter="npb")
-
 async def cafe_basketball(update: Update, context: ContextTypes.DEFAULT_TYPE):
     which = await _cafe_parse_which_arg(context)
     return await cafe_post_from_export(update, context, which, sport_filter="basketball")
@@ -2069,18 +1985,6 @@ async def cafe_soccer_deep(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cafe_baseball_deep(update: Update, context: ContextTypes.DEFAULT_TYPE):
     which = await _cafe_parse_which_arg(context)
     return await cafe_post_from_export(update, context, which, sport_filter="baseball", mode="deep")
-
-async def cafe_mlb_deep(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    which = await _cafe_parse_which_arg(context)
-    return await cafe_post_from_export(update, context, which, sport_filter="mlb", mode="deep")
-
-async def cafe_kbo_deep(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    which = await _cafe_parse_which_arg(context)
-    return await cafe_post_from_export(update, context, which, sport_filter="kbo", mode="deep")
-
-async def cafe_npb_deep(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    which = await _cafe_parse_which_arg(context)
-    return await cafe_post_from_export(update, context, which, sport_filter="npb", mode="deep")
 
 async def cafe_basketball_deep(update: Update, context: ContextTypes.DEFAULT_TYPE):
     which = await _cafe_parse_which_arg(context)
@@ -2167,18 +2071,6 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
         return ""
 
     to_post = []
-    league_selected = Counter()
-    league_dup = Counter()
-    league_ok = Counter()
-    league_fail = Counter()
-
-    def _league_bucket_label(league_key: str, sport_key: str) -> str:
-        lk = (league_key or "").strip().lower()
-        sk = (sport_key or "").strip().lower()
-        if lk in {"mlb", "kbo", "npb"}:
-            return lk
-        return sk or "etc"
-
     for row_idx, r in enumerate(vals[1:], start=2):
         sid = (r[i_src].strip() if len(r) > i_src else "")
         if not sid:
@@ -2186,22 +2078,21 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
 
         dayv = r[i_day].strip() if len(r) > i_day else ""
         sportv = r[i_sport].strip() if len(r) > i_sport else ""
-        titlev = r[i_title].strip() if len(r) > i_title else ""
-        if sport_filter and (not _cafe_export_row_match(sportv, titlev, sport_filter)):
+        if sport_filter and (not _cafe_sport_match(sportv, sport_filter)):
             continue
 
+        titlev = r[i_title].strip() if len(r) > i_title else ""
         createdv = r[i_created].strip() if len(r) > i_created else ""
-        league_key = _cafe_row_league_key(sportv, titlev)
-        sport_key = (_infer_sport_key(sportv) or ("baseball" if (sport_filter or "").strip().lower() in {"mlb", "kbo", "npb"} else sport_filter)).strip().lower()
-        bucket = _league_bucket_label(league_key, sport_key)
-        league_selected[bucket] += 1
 
         # menuid 결정 (심플/심층 게시판 분리)
-        menuid = _naver_menu_id_for_league_or_sport(sport_key, league_key, mode)
+        sport_key = (sport_filter or _infer_sport_key(sportv)).strip().lower()
+        if mode == "deep":
+            menuid = _naver_menu_id_for_sport_deep(sport_key)
+        else:
+            menuid = _naver_menu_id_for_sport(sport_key)
 
         # 이미 같은 게시판(menuid)에 올린 글이면 제외
         if menuid and f"{sid}|{menuid}" in posted_keys:
-            league_dup[bucket] += 1
             continue
 
         # mode에 따라 업로드할 본문 선택
@@ -2210,18 +2101,13 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             contentv = r[i_simple] if len(r) > i_simple else ""
 
+
         # ✅ 마지막 안전 처리: 브랜드/구분자 제거(시트에 남아있어도 업로드 전에 정리)
         contentv = _postprocess_site_body_text(contentv)
-        to_post.append((sid, dayv, sportv, titlev, contentv, createdv, menuid, row_idx, bucket))
+        to_post.append((sid, dayv, sportv, titlev, contentv, createdv, menuid, row_idx))
 
     if not to_post:
-        parts = []
-        for k, label in (("mlb", "MLB"), ("kbo", "KBO"), ("npb", "NPB")):
-            if league_selected[k] or league_dup[k] or (sport_filter or "").strip().lower() == k:
-                parts.append(f"{label} 후보 {league_selected[k]} / 중복제외 {league_dup[k]}")
-        extra = ("\n" + " | ".join(parts)) if parts else ""
-        await update.message.reply_text("업로드할 새 글이 없어(이미 올린 글은 제외됨)." + extra)
-
+        await update.message.reply_text("업로드할 새 글이 없어(이미 올린 글은 제외됨).")
         return
 
     delay_sec = float(os.getenv("CAFE_POST_DELAY_SEC", "7"))
@@ -2237,10 +2123,9 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
         return False
 
     ok_cnt, fail_cnt = 0, 0
-    for (sid, dayv, sportv, titlev, contentv, createdv, menuid, row_idx, bucket) in to_post:
+    for (sid, dayv, sportv, titlev, contentv, createdv, menuid, row_idx) in to_post:
         if not menuid:
             fail_cnt += 1
-            league_fail[bucket] += 1
             await _append_cafe_log_row_safe(
                 ws_log,
                 [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), "NO_MENU_ID", titlev, "", ""],
@@ -2250,7 +2135,6 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
         content_txt = (contentv or "").strip()
         if not content_txt:
             fail_cnt += 1
-            league_fail[bucket] += 1
             status = "NO_BODY" if mode == "deep" else "NO_SIMPLE"
             await _append_cafe_log_row_safe(
                 ws_log,
@@ -2299,7 +2183,6 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
                 deep_url = article_url if mode == "deep" else ""
 
                 ok_cnt += 1
-                league_ok[bucket] += 1
                 await _append_cafe_log_row_safe(
                     ws_log,
                     [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, article_id, posted_at, "OK", subject, url, deep_url],
@@ -2331,7 +2214,6 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
                 continue
 
             fail_cnt += 1
-            league_fail[bucket] += 1
             await _append_cafe_log_row_safe(
                 ws_log,
                 [sid, dayv, sportv, NAVER_CAFE_CLUBID, menuid, "", now_kst().isoformat(), info, subject, "", ""],
@@ -2340,18 +2222,7 @@ async def cafe_post_from_export(update: Update, context: ContextTypes.DEFAULT_TY
 
         await asyncio.sleep(delay_sec)
 
-    summary = f"카페 업로드 완료({mode}): 성공 {ok_cnt} / 실패 {fail_cnt} (중복은 제외됨)"
-    baseball_focus = (sport_filter or "").strip().lower() in {"baseball", "mlb", "kbo", "npb", "야구", "메이저", "메이저리그", "크보", "일본야구", "일야"}
-    if baseball_focus or any(league_selected[k] or league_dup[k] or league_ok[k] or league_fail[k] for k in ("mlb", "kbo", "npb")):
-        parts = []
-        for k, label in (("mlb", "MLB"), ("kbo", "KBO"), ("npb", "NPB")):
-            if league_selected[k] or league_dup[k] or league_ok[k] or league_fail[k] or (sport_filter or "").strip().lower() == k:
-                parts.append(f"{label} 후보 {league_selected[k]} / 중복 {league_dup[k]} / 성공 {league_ok[k]} / 실패 {league_fail[k]}")
-        if parts:
-            summary += "\n" + "\n".join(parts)
-    await update.message.reply_text(summary)
-
-
+    await update.message.reply_text(f"카페 업로드 완료({mode}): 성공 {ok_cnt} / 실패 {fail_cnt} (중복은 제외됨)")
 
 
 def _log_httpx_exception(prefix: str, e: Exception) -> None:
@@ -3581,7 +3452,7 @@ def generate_export_comments_pair(title: str, sport_label: str = "", body_hint: 
     deep_comments = generate_export_comments(title=title, sport_label=sport_label, count=count, mode="deep", body_hint=body_hint, avoid_text=comments)
     return (comments or "").strip(), (deep_comments or "").strip()
 
-def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
+def append_export_rows(sheet_name: str, rows: list[list[str]], *, fill_comments: bool = False) -> bool:
     """지정 export 시트에 rows를 append.
 
     입력 row 포맷(호환):
@@ -3591,6 +3462,11 @@ def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
 
     저장 포맷(항상 EXPORT_HEADER 순서):
       day, sport, src_id, title, body, createdAt, simple, cafe_title, cafe_url, comments, cafe_url_deep, deep_comments
+
+    성능 메모:
+      - fill_comments=False 이면 comments / deep_comments 자동 생성(OpenAI)을 건너뛴다.
+      - 대량 mazcrawl 시 export 저장 지연을 줄이기 위해 기본값은 False다.
+      - 댓글이 필요하면 /export_comment_fill 로 별도 생성한다.
     """
     if not rows:
         return True
@@ -3672,27 +3548,28 @@ def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
             base_title = (simple_txt.splitlines()[0] if simple_txt else "").strip()
 
         # comments(심플용) 생성/보정
-        if i_comments < len(rr) and (not str(rr[i_comments]).strip()):
-            comments, deep_comments = generate_export_comments_pair(
-                title=base_title,
-                sport_label=str(sport_label or "").strip(),
-                body_hint=str(body or "").strip(),
-            )
-            rr[i_comments] = (comments or "").strip()
-            # deep_comments도 동시에 채워주되, 이미 값이 있으면 유지
-            if i_deep_comments < len(rr) and (not str(rr[i_deep_comments]).strip()):
-                rr[i_deep_comments] = (deep_comments or "").strip()
-        else:
-            # comments가 이미 있고 deep_comments만 비어있으면 deep만 생성
-            if i_deep_comments < len(rr) and (not str(rr[i_deep_comments]).strip()):
-                deep_comments = generate_export_comments(
+        if fill_comments:
+            if i_comments < len(rr) and (not str(rr[i_comments]).strip()):
+                comments, deep_comments = generate_export_comments_pair(
                     title=base_title,
                     sport_label=str(sport_label or "").strip(),
-                    mode="deep",
                     body_hint=str(body or "").strip(),
-                    avoid_text=str(rr[i_comments] if i_comments < len(rr) else ""),
                 )
-                rr[i_deep_comments] = (deep_comments or "").strip()
+                rr[i_comments] = (comments or "").strip()
+                # deep_comments도 동시에 채워주되, 이미 값이 있으면 유지
+                if i_deep_comments < len(rr) and (not str(rr[i_deep_comments]).strip()):
+                    rr[i_deep_comments] = (deep_comments or "").strip()
+            else:
+                # comments가 이미 있고 deep_comments만 비어있으면 deep만 생성
+                if i_deep_comments < len(rr) and (not str(rr[i_deep_comments]).strip()):
+                    deep_comments = generate_export_comments(
+                        title=base_title,
+                        sport_label=str(sport_label or "").strip(),
+                        mode="deep",
+                        body_hint=str(body or "").strip(),
+                        avoid_text=str(rr[i_comments] if i_comments < len(rr) else ""),
+                    )
+                    rr[i_deep_comments] = (deep_comments or "").strip()
 
         # rr 길이 보정
         if len(rr) < len(EXPORT_HEADER):
@@ -5983,6 +5860,61 @@ def detect_game_date_from_item(item: dict, target_date: date) -> date | None:
 
     return None
 
+def _parse_maz_page_window(args: list[str] | None, default_pages: int = 5) -> tuple[int, int]:
+    """maz 크롤링용 페이지 범위를 해석한다.
+
+    지원 예시:
+      - /crawlmazsoccer_tomorrow           -> 1~5페이지
+      - /crawlmazsoccer_tomorrow 3         -> 1~3페이지
+      - /crawlmazsoccer_tomorrow page=2    -> 2페이지만
+      - /crawlmazsoccer_tomorrow range=3-5 -> 3~5페이지
+      - /crawlmazsoccer_tomorrow 3-5       -> 3~5페이지
+    """
+    start_page = 1
+    page_count = max(1, int(default_pages or 5))
+
+    for raw in (args or []):
+        s = (raw or "").strip().lower()
+        if not s:
+            continue
+
+        if s.isdigit():
+            page_count = max(1, min(int(s), 20))
+            continue
+
+        m = re.match(r"^page=(\d+)$", s)
+        if m:
+            start_page = max(1, int(m.group(1)))
+            page_count = 1
+            continue
+
+        m = re.match(r"^pages=(\d+)$", s)
+        if m:
+            page_count = max(1, min(int(m.group(1)), 20))
+            continue
+
+        m = re.match(r"^(?:range=)?(\d+)-(\d+)$", s)
+        if m:
+            a = max(1, int(m.group(1)))
+            b = max(1, int(m.group(2)))
+            if b < a:
+                a, b = b, a
+            start_page = a
+            page_count = min(20, (b - a + 1))
+            continue
+
+    return start_page, page_count
+
+
+def _format_maz_page_window(start_page: int, page_count: int) -> str:
+    start_page = max(1, int(start_page or 1))
+    page_count = max(1, int(page_count or 1))
+    end_page = start_page + page_count - 1
+    if page_count <= 1:
+        return f"{start_page}페이지만"
+    return f"{start_page}~{end_page}페이지"
+
+
 def classify_basketball_volleyball_sport(league: str) -> str:
     """
     mazgtv leagueName 기준으로 ANALYSIS 시트 sport 값을 결정한다.
@@ -6030,6 +5962,7 @@ async def crawl_maz_analysis_common(
     sport_label: str,
     league_default: str,
     day_key: str = "tomorrow",
+    start_page: int = 1,
     max_pages: int = 5,
     board_type: int = 2,
     category: int = 1,
@@ -6049,8 +5982,10 @@ async def crawl_maz_analysis_common(
 
     target_date = datetime.strptime(target_ymd, "%Y-%m-%d").date()
 
+    page_window_text = _format_maz_page_window(start_page, max_pages)
+
     await update.message.reply_text(
-        f"mazgtv {sport_label} 분석 페이지에서 {target_ymd} 경기 분석글을 가져옵니다. 잠시만 기다려 주세요..."
+        f"mazgtv {sport_label} 분석 페이지에서 {target_ymd} 경기 분석글을 가져옵니다. ({page_window_text}) 잠시만 기다려 주세요..."
     )
 
     rows_to_append: list[list[str]] = []
@@ -6062,6 +5997,28 @@ async def crawl_maz_analysis_common(
     export_sheet_name = EXPORT_TODAY_SHEET_NAME if day_key == "today" else EXPORT_TOMORROW_SHEET_NAME
     existing_export_src_ids = get_existing_export_src_ids(export_sheet_name) if export_site else set()
     site_rows_to_append: list[list[str]] = []
+    saved_analysis_cnt = 0
+    saved_export_cnt = 0
+
+    def _flush_pending_rows() -> bool:
+        nonlocal rows_to_append, site_rows_to_append, saved_analysis_cnt, saved_export_cnt
+
+        # export를 먼저 저장해서 analysis만 있고 export가 비는 상황을 줄인다.
+        if export_site and site_rows_to_append:
+            ok2 = append_export_rows(export_sheet_name, site_rows_to_append, fill_comments=False)
+            if not ok2:
+                return False
+            saved_export_cnt += len(site_rows_to_append)
+            site_rows_to_append = []
+
+        if rows_to_append:
+            ok = append_analysis_rows(day_key, rows_to_append)
+            if not ok:
+                return False
+            saved_analysis_cnt += len(rows_to_append)
+            rows_to_append = []
+
+        return True
 
     try:
         async with httpx.AsyncClient(
@@ -6070,7 +6027,8 @@ async def crawl_maz_analysis_common(
         ) as client:
             await _maz_warmup(client)
 
-            for page in range(1, max_pages + 1):
+            end_page = start_page + max_pages - 1
+            for page in range(start_page, end_page + 1):
                 list_url = (
                     f"{MAZ_LIST_API}"
                     f"?page={page}&perpage=20"
@@ -6250,6 +6208,7 @@ async def crawl_maz_analysis_common(
 
                     if needs_analysis:
                         rows_to_append.append([row_sport, row_id, new_title, new_body])
+                        existing_ids.add(row_id)
 
                     # ✅ 사이트 업로드용(site_export)도 같이 저장
                     if export_site and needs_export:
@@ -6282,6 +6241,7 @@ async def crawl_maz_analysis_common(
                                     seed=str(row_id),
                                     home_team=_hd,
                                     away_team=_ad,
+                                    use_openai_core=False,
                                 )
                             except Exception:
                                 site_simple = ""
@@ -6306,40 +6266,33 @@ async def crawl_maz_analysis_common(
                             ])
                             existing_export_src_ids.add(row_id)
 
+                if rows_to_append or site_rows_to_append:
+                    if not _flush_pending_rows():
+                        await update.message.reply_text("analysis/export 시트 저장 중 오류가 발생했습니다.")
+                        return
+
     except Exception as e:
         # ✅ 여기 except는 try와 같은 들여쓰기 레벨이어야 함
         await update.message.reply_text(f"요청 오류가 발생했습니다: {e}")
         return
 
-    if (not rows_to_append) and (not site_rows_to_append):
+    if (not rows_to_append) and (not site_rows_to_append) and saved_analysis_cnt == 0 and saved_export_cnt == 0:
         await update.message.reply_text(
             f"mazgtv {sport_label} 분석에서 {target_ymd} 경기 분석글을 찾지 못했습니다."
         )
         return
 
-    if rows_to_append:
-        ok = append_analysis_rows(day_key, rows_to_append)
-        if not ok:
-            await update.message.reply_text("구글시트에 분석 데이터를 저장하지 못했습니다.")
-            return
-    else:
-        ok = True
-
-    # ✅ site_export 시트 저장
-    if export_site and site_rows_to_append:
-        ok2 = append_export_rows(export_sheet_name, site_rows_to_append)
-        if not ok2:
-            await update.message.reply_text("site_export 시트 저장 중 오류가 발생했습니다.")
+    if rows_to_append or site_rows_to_append:
+        if not _flush_pending_rows():
+            await update.message.reply_text("analysis/export 시트 저장 중 오류가 발생했습니다.")
             return
 
     reload_analysis_from_sheet()
 
     extra = ""
     if export_site:
-        extra = f"\\nexport 시트에도 {len(site_rows_to_append)}건을 저장했습니다."
+        extra = f"\nexport 시트에도 {saved_export_cnt}건을 저장했습니다. (comments/deep_comments 자동 생성은 건너뜀)"
 
-    saved_analysis_cnt = len(rows_to_append)
-    saved_export_cnt = len(site_rows_to_append) if export_site else 0
     await update.message.reply_text(
         f"mazgtv {sport_label} 분석에서 {target_ymd} 저장 완료: "
         f"분석시트 {saved_analysis_cnt}건, export {saved_export_cnt}건." + extra + "\n"
@@ -7845,6 +7798,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 async def crawlmazsoccer_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    start_page, max_pages = _parse_maz_page_window(context.args, default_pages=5)
+
     # 1) 해외축구
     await crawl_maz_analysis_common(
         update,
@@ -7853,7 +7808,8 @@ async def crawlmazsoccer_tomorrow(update: Update, context: ContextTypes.DEFAULT_
         sport_label="축구",
         league_default="해외축구",
         day_key="tomorrow",
-        max_pages=5,
+        start_page=start_page,
+        max_pages=max_pages,
         board_type=2,
         category=1,
         export_site=True,   # ✅ 추가
@@ -7867,14 +7823,15 @@ async def crawlmazsoccer_tomorrow(update: Update, context: ContextTypes.DEFAULT_
         sport_label="축구",
         league_default="K리그/J리그",
         day_key="tomorrow",
-        max_pages=5,
+        start_page=start_page,
+        max_pages=max_pages,
         board_type=2,
         category=2,
         export_site=True,   # ✅ 추가
     )
 
     await update.message.reply_text(
-        "⚽ 텔레그램용 + 사이트용(내일) 분석 크롤링을 모두 저장했습니다.",
+        f"⚽ 텔레그램용 + 사이트용(내일) 분석 크롤링을 모두 저장했습니다. ({_format_maz_page_window(start_page, max_pages)})",
         reply_markup=_build_export_comment_zip_markup("tomorrow", "soccer"),
     )
 
@@ -7885,6 +7842,8 @@ async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAUL
     mazgtv 야구(MLB / KBO / NPB) 내일 경기 분석을 크롤링해서
     'tomorrow' 시트에 저장한다. 축구용과 동일한 구조.
     """
+    start_page, max_pages = _parse_maz_page_window(context.args, default_pages=5)
+
     # 해외야구(MLB)
     await crawl_maz_analysis_common(
         update,
@@ -7893,7 +7852,8 @@ async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAUL
         sport_label="야구",
         league_default="해외야구",
         day_key="tomorrow",
-        max_pages=5,
+        start_page=start_page,
+        max_pages=max_pages,
         board_type=2,
         category=3,
         export_site=True,
@@ -7907,14 +7867,15 @@ async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAUL
         sport_label="야구",
         league_default="KBO/NPB",
         day_key="tomorrow",
-        max_pages=5,
+        start_page=start_page,
+        max_pages=max_pages,
         board_type=2,
         category=4,
         export_site=True,
     )
 
     await update.message.reply_text(
-        "⚾ 야구(MLB · KBO · NPB) 내일 경기 분석 크롤링 명령을 모두 실행했습니다.",
+        f"⚾ 야구(MLB · KBO · NPB) 내일 경기 분석 크롤링 명령을 모두 실행했습니다. ({_format_maz_page_window(start_page, max_pages)})",
         reply_markup=_build_export_comment_zip_markup("tomorrow", "baseball"),
     )
 
@@ -7926,6 +7887,8 @@ async def bvcrawl_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     - 국내 농구/배구: https://mazgtv1.com/analyze/volleyball
     두 곳에서 '내일 경기' 분석글을 크롤링해서 tomorrow 시트에 저장한다.
     """
+    start_page, max_pages = _parse_maz_page_window(context.args, default_pages=5)
+
 
     # 1) NBA (해외 농구)
     await crawl_maz_analysis_common(
@@ -7935,7 +7898,8 @@ async def bvcrawl_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sport_label="농구",          # 시트에는 NBA/KBL/WKBL 등으로 나뉨
         league_default="NBA",
         day_key="tomorrow",
-        max_pages=5,
+        start_page=start_page,
+        max_pages=max_pages,
         board_type=2,                # ⚠️ 실제 boardType 값으로 수정 필요
         category=5,                  # ⚠️ 실제 category 값으로 수정 필요
         # target_ymd=None → 자동으로 '내일' 날짜 사용
@@ -7950,14 +7914,15 @@ async def bvcrawl_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sport_label="농구/배구",     # 분류 함수에서 KBL/WKBL/V리그/배구 등으로 세분화
         league_default="국내농구/배구",
         day_key="tomorrow",
-        max_pages=5,
+        start_page=start_page,
+        max_pages=max_pages,
         board_type=2,                # ⚠️ 실제 boardType 값으로 수정 필요
         category=7,                  # ⚠️ 실제 category 값으로 수정 필요
         export_site=True,
     )
 
     await update.message.reply_text(
-        "NBA + 국내 농구/배구(내일 경기) 분석 크롤링을 모두 실행했습니다.\n"
+        f"NBA + 국내 농구/배구(내일 경기) 분석 크롤링을 모두 실행했습니다. ({_format_maz_page_window(start_page, max_pages)})\n"
         "/syncsheet 로 텔레그램 메뉴 데이터를 갱신할 수 있습니다.",
         reply_markup=_build_export_comment_zip_markup_bv("tomorrow"),
     )
@@ -7967,6 +7932,8 @@ async def crawlmazsoccer_today(update: Update, context: ContextTypes.DEFAULT_TYP
     mazgtv 해외축구 + K리그/J리그 분석 중
     '오늘 날짜' 경기를 크롤링해서 today 시트에 저장.
     """
+    start_page, max_pages = _parse_maz_page_window(context.args, default_pages=5)
+
 
     # 1) 해외축구 탭
     await crawl_maz_analysis_common(
@@ -7976,7 +7943,8 @@ async def crawlmazsoccer_today(update: Update, context: ContextTypes.DEFAULT_TYP
         sport_label="축구",          # 안에서 '해외축구/K리그/J리그'로 다시 분류됨
         league_default="해외축구",
         day_key="today",            # ✅ today
-        max_pages=5,
+        start_page=start_page,
+        max_pages=max_pages,
         board_type=2,
         category=1,                 # 해외축구
         export_site=True,
@@ -7990,14 +7958,15 @@ async def crawlmazsoccer_today(update: Update, context: ContextTypes.DEFAULT_TYP
         sport_label="축구",
         league_default="K리그/J리그",
         day_key="today",            # ✅ today
-        max_pages=5,
+        start_page=start_page,
+        max_pages=max_pages,
         board_type=2,
         category=2,                 # K리그/J리그
         export_site=True,
     )
 
     await update.message.reply_text(
-        "⚽ 해외축구 + K리그/J리그 오늘 경기 분석 크롤링을 모두 실행했습니다.",
+        f"⚽ 해외축구 + K리그/J리그 오늘 경기 분석 크롤링을 모두 실행했습니다. ({_format_maz_page_window(start_page, max_pages)})",
         reply_markup=_build_export_comment_zip_markup("today", "soccer"),
     )
 
@@ -8006,6 +7975,8 @@ async def crawlmazbaseball_today(update: Update, context: ContextTypes.DEFAULT_T
     mazgtv 야구 분석(MLB + KBO + NPB) 중
     '오늘 날짜' 경기를 크롤링해서 today 시트에 저장.
     """
+    start_page, max_pages = _parse_maz_page_window(context.args, default_pages=5)
+
 
     # 1) 해외야구 (MLB)
     await crawl_maz_analysis_common(
@@ -8015,7 +7986,8 @@ async def crawlmazbaseball_today(update: Update, context: ContextTypes.DEFAULT_T
         sport_label="야구",          # 시트에서는 해외야구/KBO/NPB로 분리됨
         league_default="해외야구",
         day_key="today",            # 🔴 오늘
-        max_pages=5,
+        start_page=start_page,
+        max_pages=max_pages,
         board_type=2,               # 기존 /crawlmazbaseball_tomorrow 와 동일
         category=3,                 # MLB 쪽 category 값 (지금 쓰는 값 그대로)
         export_site=True,
@@ -8029,14 +8001,15 @@ async def crawlmazbaseball_today(update: Update, context: ContextTypes.DEFAULT_T
         sport_label="야구",
         league_default="KBO/NPB",
         day_key="today",            # 🔴 오늘
-        max_pages=5,
+        start_page=start_page,
+        max_pages=max_pages,
         board_type=2,               # 동일 boardType
         category=4,                 # KBO/NPB 쪽 category 값 (지금 쓰는 값 그대로)
         export_site=True,
     )
 
     await update.message.reply_text(
-        "⚾ mazgtv 야구(MLB · KBO · NPB) '오늘 경기' 분석 크롤링을 완료했습니다.\n"
+        f"⚾ mazgtv 야구(MLB · KBO · NPB) '오늘 경기' 분석 크롤링을 완료했습니다. ({_format_maz_page_window(start_page, max_pages)})\n"
         "today 시트에서 내용을 확인할 수 있습니다.",
         reply_markup=_build_export_comment_zip_markup("today", "baseball"),
     )
@@ -8049,6 +8022,8 @@ async def bvcrawl_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     - 국내 농구/배구: https://mazgtv1.com/analyze/volleyball
     두 곳에서 '오늘 경기' 분석글을 크롤링해서 today 시트에 저장한다.
     """
+    start_page, max_pages = _parse_maz_page_window(context.args, default_pages=5)
+
 
     # 1) NBA (해외 농구)
     await crawl_maz_analysis_common(
@@ -8058,7 +8033,8 @@ async def bvcrawl_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sport_label="농구",
         league_default="NBA",
         day_key="today",             # ✅ 오늘
-        max_pages=5,
+        start_page=start_page,
+        max_pages=max_pages,
         board_type=2,                # 👉 tomorrow와 동일 값 유지
         category=5,
         export_site=True,
@@ -8072,14 +8048,15 @@ async def bvcrawl_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sport_label="농구/배구",
         league_default="국내농구/배구",
         day_key="today",             # ✅ 오늘
-        max_pages=5,
+        start_page=start_page,
+        max_pages=max_pages,
         board_type=2,                # 👉 tomorrow와 동일 값 유지
         category=7,
         export_site=True,
     )
 
     await update.message.reply_text(
-        "NBA + 국내 농구/배구(오늘 경기) 분석 크롤링을 모두 실행했습니다.\n"
+        f"NBA + 국내 농구/배구(오늘 경기) 분석 크롤링을 모두 실행했습니다. ({_format_maz_page_window(start_page, max_pages)})\n"
         "today 시트에서 내용을 확인할 수 있습니다.",
         reply_markup=_build_export_comment_zip_markup_bv("today"),
     )
@@ -8169,16 +8146,70 @@ YOUTOO_AUTO_HEADER = [
     "첫댓글시간",
     "게시시간(날짜)",
     "별명",
+    "본문내용",
+    "본문길이",
+    "본문20자미만",
 ]
 
-# ✅ 수기 입력 컬럼 (L~M) - 봇이 절대 덮어쓰지 않음
+# 본문 길이 판정 기준(공백 제외 글자 수)
+YOUTOO_SHORT_BODY_MIN_LEN = max(1, int(os.getenv("YOUTOO_SHORT_BODY_MIN_LEN", "20")))
+YOUTOO_BODY_PREVIEW_MAX_CHARS = max(50, int(os.getenv("YOUTOO_BODY_PREVIEW_MAX_CHARS", "2000")))
+
+# ✅ 수기 입력 컬럼 (O~P) - 봇이 절대 덮어쓰지 않음
 YOUTOO_MANUAL_HEADER = [
     "적중건제출여부",
     "지급여부",
 ]
 
-# 전체 헤더(A~M)
+# 전체 헤더(A~P)
 YOUTOO_HEADER = YOUTOO_AUTO_HEADER + YOUTOO_MANUAL_HEADER
+
+# youtoo 시트 쓰기 quota(429)/서버(503) 대응
+YOUTOO_GSHEET_MAX_RETRIES = int(os.getenv("YOUTOO_GSHEET_MAX_RETRIES", "6"))
+YOUTOO_GSHEET_BACKOFF_BASE_SEC = float(os.getenv("YOUTOO_GSHEET_BACKOFF_BASE_SEC", "1.6"))
+YOUTOO_GSHEET_BACKOFF_MAX_SEC = float(os.getenv("YOUTOO_GSHEET_BACKOFF_MAX_SEC", "35"))
+YOUTOO_GSHEET_BATCH_CHUNK = max(1, int(os.getenv("YOUTOO_GSHEET_BATCH_CHUNK", "80")))
+
+
+def _is_youtoo_gsheet_retryable(exc: Exception) -> bool:
+    low = str(exc).lower()
+    retry_markers = (
+        "[429",
+        " 429",
+        "quota exceeded",
+        "quota",
+        "rate limit",
+        "rate",
+        "too many",
+        "[503",
+        " 503",
+        "unavailable",
+        "backend error",
+        "backenderror",
+        "try again later",
+    )
+    return any(marker in low for marker in retry_markers)
+
+
+async def _youtoo_gsheet_call_with_backoff(op_name: str, func, *args, **kwargs):
+    """youtoo 구글시트 쓰기 작업용 지수 백오프."""
+    retries = max(1, YOUTOO_GSHEET_MAX_RETRIES)
+    base = max(0.2, YOUTOO_GSHEET_BACKOFF_BASE_SEC)
+
+    for attempt in range(retries):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            if (attempt >= retries - 1) or (not _is_youtoo_gsheet_retryable(e)):
+                raise
+            sleep_s = min(YOUTOO_GSHEET_BACKOFF_MAX_SEC, base * (2 ** attempt))
+            print(f"[GSHEET][YOUTOO] {op_name} retry {attempt + 1}/{retries} after {sleep_s:.1f}s: {str(e)[:180]}")
+            try:
+                await asyncio.sleep(sleep_s)
+            except Exception:
+                pass
+
+    return func(*args, **kwargs)
 
 def _col_letter(n: int) -> str:
     """1-indexed column number -> A1 column letter."""
@@ -8189,8 +8220,166 @@ def _col_letter(n: int) -> str:
         s = chr(65 + r) + s
     return s
 
-# 자동 갱신 범위(A~K)의 끝 컬럼(기본: K)
+# 자동 갱신 범위(A~N)의 끝 컬럼
 YOUTOO_AUTO_END_COL = _col_letter(len(YOUTOO_AUTO_HEADER))
+
+_YOUTOO_SHORT_BG = {"red": 1.0, "green": 0.949, "blue": 0.8}  # 연노랑
+_YOUTOO_NORMAL_BG = {"red": 1.0, "green": 1.0, "blue": 1.0}
+
+
+_YOUTOO_URL_RE = re.compile(r"https?://\S+|www\.\S+", re.I)
+_YOUTOO_HASHTAG_TOKEN_RE = re.compile(r"(?<!\w)#[^\s#]+")
+_YOUTOO_TEMPLATE_ONLY_LINES = {
+    "픽", "최종픽", "추천픽", "무료픽", "주력픽", "부주력픽", "분석", "분석픽",
+    "배팅포인트", "핵심포인트", "핵심포인트요약", "승부예측", "pick",
+}
+
+
+def _youtoo_normalize_chars_only(text: str) -> str:
+    """길이 판정용: 공백/줄바꿈/해시태그/URL/기호를 제거하고 실제 글자만 남긴다."""
+    s = unicodedata.normalize("NFKC", str(text or ""))
+    s = _YOUTOO_URL_RE.sub(" ", s)
+    s = _YOUTOO_HASHTAG_TOKEN_RE.sub(" ", s)
+    return "".join(ch for ch in s if ch.isalnum())
+
+
+def _youtoo_is_noise_line(line: str) -> bool:
+    """본문 길이/미리보기에서 제외할 양식성 라인인지 판정."""
+    s = unicodedata.normalize("NFKC", str(line or "")).strip()
+    if not s:
+        return True
+
+    # 해시태그, URL, 이모지/기호만 있는 라인은 제외
+    chars_only = _youtoo_normalize_chars_only(s)
+    if not chars_only:
+        return True
+
+    # 짧은 양식 라벨(예: '📌 픽', '최종 픽')은 제외
+    key = chars_only.lower()
+    if key in _YOUTOO_TEMPLATE_ONLY_LINES:
+        return True
+
+    return False
+
+
+def _youtoo_prepare_body_text(text: str) -> str:
+    """시트 저장용 본문 정리.
+
+    - 빈 줄/중복 줄 제거
+    - 해시태그 전용 줄, URL 전용 줄, 기호/이모지 전용 줄 제거
+    - 짧은 양식성 라벨 줄(예: '📌 픽') 제거
+    """
+    s = str(text or "").replace("\r", "\n")
+    lines: list[str] = []
+    prev = None
+    for raw in s.split("\n"):
+        line = re.sub(r"\s+", " ", raw or "").strip()
+        if not line:
+            continue
+        if _youtoo_is_noise_line(line):
+            continue
+        if line == prev:
+            continue
+        lines.append(line)
+        prev = line
+    return "\n".join(lines).strip()
+
+
+def _youtoo_effective_body_len(text: str) -> int:
+    """공백/줄바꿈/해시태그/양식 기호를 제외한 실질 본문 길이."""
+    return len(_youtoo_normalize_chars_only(_youtoo_prepare_body_text(text)))
+
+
+def _youtoo_trim_body_preview(text: str) -> str:
+    s = _youtoo_prepare_body_text(text)
+    if len(s) <= YOUTOO_BODY_PREVIEW_MAX_CHARS:
+        return s
+    return s[: YOUTOO_BODY_PREVIEW_MAX_CHARS - 3].rstrip() + "..."
+
+
+def _youtoo_is_short_row(row: list[str]) -> bool:
+    try:
+        idx = YOUTOO_AUTO_HEADER.index("본문20자미만")
+    except ValueError:
+        return False
+    try:
+        return str((row[idx] if idx < len(row) else "") or "").strip().upper() == "Y"
+    except Exception:
+        return False
+
+
+async def _youtoo_apply_row_backgrounds(ws, row_states: list[tuple[int, bool]]) -> None:
+    """자동 수집 구간(A~N)만 배경색 반영.
+
+    - 본문20자미만=Y  -> 노란색
+    - 그 외           -> 흰색
+    수기 컬럼(O~P)은 건드리지 않는다.
+    """
+    if not row_states:
+        return
+
+    try:
+        sheet_id = getattr(ws, "id", None)
+        if sheet_id is None:
+            sheet_id = (getattr(ws, "_properties", {}) or {}).get("sheetId")
+        sheet_id = int(sheet_id)
+    except Exception as e:
+        print(f"[GSHEET][YOUTOO] sheetId 확인 실패: {e}")
+        return
+
+    try:
+        sh = getattr(ws, "spreadsheet", None)
+        if sh is None:
+            print("[GSHEET][YOUTOO] spreadsheet handle 없음")
+            return
+
+        requests = []
+        seen_rows: set[int] = set()
+        auto_col_count = len(YOUTOO_AUTO_HEADER)
+
+        for row_num, is_short in row_states:
+            try:
+                rn = int(row_num)
+            except Exception:
+                continue
+            if rn < 2 or rn in seen_rows:
+                continue
+            seen_rows.add(rn)
+
+            color = _YOUTOO_SHORT_BG if is_short else _YOUTOO_NORMAL_BG
+            requests.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": rn - 1,
+                        "endRowIndex": rn,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": auto_col_count,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "backgroundColor": color,
+                        }
+                    },
+                    "fields": "userEnteredFormat.backgroundColor",
+                }
+            })
+
+        if not requests:
+            return
+
+        chunk_size = min(100, max(1, YOUTOO_GSHEET_BATCH_CHUNK))
+        for i in range(0, len(requests), chunk_size):
+            try:
+                await _youtoo_gsheet_call_with_backoff(
+                    "row_backgrounds.batch_update",
+                    sh.batch_update,
+                    {"requests": requests[i:i + chunk_size]},
+                )
+            except Exception as e:
+                print(f"[GSHEET][YOUTOO] 배경색 적용 실패: {e}")
+    except Exception as e:
+        print(f"[GSHEET][YOUTOO] 배경색 적용 실패: {e}")
 
 # 과거 버전/표기 차이 호환(자동 마이그레이션용)
 _YOUTOO_COL_ALIASES: dict[str, list[str]] = {
@@ -8217,8 +8406,8 @@ def _youtoo_find_header_index(old_header: list[str], col: str) -> int | None:
 def ensure_youtoo_header(ws) -> None:
     """youtoo 시트 헤더를 최신 스펙으로 맞춘다.
 
-    - A~K: 봇이 자동 수집/갱신하는 컬럼
-    - L~M: 사람이 수기로 입력하는 컬럼(적중건제출여부/지급여부) → ✅ 봇이 절대 덮어쓰지 않음
+    - A~N: 봇이 자동 수집/갱신하는 컬럼
+    - O~P: 사람이 수기로 입력하는 컬럼(적중건제출여부/지급여부) → ✅ 봇이 절대 덮어쓰지 않음
 
     헤더가 어긋난 과거 버전(구/신 헤더 혼재)도 가능한 범위 내에서 자동 마이그레이션한다.
     """
@@ -8254,14 +8443,14 @@ def ensure_youtoo_header(ws) -> None:
     auto_len = len(YOUTOO_AUTO_HEADER)
     auto_match = [str(c).strip() for c in header[:auto_len]] == YOUTOO_AUTO_HEADER
 
-    # ✅ A~K 헤더가 이미 맞으면: L/M 헤더만 보정하고(필요 시) 끝낸다. (수기 데이터 보호)
+    # ✅ A~N 헤더가 이미 맞으면: O/P 헤더만 보정하고(필요 시) 끝낸다. (수기 데이터 보호)
     if auto_match:
         # 헤더 배열 길이 보정
         if len(header) < len(YOUTOO_HEADER):
             header += [""] * (len(YOUTOO_HEADER) - len(header))
 
         for i, name in enumerate(YOUTOO_MANUAL_HEADER):
-            col_idx_1based = auto_len + 1 + i  # L=12, M=13
+            col_idx_1based = auto_len + 1 + i  # O=15, P=16
             cur = str(header[auto_len + i] or "").strip()
             if cur == name:
                 continue
@@ -8285,7 +8474,7 @@ def ensure_youtoo_header(ws) -> None:
         for col_name in YOUTOO_HEADER:
             idx = _youtoo_find_header_index(old_header, col_name)
             if idx is None:
-                # 헤더명이 비어있던 경우를 대비해, L/M은 "위치 기반"으로도 복원 시도
+                # 헤더명이 비어있던 경우를 대비해, O/P는 "위치 기반"으로도 복원 시도
                 if col_name in YOUTOO_MANUAL_HEADER:
                     pos = YOUTOO_HEADER.index(col_name)
                     nr.append(rp[pos] if pos < len(rp) else "")
@@ -8367,14 +8556,17 @@ def get_existing_youtoo_src_ids() -> set[str]:
         return set()
 
 
-def upsert_youtoo_rows_top(rows: list[list[str]]) -> tuple[bool, int, int]:
+async def upsert_youtoo_rows_top(rows: list[list[str]]) -> tuple[bool, int, int]:
     """youtoo 시트에 rows를 upsert 하되, ✅ 신규는 2행(헤더 아래)에 삽입해서 '위로 업데이트'되게 만든다.
 
     반환: (ok, inserted_count, updated_count)
 
     - src_id 기준으로 중복을 판단한다.
-    - 이미 존재하면 해당 행을 덮어쓴다(댓글수/조회수/좋아요 등이 갱신될 수 있으므로).
-    - 신규는 insert_rows(row=2)로 상단에 붙인다.
+    - 이미 존재하면 A~N(자동 수집 컬럼)만 갱신한다.
+    - 현재 시트 값과 동일한 행은 업데이트를 생략한다.
+    - 기존 행 업데이트는 batch_update로 묶어서 처리해 Google Sheets write quota를 아낀다.
+    - 신규는 insert_rows(row=2) 1회로 상단 삽입한다.
+    - 본문20자미만 행의 노란색 표시도 유지한다.
     """
     if not rows:
         return True, 0, 0
@@ -8383,7 +8575,6 @@ def upsert_youtoo_rows_top(rows: list[list[str]]) -> tuple[bool, int, int]:
     if not ws:
         return False, 0, 0
 
-    # 헤더 보정/마이그레이션
     ensure_youtoo_header(ws)
 
     try:
@@ -8392,31 +8583,50 @@ def upsert_youtoo_rows_top(rows: list[list[str]]) -> tuple[bool, int, int]:
         values = []
 
     if not values:
-        ws.update("A1", [YOUTOO_HEADER])
+        try:
+            await _youtoo_gsheet_call_with_backoff(
+                "header.update",
+                ws.update,
+                range_name="A1",
+                values=[YOUTOO_HEADER],
+                value_input_option="RAW",
+            )
+        except Exception as e:
+            print(f"[GSHEET][YOUTOO] header update 실패: {e}")
+            return False, 0, 0
         values = [YOUTOO_HEADER]
 
-    header = [c.strip() for c in values[0]]
+    header = [str(c).strip() for c in values[0]]
     try:
         idx_src = header.index("src_id")
     except ValueError:
         idx_src = 0
 
-    # src_id -> row_number(1-indexed)
-    existing_map: dict[str, int] = {}
+    auto_len = len(YOUTOO_AUTO_HEADER)
+
+    # src_id -> (row_number(1-indexed), current_auto_values)
+    existing_map: dict[str, tuple[int, list[str]]] = {}
     for i, row in enumerate(values[1:], start=2):
-        if len(row) > idx_src:
-            sid = (row[idx_src] or "").strip()
-            if sid and sid not in existing_map:
-                existing_map[sid] = i
+        if len(row) <= idx_src:
+            continue
+        sid = (row[idx_src] or "").strip()
+        if (not sid) or (sid in existing_map):
+            continue
+        current_auto = list(row[:auto_len])
+        if len(current_auto) < auto_len:
+            current_auto += [""] * (auto_len - len(current_auto))
+        existing_map[sid] = (i, current_auto)
 
     updated = 0
+    inserted = 0
     to_insert: list[list[str]] = []
+    updates: list[tuple[dict, str, int, bool]] = []
     seen: set[str] = set()
 
-    # 1) 기존 행 업데이트(삽입 전에 수행해야 row index가 흔들리지 않음)
     for r in rows:
         if not r:
             continue
+
         rr = list(r)
         if len(rr) < len(YOUTOO_HEADER):
             rr += [""] * (len(YOUTOO_HEADER) - len(rr))
@@ -8428,23 +8638,70 @@ def upsert_youtoo_rows_top(rows: list[list[str]]) -> tuple[bool, int, int]:
             continue
         seen.add(sid)
 
+        rr_auto = rr[:auto_len]
+        is_short = _youtoo_is_short_row(rr)
         if sid in existing_map:
-            row_num = existing_map[sid]
-            try:
-                rr_auto = rr[: len(YOUTOO_AUTO_HEADER)]
-                ws.update(f"A{row_num}:{YOUTOO_AUTO_END_COL}{row_num}", [rr_auto], value_input_option="RAW")
-                updated += 1
-            except Exception as e:
-                print(f"[GSHEET][YOUTOO] update 실패(src_id={sid}): {e}")
+            row_num, current_auto = existing_map[sid]
+            if current_auto == rr_auto:
+                continue
+            updates.append((
+                {
+                    "range": f"A{row_num}:{YOUTOO_AUTO_END_COL}{row_num}",
+                    "values": [rr_auto],
+                },
+                sid,
+                row_num,
+                is_short,
+            ))
         else:
             to_insert.append(rr)
 
-    inserted = 0
+    updated_row_states: list[tuple[int, bool]] = []
+    if updates:
+        for start in range(0, len(updates), YOUTOO_GSHEET_BATCH_CHUNK):
+            chunk = updates[start:start + YOUTOO_GSHEET_BATCH_CHUNK]
+            payload = [u[0] for u in chunk]
+            try:
+                await _youtoo_gsheet_call_with_backoff(
+                    "upsert.batch_update",
+                    ws.batch_update,
+                    payload,
+                    value_input_option="RAW",
+                )
+                updated += len(chunk)
+                updated_row_states.extend((row_num, is_short) for _, _, row_num, is_short in chunk)
+            except Exception as batch_err:
+                print(f"[GSHEET][YOUTOO] batch_update 실패 → 단건 폴백: {batch_err}")
+                for item, sid, row_num, is_short in chunk:
+                    try:
+                        await _youtoo_gsheet_call_with_backoff(
+                            "upsert.update",
+                            ws.update,
+                            range_name=item["range"],
+                            values=item["values"],
+                            value_input_option="RAW",
+                        )
+                        updated += 1
+                        updated_row_states.append((row_num, is_short))
+                    except Exception as e:
+                        print(f"[GSHEET][YOUTOO] update 실패(src_id={sid}): {e}")
+
+    # ✅ 업데이트 행은 삽입 전에 색 반영해야 row 번호가 안 틀어짐.
+    if updated_row_states:
+        await _youtoo_apply_row_backgrounds(ws, updated_row_states)
+
     if to_insert:
         try:
-            # ✅ 신규는 맨 위(2행)에 넣어서 최신이 위로 오게 한다.
-            ws.insert_rows(to_insert, row=2, value_input_option="RAW")
+            await _youtoo_gsheet_call_with_backoff(
+                "upsert.insert_rows",
+                ws.insert_rows,
+                to_insert,
+                row=2,
+                value_input_option="RAW",
+            )
             inserted = len(to_insert)
+            inserted_row_states = [(2 + i, _youtoo_is_short_row(rr)) for i, rr in enumerate(to_insert)]
+            await _youtoo_apply_row_backgrounds(ws, inserted_row_states)
         except Exception as e:
             print(f"[GSHEET][YOUTOO] insert_rows 오류: {e}")
             return False, inserted, updated
@@ -8738,40 +8995,220 @@ async def _fetch_first_comment(
         return (content, nick, t)
 
     return ("", "", "")
-async def youtoo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/youtoo 명령어:
-    네이버 카페(기본: 18677861) 메뉴(기본: 20) 글 목록을 가져와 구글시트 youtoo 탭에 저장한다.
 
-    사용 예)
-    - /youtoo                -> 1페이지(page=1) 15개 저장
-    - /youtoo 3              -> 1~3페이지까지 저장
-    - /youtoo 3 30           -> 1~3페이지, 페이지당 30개
-    - /youtoo page=2         -> 2페이지(1페이지만)
-    - /youtoo page=2 pages=2 -> 2~3페이지
-    - /youtoo menu=20        -> 메뉴ID를 바꿔서 수집(테스트/확장용)
+
+def _build_article_url_candidates(cafe_id: str, article_id: str, menu_id: str) -> list[str]:
+    """게시글 본문(JSON) 후보 URL 리스트."""
+    base_variants = [
+        f"https://apis.naver.com/cafe-web/cafe-articleapi/cafes/{cafe_id}/articles/{article_id}",
+        f"https://apis.naver.com/cafe-web/cafe-articleapi/v2/cafes/{cafe_id}/articles/{article_id}",
+        f"https://apis.naver.com/cafe-web/cafe-articleapi/v2.1/cafes/{cafe_id}/articles/{article_id}",
+    ]
+
+    qs_list = [
+        f"fromList=true&menuId={menu_id}&useCafeId=true",
+        f"fromList=true&menuId={menu_id}",
+        "useCafeId=true",
+        "",
+    ]
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for base in base_variants:
+        for qs in qs_list:
+            u = _append_qs(base, qs) if qs else base
+            if u not in seen:
+                out.append(u)
+                seen.add(u)
+    return out
+
+
+def _extract_article_obj(data: dict | None) -> dict | None:
+    if not isinstance(data, dict):
+        return None
+
+    candidates = [
+        data.get("article"),
+        (data.get("result") or {}).get("article") if isinstance(data.get("result"), dict) else None,
+        ((data.get("message") or {}).get("result") or {}).get("article")
+        if isinstance(data.get("message"), dict) and isinstance((data.get("message") or {}).get("result"), dict)
+        else None,
+    ]
+    for c in candidates:
+        if isinstance(c, dict):
+            return c
+    return None
+
+
+def _collect_naver_article_text_candidates(obj, out: list[str]) -> None:
+    """article payload 내부에서 본문성 텍스트만 재귀적으로 모은다."""
+    wanted_keys = {
+        "content", "text", "plaintext", "value", "title", "caption",
+        "description", "summary", "alt", "name", "line",
+    }
+    skip_keys = {
+        "url", "link", "src", "path", "image", "originalimage", "thumbnail",
+        "video", "author", "nick", "nickname", "id", "articleid", "menuid",
+        "cafeid", "updatedate", "createdate", "date", "from", "type", "service",
+    }
+
+    if isinstance(obj, str):
+        s = obj.strip()
+        if s:
+            out.append(s)
+        return
+
+    if isinstance(obj, list):
+        for x in obj:
+            _collect_naver_article_text_candidates(x, out)
+        return
+
+    if not isinstance(obj, dict):
+        return
+
+    for k, v in obj.items():
+        kl = str(k or "").strip().lower()
+        if kl in skip_keys:
+            continue
+        if kl in wanted_keys:
+            if isinstance(v, str):
+                s = v.strip()
+                if s:
+                    out.append(s)
+                continue
+            if isinstance(v, (list, dict)):
+                _collect_naver_article_text_candidates(v, out)
+                continue
+        if isinstance(v, (dict, list)):
+            _collect_naver_article_text_candidates(v, out)
+
+
+def _clean_naver_article_text(text: str) -> str:
+    s = html.unescape(str(text or ""))
+    if not s:
+        return ""
+
+    s = re.sub(r"<br\s*/?>", "\n", s, flags=re.I)
+    s = re.sub(r"</?(?:p|div|li|ul|ol|blockquote|h[1-6]|table|tr|td|th)[^>]*>", "\n", s, flags=re.I)
+    s = re.sub(r"<[^>]+>", " ", s)
+
+    try:
+        soup = BeautifulSoup(s, "html.parser")
+        s = soup.get_text("\n", strip=True)
+    except Exception:
+        pass
+
+    lines: list[str] = []
+    prev = None
+    for raw in s.replace("\r", "\n").split("\n"):
+        line = re.sub(r"\s+", " ", raw or "").strip()
+        if not line:
+            continue
+        if line == prev:
+            continue
+        lines.append(line)
+        prev = line
+
+    return "\n".join(lines).strip()
+
+
+def _extract_article_body_text(data: dict | None) -> tuple[str, bool]:
+    """(body_text, fetched_ok)
+
+    fetched_ok=True 는 본문 API 응답 파싱까지 성공했다는 뜻이다.
+    본문이 실제로 비어 있으면 text는 빈 문자열일 수 있다.
     """
-    if not is_admin(update):
-        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
-        return
+    article = _extract_article_obj(data)
+    if not isinstance(article, dict):
+        return "", False
 
-    cookie = _get_naver_web_cookie()
-    if not cookie:
-        await update.message.reply_text(
-            "NAVER_COOKIE 환경변수가 비어있습니다.\n"
-            "Render 환경변수에 브라우저 쿠키 문자열을 넣어주세요."
-        )
-        return
+    direct_candidates = [
+        article.get("content"),
+        article.get("memo"),
+        article.get("articleContent"),
+        article.get("contentHtml"),
+        article.get("contentText"),
+        article.get("summary"),
+    ]
+    for cand in direct_candidates:
+        if isinstance(cand, str) and cand.strip():
+            return _clean_naver_article_text(cand), True
 
-    # 기본값
+    parts: list[str] = []
+    content_elements = article.get("contentElements")
+    if isinstance(content_elements, list):
+        for el in content_elements:
+            if not isinstance(el, dict):
+                continue
+            payload = el.get("json") if isinstance(el.get("json"), dict) else el
+            _collect_naver_article_text_candidates(payload, parts)
+
+    if not parts:
+        _collect_naver_article_text_candidates(article, parts)
+
+    text = _clean_naver_article_text("\n".join(parts)) if parts else ""
+    return text, True
+
+
+async def _fetch_article_body_text(
+    client: httpx.AsyncClient,
+    *,
+    cafe_id: str,
+    menu_id: str,
+    article_id: str,
+) -> tuple[str, bool]:
+    """네이버 카페 게시글 본문을 가져온다.
+
+    반환: (body_text, fetched_ok)
+    - fetched_ok=False : 본문 API 요청/파싱 자체가 실패
+    - fetched_ok=True  : 응답 파싱 성공(본문이 빈 문자열일 수 있음)
+    """
+    headers = _naver_web_headers(cafe_id, menu_id)
+    headers.update({
+        "Referer": f"https://cafe.naver.com/ArticleRead.nhn?clubid={cafe_id}&articleid={article_id}",
+        "X-Requested-With": "XMLHttpRequest",
+    })
+
+    for url in _build_article_url_candidates(cafe_id, article_id, menu_id):
+        try:
+            r = await client.get(url, headers=headers, timeout=15.0)
+        except Exception:
+            continue
+
+        if r.status_code in (401, 403):
+            return "", False
+        if not (200 <= r.status_code < 300):
+            continue
+
+        try:
+            data = r.json()
+        except Exception:
+            continue
+
+        body_text, ok = _extract_article_body_text(data)
+        if ok:
+            return body_text, True
+
+    return "", False
+
+
+def _parse_youtoo_args(raw_args: list[str], *, single_page: bool = False) -> tuple[int, int, int, str, str]:
+    """/youtoo 계열 명령어 인자를 파싱한다.
+
+    - /youtoo 5         -> 1~5페이지
+    - /youtoo 5 30      -> 1~5페이지, 페이지당 30개
+    - /youtoo page=2    -> 2페이지(1페이지만)
+    - /youtoo page=2 pages=2 -> 2~3페이지
+    - /youtoo_page 5    -> 5페이지 한 장만
+    - /youtoo_page 5 30 -> 5페이지 한 장, 페이지당 30개
+    """
     start_page = 1
     pages = 1
     page_size = 15
 
-    # args 파싱(키=값 우선)
-    raw_args = list(context.args or [])
-    kv = {}
-    nums = []
-    for a in raw_args:
+    kv: dict[str, str] = {}
+    nums: list[int] = []
+    for a in list(raw_args or []):
         s = (a or "").strip()
         if not s:
             continue
@@ -8787,31 +9224,63 @@ async def youtoo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             return default
 
-    # 키=값 우선 처리
-    if "page" in kv or "p" in kv:
-        start_page = _safe_int(kv.get("page") or kv.get("p"), 1)
-    if "pages" in kv or "n" in kv:
-        pages = _safe_int(kv.get("pages") or kv.get("n"), 1)
-    if "size" in kv or "pagesize" in kv or "ps" in kv:
-        page_size = _safe_int(kv.get("size") or kv.get("pagesize") or kv.get("ps"), 15)
+    if single_page:
+        if "page" in kv or "p" in kv:
+            start_page = _safe_int(kv.get("page") or kv.get("p"), 1)
+        elif nums:
+            start_page = nums[0]
 
-    # 숫자 인자 처리 (/youtoo 3 30 형태)
-    if nums:
-        pages = nums[0]
-        if len(nums) >= 2:
+        if "size" in kv or "pagesize" in kv or "ps" in kv:
+            page_size = _safe_int(kv.get("size") or kv.get("pagesize") or kv.get("ps"), 15)
+        elif len(nums) >= 2:
             page_size = nums[1]
 
-    # 안전 범위
+        pages = 1
+    else:
+        if "page" in kv or "p" in kv:
+            start_page = _safe_int(kv.get("page") or kv.get("p"), 1)
+        if "pages" in kv or "n" in kv:
+            pages = _safe_int(kv.get("pages") or kv.get("n"), 1)
+        if "size" in kv or "pagesize" in kv or "ps" in kv:
+            page_size = _safe_int(kv.get("size") or kv.get("pagesize") or kv.get("ps"), 15)
+
+        if nums:
+            pages = nums[0]
+            if len(nums) >= 2:
+                page_size = nums[1]
+
     start_page = max(1, start_page)
-    pages = max(1, min(20, pages))          # 너무 많이 가져오면 차단/시간초과 위험
-    page_size = max(1, min(50, page_size))  # 일반적으로 50이면 충분
+    pages = max(1, min(20, pages))
+    page_size = max(1, min(50, page_size))
 
     cafe_id = str(kv.get("cafe") or kv.get("cafeid") or NAVER_CAFE_WEB_CAFE_ID).strip() or NAVER_CAFE_WEB_CAFE_ID
     menu_id = str(kv.get("menu") or kv.get("menuid") or NAVER_CAFE_WEB_MENU_ID).strip() or NAVER_CAFE_WEB_MENU_ID
+    return start_page, pages, page_size, cafe_id, menu_id
+
+
+async def _run_youtoo_collect(update: Update, context: ContextTypes.DEFAULT_TYPE, *, single_page: bool = False):
+    if not is_admin(update):
+        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+
+    cookie = _get_naver_web_cookie()
+    if not cookie:
+        await update.message.reply_text(
+            "NAVER_COOKIE 환경변수가 비어있습니다.\n"
+            "Render 환경변수에 브라우저 쿠키 문자열을 넣어주세요."
+        )
+        return
+
+    start_page, pages, page_size, cafe_id, menu_id = _parse_youtoo_args(
+        list(context.args or []),
+        single_page=single_page,
+    )
+    end_page = start_page + pages - 1
+    page_desc = str(start_page) if start_page == end_page else f"{start_page}~{end_page}"
 
     await update.message.reply_text(
         f"네이버 카페 게시글을 가져옵니다. (cafeId={cafe_id}, menuId={menu_id})\n"
-        f"- page={start_page} ~ {start_page + pages - 1}\n"
+        f"- 대상 페이지: {page_desc}\n"
         f"- pageSize={page_size}\n"
         f"잠시만 기다려 주세요..."
     )
@@ -8823,6 +9292,8 @@ async def youtoo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     new_rows: list[list[str]] = []
     seen: set[str] = set()
+    short_body_rows = 0
+    body_fetch_fail = 0
 
     sort_by = NAVER_CAFE_WEB_SORT_BY
     view_type = NAVER_CAFE_WEB_VIEW_TYPE
@@ -8850,7 +9321,6 @@ async def youtoo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
 
                 if not data:
-                    # 200인데 JSON 파싱 실패 등
                     await update.message.reply_text(
                         f"page={p} 응답 파싱에 실패했습니다.\n"
                         f"(HTTP {status}) 응답 일부: {snippet}"
@@ -8860,7 +9330,6 @@ async def youtoo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 result = data.get("result") if isinstance(data, dict) else None
                 article_list = (result or {}).get("articleList") if isinstance(result, dict) else None
                 if not isinstance(article_list, list) or not article_list:
-                    # 더 이상 글이 없으면 중단
                     break
 
                 for entry in article_list:
@@ -8875,7 +9344,6 @@ async def youtoo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         continue
 
                     src_id = f"navercafe:{cafe_id}:{menu_id}:{article_id}"
-                    # 동일 실행 내 중복만 방지(시트에 이미 있어도 '업데이트' 대상이므로 스킵하지 않음)
                     if src_id in seen:
                         continue
                     seen.add(src_id)
@@ -8893,7 +9361,6 @@ async def youtoo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     read_cnt = str(item.get("readCount") or 0)
                     like_cnt = str(item.get("likeCount") or 0)
 
-
                     # 첫 댓글(있을 때만 추가 호출)
                     first_comment = ""
                     first_comment_nick = ""
@@ -8910,16 +9377,54 @@ async def youtoo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             cookie=cookie,
                         )
 
-                    # 본문 링크(카페 별칭 URL 기반)
+                    # 본문(20자 미만 여부 판정용)
+                    body_text = ""
+                    body_len = 0
+                    body_short = ""
+                    body_ok = False
+                    try:
+                        body_text, body_ok = await _fetch_article_body_text(
+                            client,
+                            cafe_id=cafe_id,
+                            menu_id=menu_id,
+                            article_id=str(article_id),
+                        )
+                    except Exception as e:
+                        print(f"[YOUTOO] 본문 추출 실패(article_id={article_id}): {e}")
+                        body_text, body_ok = "", False
+
+                    if body_ok:
+                        body_len = _youtoo_effective_body_len(body_text)
+                        body_text = _youtoo_trim_body_preview(body_text)
+                        if body_len < YOUTOO_SHORT_BODY_MIN_LEN:
+                            body_short = "Y"
+                            short_body_rows += 1
+                    else:
+                        body_fetch_fail += 1
+
                     link = f"{NAVER_CAFE_BASE_URL}/{article_id}"
 
-                    new_rows.append([src_id, subject, comment_cnt, read_cnt, like_cnt, link, first_comment, first_comment_nick, first_comment_time, posted_at, nick])
+                    new_rows.append([
+                        src_id,
+                        subject,
+                        comment_cnt,
+                        read_cnt,
+                        like_cnt,
+                        link,
+                        first_comment,
+                        first_comment_nick,
+                        first_comment_time,
+                        posted_at,
+                        nick,
+                        body_text,
+                        str(body_len) if body_ok else "",
+                        body_short,
+                    ])
 
-        # 시트 저장 (✅ 신규는 상단 삽입 / 기존은 덮어쓰기)
         inserted = 0
         updated = 0
         if new_rows:
-            ok, inserted, updated = upsert_youtoo_rows_top(new_rows)
+            ok, inserted, updated = await upsert_youtoo_rows_top(new_rows)
             if not ok:
                 await update.message.reply_text("구글시트(youtoo)에 저장하지 못했습니다. 권한/시트 상태를 확인하세요.")
                 return
@@ -8929,13 +9434,44 @@ async def youtoo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"- 신규 추가(상단): {inserted}건\n"
             f"- 기존 업데이트: {updated}건\n"
             f"- 수집: {len(new_rows)}건\n"
-            f"- 대상 페이지: {start_page}~{start_page + pages - 1} (pageSize={page_size})"
+            f"- 본문 {YOUTOO_SHORT_BODY_MIN_LEN}자 미만(노란색): {short_body_rows}건\n"
+            f"- 본문 추출 실패: {body_fetch_fail}건\n"
+            f"- 대상 페이지: {page_desc} (pageSize={page_size})"
         )
 
     except Exception as e:
         await update.message.reply_text(f"요청 중 오류가 발생했습니다: {e}")
         return
 
+
+async def youtoo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/youtoo 명령어:
+    네이버 카페(기본: 18677861) 메뉴(기본: 20) 글 목록을 가져와 구글시트 youtoo 탭에 저장한다.
+
+    사용 예)
+    - /youtoo                -> 1페이지(page=1) 15개 저장
+    - /youtoo 3              -> 1~3페이지까지 저장
+    - /youtoo 3 30           -> 1~3페이지, 페이지당 30개
+    - /youtoo page=2         -> 2페이지(1페이지만)
+    - /youtoo page=2 pages=2 -> 2~3페이지
+    - /youtoo menu=20        -> 메뉴ID를 바꿔서 수집(테스트/확장용)
+    - /youtoo_page 5         -> 5페이지만 저장(별도 명령어)
+    """
+    return await _run_youtoo_collect(update, context, single_page=False)
+
+
+async def youtoo_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/youtoo_page 명령어:
+    지정한 페이지 하나만 가져와 구글시트 youtoo 탭에 저장한다.
+
+    사용 예)
+    - /youtoo_page 5
+    - /youtoo_page 5 30
+    - /youtoo_page page=5
+    - /youtoo_page page=5 size=30
+    - /youtoo_page 5 menu=20
+    """
+    return await _run_youtoo_collect(update, context, single_page=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -9454,6 +9990,105 @@ async def _ensure_quiz_schema(ws) -> None:
     """
     return
 
+def _quiz_norm_compact(s: str) -> str:
+    s = str(s or "").strip().lower()
+    if not s:
+        return ""
+    s = s.replace("\u200b", "")
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = s.replace("&nbsp;", " ")
+    s = re.sub(r"[\s\r\n\t]+", "", s)
+    return re.sub(r"[^0-9a-z가-힣]+", "", s)
+
+
+def _quiz_clean_choice_text(s: str) -> str:
+    s = str(s or "").strip()
+    if not s:
+        return ""
+    s = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", s)
+    s = re.split(r"\s+(?:이벤트|마감|퀴즈|정답|댓글|참여|응모)\b", s, maxsplit=1)[0]
+    s = re.sub(r"\s+", " ", s).strip(" -_/|")
+    return s
+
+
+def _build_quiz_subject_choice_map(subject: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    subj = str(subject or "").strip()
+    if not subj:
+        return out
+
+    compact_subj = _quiz_norm_compact(subj)
+    if ("홀짝" in compact_subj) or ("oddeven" in compact_subj) or ("oddseven" in compact_subj):
+        for alias in ("홀", "홀수", "odd"):
+            out[_quiz_norm_compact(alias)] = "홀"
+        for alias in ("짝", "짝수", "even"):
+            out[_quiz_norm_compact(alias)] = "짝"
+
+    m = re.search(r"(.+?)\s*(?:vs\.?|v\.?|대)\s*(.+)", subj, flags=re.I)
+    if not m:
+        return out
+
+    for raw in (_quiz_clean_choice_text(m.group(1)), _quiz_clean_choice_text(m.group(2))):
+        if not raw:
+            continue
+        canonical = raw
+        aliases = {raw, raw.replace(" ", "")}
+        short = re.sub(r"\b(?:fc|bc|sc|afc|cf|utd|united)\b", "", raw, flags=re.I)
+        short = re.sub(r"\s+", " ", short).strip()
+        if short and len(short) >= 2:
+            aliases.add(short)
+            aliases.add(short.replace(" ", ""))
+        for alias in aliases:
+            key = _quiz_norm_compact(alias)
+            if key:
+                out[key] = canonical
+    return out
+
+
+def _parse_quiz_answer(text: str, subject_choice_map: dict[str, str] | None = None) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+
+    compact = _quiz_norm_compact(raw)
+    if not compact:
+        return ""
+
+    if subject_choice_map:
+        direct = subject_choice_map.get(compact)
+        if direct:
+            return direct
+        for k, v in subject_choice_map.items():
+            if not k:
+                continue
+            if compact.startswith(k) or compact.endswith(k):
+                return v
+
+    if compact in {"홀짝", "oddeven", "oddseven"}:
+        return ""
+
+    has_hol = ("홀" in compact) or ("odd" in compact)
+    has_jjak = ("짝" in compact) or ("even" in compact)
+
+    if has_hol and not has_jjak:
+        if compact.startswith(("홀", "홀수", "odd")) or compact.endswith(("홀", "odd")):
+            return "홀"
+    if has_jjak and not has_hol:
+        if compact.startswith(("짝", "짝수", "even")) or compact.endswith(("짝", "even")):
+            return "짝"
+    if has_hol and has_jjak:
+        if compact.endswith(("홀", "odd")):
+            return "홀"
+        if compact.endswith(("짝", "even")):
+            return "짝"
+
+    m = re.search(r"\d+", compact)
+    if m:
+        return m.group(0)
+
+    return ""
+
+
 async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/quizcrawl M.DD : 해당 날짜(작성일 기준) 게시글 1개를 찾고 댓글 전체를 수집해 '퀴즈' 시트에 반영."""
     if not is_admin(update):
@@ -9625,21 +10260,23 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parsed.sort(key=lambda x: (x[0], x[1]))
 
     total_fetched = len(parsed)
-    valid_num = 0
+    valid_ans = 0
     dup_skip = 0
-    no_num = 0
+    no_ans = 0
 
     seen_nick: set[str] = set()
     nick_to_ans: dict[str, str] = {}
+    ignored_samples: list[str] = []
+    subject_choice_map = _build_quiz_subject_choice_map(found_subject)
 
-    num_re = re.compile(r"\d+")
     for ts, nick, text in parsed:
-        m = num_re.search(text)
-        if not m:
-            no_num += 1
+        ans = _parse_quiz_answer(text, subject_choice_map=subject_choice_map)
+        if not ans:
+            no_ans += 1
+            if len(ignored_samples) < 5:
+                ignored_samples.append(str(text).strip().replace("\n", " ")[:60])
             continue
-        ans = m.group(0)
-        valid_num += 1
+        valid_ans += 1
         if nick in seen_nick:
             dup_skip += 1
             continue
@@ -9713,13 +10350,15 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- 게시글: {found_subject or '(제목없음)'}\n"
         f"- URL: {article_url}\n"
         f"- 댓글(텍스트 파싱 대상): {total_fetched}개\n"
-        f"- 숫자 답안 포함 댓글: {valid_num}개\n"
+        f"- 유효 답안 댓글: {valid_ans}개\n"
         f"- 중복 닉네임 스킵: {dup_skip}개\n"
-        f"- 숫자 없음 무시: {no_num}개\n"
+        f"- 답안 인식 실패 무시: {no_ans}개\n"
         f"- 시트 반영: 신규 {inserted_cnt}명 / 업데이트 {updated_cnt}명\n"
         f"- 기존값 있어 스킵: {skipped_already}명\n"
         f"- 반영 컬럼: {day_col}(월~일 제출답)"
     )
+    if ignored_samples:
+        summary += "\n- 미인식 댓글 예시: " + " / ".join(ignored_samples[:3])
     await update.message.reply_text(summary)
 
 
@@ -9775,24 +10414,20 @@ def main():
     app.add_handler(CommandHandler("export_comment_zip", export_comment_zip))
     app.add_handler(CommandHandler("export_comment_zip_buttons", export_comment_zip_buttons))
     app.add_handler(CommandHandler("youtoo", youtoo))  # 네이버 카페 메뉴 글 수집 → youtoo 시트
+    app.add_handler(CommandHandler("youtoo_page", youtoo_page))  # 네이버 카페 지정 페이지 1개만 수집
+    app.add_handler(CommandHandler("youtoopage", youtoo_page))  # alias
     app.add_handler(CommandHandler("quizcrawl", quizcrawl))
     app.add_handler(CommandHandler("quiz_reset", quiz_reset))
 
     # 네이버 카페 자동 글쓰기(종목별 게시판)  ※ /cafe_soccer [tomorrow] 처럼 사용
     app.add_handler(CommandHandler("cafe_soccer", cafe_soccer))
     app.add_handler(CommandHandler("cafe_baseball", cafe_baseball))
-    app.add_handler(CommandHandler("cafe_mlb", cafe_mlb))
-    app.add_handler(CommandHandler("cafe_kbo", cafe_kbo))
-    app.add_handler(CommandHandler("cafe_npb", cafe_npb))
     app.add_handler(CommandHandler("cafe_basketball", cafe_basketball))
     app.add_handler(CommandHandler("cafe_volleyball", cafe_volleyball))
 
     # 네이버 카페 자동 글쓰기(심층 분석 게시판)  ※ /cafe_soccer_deep [tomorrow]
     app.add_handler(CommandHandler("cafe_soccer_deep", cafe_soccer_deep))
     app.add_handler(CommandHandler("cafe_baseball_deep", cafe_baseball_deep))
-    app.add_handler(CommandHandler("cafe_mlb_deep", cafe_mlb_deep))
-    app.add_handler(CommandHandler("cafe_kbo_deep", cafe_kbo_deep))
-    app.add_handler(CommandHandler("cafe_npb_deep", cafe_npb_deep))
     app.add_handler(CommandHandler("cafe_basketball_deep", cafe_basketball_deep))
     app.add_handler(CommandHandler("cafe_volleyball_deep", cafe_volleyball_deep))
 
