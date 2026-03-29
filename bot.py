@@ -15,7 +15,7 @@ def now_kst() -> datetime:
     return datetime.now(KST)
 
 
-def extract_simple_from_body(body: str, allow_ai_rewrite: bool = True) -> str:
+def extract_simple_from_body(body: str) -> str:
     """서술형 body에서 '핵심 포인트 요약'을 한 줄로 압축해 반환.
     - [핵심 포인트 요약] / 핵심 포인트 요약 / 핵심포인트요약 등 다양한 표기 지원
     - HTML(<br>, <p>)이 섞여 있어도 처리
@@ -83,7 +83,7 @@ def extract_simple_from_body(body: str, allow_ai_rewrite: bool = True) -> str:
 
     # OpenAI로 1문장 재작성 (불릿이 2개 이상일 때만)
     client_oa = get_openai_client()
-    if allow_ai_rewrite and client_oa and len(cleaned) >= 2:
+    if client_oa and len(cleaned) >= 2:
         try:
             bullets_txt = "\n".join([f"- {b}" for b in cleaned[:6]])
             prompt = f'''아래 "핵심 포인트 요약" 불릿들을 의미를 유지한 채 자연스러운 한국어 1문장으로 재작성해줘.
@@ -716,7 +716,7 @@ def _slug_tag(s: str) -> str:
     s = re.sub(r"[^\w가-힣]+", "", s)
     # 너무 긴 경우 잘라내기
     return s[:15]
-def build_dynamic_cafe_simple(title: str, body: str, *, sport: str = "", seed: str = "", home_team: str = "", away_team: str = "", use_openai_core: bool = True) -> str:
+def build_dynamic_cafe_simple(title: str, body: str, *, sport: str = "", seed: str = "", home_team: str = "", away_team: str = "") -> str:
     """export_* 시트 G열(simple) 생성(요약형)
     목표:
     - body 전체 복사 금지
@@ -775,7 +775,7 @@ def build_dynamic_cafe_simple(title: str, body: str, *, sport: str = "", seed: s
         theme = rng.choice(["세트피스", "압박", "전환", "수비", "역습", "피지컬"])
 
     # 요약: 핵심포인트 1문장(없으면 본문 첫 문장들)
-    core_one = (extract_simple_from_body(body_nopick, allow_ai_rewrite=use_openai_core) or "").strip()
+    core_one = (extract_simple_from_body(body_nopick) or "").strip()
 
     # 요약에 픽 관련 라인 들어가면 제거
     if core_one:
@@ -3452,7 +3452,7 @@ def generate_export_comments_pair(title: str, sport_label: str = "", body_hint: 
     deep_comments = generate_export_comments(title=title, sport_label=sport_label, count=count, mode="deep", body_hint=body_hint, avoid_text=comments)
     return (comments or "").strip(), (deep_comments or "").strip()
 
-def append_export_rows(sheet_name: str, rows: list[list[str]], *, fill_comments: bool = False) -> bool:
+def append_export_rows(sheet_name: str, rows: list[list[str]]) -> bool:
     """지정 export 시트에 rows를 append.
 
     입력 row 포맷(호환):
@@ -3462,11 +3462,6 @@ def append_export_rows(sheet_name: str, rows: list[list[str]], *, fill_comments:
 
     저장 포맷(항상 EXPORT_HEADER 순서):
       day, sport, src_id, title, body, createdAt, simple, cafe_title, cafe_url, comments, cafe_url_deep, deep_comments
-
-    성능 메모:
-      - fill_comments=False 이면 comments / deep_comments 자동 생성(OpenAI)을 건너뛴다.
-      - 대량 mazcrawl 시 export 저장 지연을 줄이기 위해 기본값은 False다.
-      - 댓글이 필요하면 /export_comment_fill 로 별도 생성한다.
     """
     if not rows:
         return True
@@ -3548,28 +3543,27 @@ def append_export_rows(sheet_name: str, rows: list[list[str]], *, fill_comments:
             base_title = (simple_txt.splitlines()[0] if simple_txt else "").strip()
 
         # comments(심플용) 생성/보정
-        if fill_comments:
-            if i_comments < len(rr) and (not str(rr[i_comments]).strip()):
-                comments, deep_comments = generate_export_comments_pair(
+        if i_comments < len(rr) and (not str(rr[i_comments]).strip()):
+            comments, deep_comments = generate_export_comments_pair(
+                title=base_title,
+                sport_label=str(sport_label or "").strip(),
+                body_hint=str(body or "").strip(),
+            )
+            rr[i_comments] = (comments or "").strip()
+            # deep_comments도 동시에 채워주되, 이미 값이 있으면 유지
+            if i_deep_comments < len(rr) and (not str(rr[i_deep_comments]).strip()):
+                rr[i_deep_comments] = (deep_comments or "").strip()
+        else:
+            # comments가 이미 있고 deep_comments만 비어있으면 deep만 생성
+            if i_deep_comments < len(rr) and (not str(rr[i_deep_comments]).strip()):
+                deep_comments = generate_export_comments(
                     title=base_title,
                     sport_label=str(sport_label or "").strip(),
+                    mode="deep",
                     body_hint=str(body or "").strip(),
+                    avoid_text=str(rr[i_comments] if i_comments < len(rr) else ""),
                 )
-                rr[i_comments] = (comments or "").strip()
-                # deep_comments도 동시에 채워주되, 이미 값이 있으면 유지
-                if i_deep_comments < len(rr) and (not str(rr[i_deep_comments]).strip()):
-                    rr[i_deep_comments] = (deep_comments or "").strip()
-            else:
-                # comments가 이미 있고 deep_comments만 비어있으면 deep만 생성
-                if i_deep_comments < len(rr) and (not str(rr[i_deep_comments]).strip()):
-                    deep_comments = generate_export_comments(
-                        title=base_title,
-                        sport_label=str(sport_label or "").strip(),
-                        mode="deep",
-                        body_hint=str(body or "").strip(),
-                        avoid_text=str(rr[i_comments] if i_comments < len(rr) else ""),
-                    )
-                    rr[i_deep_comments] = (deep_comments or "").strip()
+                rr[i_deep_comments] = (deep_comments or "").strip()
 
         # rr 길이 보정
         if len(rr) < len(EXPORT_HEADER):
@@ -5802,35 +5796,62 @@ def _parse_game_start_date(game_start_at: str) -> date | None:
 
 from datetime import date  # 파일 위쪽에 이미 있을 수도 있음
 
-def detect_game_date_from_item(item: dict, target_date: date) -> date | None:
-    """
-    mazgtv 리스트 JSON 한 건(item) 전체를 훑으면서
-    target_date 와 '같은 날짜'가 들어있는지 찾는다.
+def _iter_game_date_candidate_texts(item: dict):
+    """mazgtv item에서 경기 날짜 후보 텍스트만 최대한 보수적으로 추출한다.
 
-    아래 패턴들 중 하나라도 target_date 와 같으면 target_date 를 리턴, 
-    하나도 없으면 None:
-    - YYYY-MM-DD
-    - MM-DD
-    - M월 D일 / MM월 DD일
+    createdAt/updatedAt 같은 게시글 작성일이 target_date 와 우연히 같아도
+    경기 날짜로 오인하지 않도록, game/match/start/title 등의 키만 우선 본다.
     """
 
-    def _iter_values(x):
+    deny_keywords = (
+        "created", "updated", "modified", "posted", "reg", "register", "write",
+        "writer", "author", "comment", "view", "read", "like",
+    )
+    allow_keywords = (
+        "game", "match", "start", "fixture", "schedule", "date",
+        "title", "subject", "home", "away", "league", "content", "summary",
+    )
+
+    def _walk(x, key_path: str = ""):
         if isinstance(x, dict):
-            for v in x.values():
-                yield from _iter_values(v)
+            for k, v in x.items():
+                child_path = f"{key_path}.{k}" if key_path else str(k)
+                yield from _walk(v, child_path)
         elif isinstance(x, list):
             for v in x:
-                yield from _iter_values(v)
-        else:
+                yield from _walk(v, key_path)
+        elif isinstance(x, str):
+            key_lower = (key_path or "").lower()
+            if key_lower:
+                if any(bad in key_lower for bad in deny_keywords):
+                    return
+                if not any(ok in key_lower for ok in allow_keywords):
+                    return
             yield x
 
-    texts = [v for v in _iter_values(item) if isinstance(v, str)]
+    yield from _walk(item)
+
+
+def detect_game_date_from_item(item: dict, target_date: date) -> date | None:
+    """item 내부 텍스트에서 경기 날짜로 보이는 값만 찾아 target_date 와 비교한다.
+
+    - gameStartAt 파싱이 실패했을 때만 사용하는 보조 판정
+    - 게시글 작성일/수정일과 경기 날짜를 혼동하지 않도록 보수적으로 동작
+    - 아래 패턴 중 target_date 와 정확히 일치할 때만 반환
+      * YYYY-MM-DD / YYYY.MM.DD
+      * MM-DD / MM.DD / MM/DD
+      * M월 D일
+    """
+
+    texts = [v for v in _iter_game_date_candidate_texts(item) if isinstance(v, str)]
+    if not texts:
+        return None
 
     ty = target_date.year
 
-    # 1) YYYY-MM-DD 패턴들 중에서 target_date 와 같은 날짜가 있는지
+    # 1) YYYY-MM-DD / YYYY.MM.DD
     for text in texts:
-        for yy, mm, dd in re.findall(r"(\d{4})-(\d{2})-(\d{2})", text):
+        for yy, mm, dd in re.findall(r"(\d{4})[-./](\d{1,2})[-./](\d{1,2})", text):
             try:
                 dt = date(int(yy), int(mm), int(dd))
             except ValueError:
@@ -5838,9 +5859,9 @@ def detect_game_date_from_item(item: dict, target_date: date) -> date | None:
             if dt == target_date:
                 return dt
 
-    # 2) MM-DD (예: 12-03)
+    # 2) MM-DD / MM.DD / MM/DD
     for text in texts:
-        for mm, dd in re.findall(r"(\d{1,2})-(\d{1,2})", text):
+        for mm, dd in re.findall(r"(\d{1,2})[-./](\d{1,2})", text):
             try:
                 dt = date(ty, int(mm), int(dd))
             except ValueError:
@@ -5848,7 +5869,7 @@ def detect_game_date_from_item(item: dict, target_date: date) -> date | None:
             if dt == target_date:
                 return dt
 
-    # 3) '12월 3일' / '12 월 03 일' 패턴
+    # 3) '12월 3일' / '12 월 03 일'
     for text in texts:
         for mm, dd in re.findall(r"(\d{1,2})\s*월\s*(\d{1,2})\s*일", text):
             try:
@@ -5859,61 +5880,6 @@ def detect_game_date_from_item(item: dict, target_date: date) -> date | None:
                 return dt
 
     return None
-
-def _parse_maz_page_window(args: list[str] | None, default_pages: int = 5) -> tuple[int, int]:
-    """maz 크롤링용 페이지 범위를 해석한다.
-
-    지원 예시:
-      - /crawlmazsoccer_tomorrow           -> 1~5페이지
-      - /crawlmazsoccer_tomorrow 3         -> 1~3페이지
-      - /crawlmazsoccer_tomorrow page=2    -> 2페이지만
-      - /crawlmazsoccer_tomorrow range=3-5 -> 3~5페이지
-      - /crawlmazsoccer_tomorrow 3-5       -> 3~5페이지
-    """
-    start_page = 1
-    page_count = max(1, int(default_pages or 5))
-
-    for raw in (args or []):
-        s = (raw or "").strip().lower()
-        if not s:
-            continue
-
-        if s.isdigit():
-            page_count = max(1, min(int(s), 20))
-            continue
-
-        m = re.match(r"^page=(\d+)$", s)
-        if m:
-            start_page = max(1, int(m.group(1)))
-            page_count = 1
-            continue
-
-        m = re.match(r"^pages=(\d+)$", s)
-        if m:
-            page_count = max(1, min(int(m.group(1)), 20))
-            continue
-
-        m = re.match(r"^(?:range=)?(\d+)-(\d+)$", s)
-        if m:
-            a = max(1, int(m.group(1)))
-            b = max(1, int(m.group(2)))
-            if b < a:
-                a, b = b, a
-            start_page = a
-            page_count = min(20, (b - a + 1))
-            continue
-
-    return start_page, page_count
-
-
-def _format_maz_page_window(start_page: int, page_count: int) -> str:
-    start_page = max(1, int(start_page or 1))
-    page_count = max(1, int(page_count or 1))
-    end_page = start_page + page_count - 1
-    if page_count <= 1:
-        return f"{start_page}페이지만"
-    return f"{start_page}~{end_page}페이지"
-
 
 def classify_basketball_volleyball_sport(league: str) -> str:
     """
@@ -5962,7 +5928,6 @@ async def crawl_maz_analysis_common(
     sport_label: str,
     league_default: str,
     day_key: str = "tomorrow",
-    start_page: int = 1,
     max_pages: int = 5,
     board_type: int = 2,
     category: int = 1,
@@ -5982,10 +5947,8 @@ async def crawl_maz_analysis_common(
 
     target_date = datetime.strptime(target_ymd, "%Y-%m-%d").date()
 
-    page_window_text = _format_maz_page_window(start_page, max_pages)
-
     await update.message.reply_text(
-        f"mazgtv {sport_label} 분석 페이지에서 {target_ymd} 경기 분석글을 가져옵니다. ({page_window_text}) 잠시만 기다려 주세요..."
+        f"mazgtv {sport_label} 분석 페이지에서 {target_ymd} 경기 분석글을 가져옵니다. 잠시만 기다려 주세요..."
     )
 
     rows_to_append: list[list[str]] = []
@@ -5997,28 +5960,6 @@ async def crawl_maz_analysis_common(
     export_sheet_name = EXPORT_TODAY_SHEET_NAME if day_key == "today" else EXPORT_TOMORROW_SHEET_NAME
     existing_export_src_ids = get_existing_export_src_ids(export_sheet_name) if export_site else set()
     site_rows_to_append: list[list[str]] = []
-    saved_analysis_cnt = 0
-    saved_export_cnt = 0
-
-    def _flush_pending_rows() -> bool:
-        nonlocal rows_to_append, site_rows_to_append, saved_analysis_cnt, saved_export_cnt
-
-        # export를 먼저 저장해서 analysis만 있고 export가 비는 상황을 줄인다.
-        if export_site and site_rows_to_append:
-            ok2 = append_export_rows(export_sheet_name, site_rows_to_append, fill_comments=False)
-            if not ok2:
-                return False
-            saved_export_cnt += len(site_rows_to_append)
-            site_rows_to_append = []
-
-        if rows_to_append:
-            ok = append_analysis_rows(day_key, rows_to_append)
-            if not ok:
-                return False
-            saved_analysis_cnt += len(rows_to_append)
-            rows_to_append = []
-
-        return True
 
     try:
         async with httpx.AsyncClient(
@@ -6027,8 +5968,7 @@ async def crawl_maz_analysis_common(
         ) as client:
             await _maz_warmup(client)
 
-            end_page = start_page + max_pages - 1
-            for page in range(start_page, end_page + 1):
+            for page in range(1, max_pages + 1):
                 list_url = (
                     f"{MAZ_LIST_API}"
                     f"?page={page}&perpage=20"
@@ -6121,17 +6061,15 @@ async def crawl_maz_analysis_common(
                     if not item_date:
                         continue
 
-                    # ✅ 날짜 필터링
-                    # - 축구/농구/배구: target_date와 정확히 일치만
-                    # - 야구: (혹시 주간 카드로 들어오는 경우) 일치가 아니면 같은 주(0~6일)까지 허용
-                    if sport_label == "야구":
-                        if item_date != target_date:
-                            delta_days = (target_date - item_date).days
-                            if delta_days < 0 or delta_days >= 7:
-                                continue
-                    else:
-                        if item_date != target_date:
-                            continue
+                    # ✅ 날짜 필터링 (전 종목 공통: target_date와 정확히 일치만 허용)
+                    # 이전에는 야구만 같은 주(0~6일)까지 허용해서,
+                    # 3/28 글이 /tomorrow 실행 시 3/29 경기로 잘못 저장되는 문제가 있었다.
+                    if item_date != target_date:
+                        print(
+                            f"[MAZ][SKIP_DATE] page={page} id={board_id} "
+                            f"sport={sport_label} target_date={target_date} item_date={item_date}"
+                        )
+                        continue
 
                     league = item.get("leagueName") or league_default
                     home = item.get("homeTeamName") or ""
@@ -6175,9 +6113,10 @@ async def crawl_maz_analysis_common(
                     else:
                         new_title, new_body = "", ""
 
-                    # ✅ today/tomorrow 크롤링 제목 앞에 날짜 프리픽스 추가 (중복 방지)
+                    # ✅ today/tomorrow 크롤링 제목 앞에 실제 경기 날짜 프리픽스 추가 (중복 방지)
+                    title_date = item_date or target_date
                     if new_title and day_key in ("today", "tomorrow"):
-                        _dp = f"{target_date.month}월 {target_date.day}일 "
+                        _dp = f"{title_date.month}월 {title_date.day}일 "
                         if not str(new_title).startswith(_dp):
                             new_title = _dp + str(new_title).strip()
 
@@ -6208,7 +6147,6 @@ async def crawl_maz_analysis_common(
 
                     if needs_analysis:
                         rows_to_append.append([row_sport, row_id, new_title, new_body])
-                        existing_ids.add(row_id)
 
                     # ✅ 사이트 업로드용(site_export)도 같이 저장
                     if export_site and needs_export:
@@ -6226,7 +6164,7 @@ async def crawl_maz_analysis_common(
                             # ✅ 팀명/구분자 정규화 (표시용 키워드: '팀1 팀2')
                             _norm_key = infer_norm_sport_key(sport_label, row_sport, league or "")
                             _league_for_title = (league or league_default or "").strip()
-                            site_title = build_export_title(target_date, _league_for_title, home, away, _norm_key)
+                            site_title = build_export_title(title_date, _league_for_title, home, away, _norm_key)
                             # body(E열)에도 팀명/구분자 표기를 정리(FC/CF/워리어스 등 제거 + vs/대 제거)
                             site_body = normalize_text_teamnames(site_body, sport_key=_norm_key, home_raw=home, away_raw=away)
                             site_body = _postprocess_site_body_text(site_body)
@@ -6241,7 +6179,6 @@ async def crawl_maz_analysis_common(
                                     seed=str(row_id),
                                     home_team=_hd,
                                     away_team=_ad,
-                                    use_openai_core=False,
                                 )
                             except Exception:
                                 site_simple = ""
@@ -6266,33 +6203,40 @@ async def crawl_maz_analysis_common(
                             ])
                             existing_export_src_ids.add(row_id)
 
-                if rows_to_append or site_rows_to_append:
-                    if not _flush_pending_rows():
-                        await update.message.reply_text("analysis/export 시트 저장 중 오류가 발생했습니다.")
-                        return
-
     except Exception as e:
         # ✅ 여기 except는 try와 같은 들여쓰기 레벨이어야 함
         await update.message.reply_text(f"요청 오류가 발생했습니다: {e}")
         return
 
-    if (not rows_to_append) and (not site_rows_to_append) and saved_analysis_cnt == 0 and saved_export_cnt == 0:
+    if (not rows_to_append) and (not site_rows_to_append):
         await update.message.reply_text(
             f"mazgtv {sport_label} 분석에서 {target_ymd} 경기 분석글을 찾지 못했습니다."
         )
         return
 
-    if rows_to_append or site_rows_to_append:
-        if not _flush_pending_rows():
-            await update.message.reply_text("analysis/export 시트 저장 중 오류가 발생했습니다.")
+    if rows_to_append:
+        ok = append_analysis_rows(day_key, rows_to_append)
+        if not ok:
+            await update.message.reply_text("구글시트에 분석 데이터를 저장하지 못했습니다.")
+            return
+    else:
+        ok = True
+
+    # ✅ site_export 시트 저장
+    if export_site and site_rows_to_append:
+        ok2 = append_export_rows(export_sheet_name, site_rows_to_append)
+        if not ok2:
+            await update.message.reply_text("site_export 시트 저장 중 오류가 발생했습니다.")
             return
 
     reload_analysis_from_sheet()
 
     extra = ""
     if export_site:
-        extra = f"\nexport 시트에도 {saved_export_cnt}건을 저장했습니다. (comments/deep_comments 자동 생성은 건너뜀)"
+        extra = f"\\nexport 시트에도 {len(site_rows_to_append)}건을 저장했습니다."
 
+    saved_analysis_cnt = len(rows_to_append)
+    saved_export_cnt = len(site_rows_to_append) if export_site else 0
     await update.message.reply_text(
         f"mazgtv {sport_label} 분석에서 {target_ymd} 저장 완료: "
         f"분석시트 {saved_analysis_cnt}건, export {saved_export_cnt}건." + extra + "\n"
@@ -7798,8 +7742,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 async def crawlmazsoccer_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    start_page, max_pages = _parse_maz_page_window(context.args, default_pages=5)
-
     # 1) 해외축구
     await crawl_maz_analysis_common(
         update,
@@ -7808,8 +7750,7 @@ async def crawlmazsoccer_tomorrow(update: Update, context: ContextTypes.DEFAULT_
         sport_label="축구",
         league_default="해외축구",
         day_key="tomorrow",
-        start_page=start_page,
-        max_pages=max_pages,
+        max_pages=5,
         board_type=2,
         category=1,
         export_site=True,   # ✅ 추가
@@ -7823,15 +7764,14 @@ async def crawlmazsoccer_tomorrow(update: Update, context: ContextTypes.DEFAULT_
         sport_label="축구",
         league_default="K리그/J리그",
         day_key="tomorrow",
-        start_page=start_page,
-        max_pages=max_pages,
+        max_pages=5,
         board_type=2,
         category=2,
         export_site=True,   # ✅ 추가
     )
 
     await update.message.reply_text(
-        f"⚽ 텔레그램용 + 사이트용(내일) 분석 크롤링을 모두 저장했습니다. ({_format_maz_page_window(start_page, max_pages)})",
+        "⚽ 텔레그램용 + 사이트용(내일) 분석 크롤링을 모두 저장했습니다.",
         reply_markup=_build_export_comment_zip_markup("tomorrow", "soccer"),
     )
 
@@ -7842,8 +7782,6 @@ async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAUL
     mazgtv 야구(MLB / KBO / NPB) 내일 경기 분석을 크롤링해서
     'tomorrow' 시트에 저장한다. 축구용과 동일한 구조.
     """
-    start_page, max_pages = _parse_maz_page_window(context.args, default_pages=5)
-
     # 해외야구(MLB)
     await crawl_maz_analysis_common(
         update,
@@ -7852,8 +7790,7 @@ async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAUL
         sport_label="야구",
         league_default="해외야구",
         day_key="tomorrow",
-        start_page=start_page,
-        max_pages=max_pages,
+        max_pages=5,
         board_type=2,
         category=3,
         export_site=True,
@@ -7867,15 +7804,14 @@ async def crawlmazbaseball_tomorrow(update: Update, context: ContextTypes.DEFAUL
         sport_label="야구",
         league_default="KBO/NPB",
         day_key="tomorrow",
-        start_page=start_page,
-        max_pages=max_pages,
+        max_pages=5,
         board_type=2,
         category=4,
         export_site=True,
     )
 
     await update.message.reply_text(
-        f"⚾ 야구(MLB · KBO · NPB) 내일 경기 분석 크롤링 명령을 모두 실행했습니다. ({_format_maz_page_window(start_page, max_pages)})",
+        "⚾ 야구(MLB · KBO · NPB) 내일 경기 분석 크롤링 명령을 모두 실행했습니다.",
         reply_markup=_build_export_comment_zip_markup("tomorrow", "baseball"),
     )
 
@@ -7887,8 +7823,6 @@ async def bvcrawl_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     - 국내 농구/배구: https://mazgtv1.com/analyze/volleyball
     두 곳에서 '내일 경기' 분석글을 크롤링해서 tomorrow 시트에 저장한다.
     """
-    start_page, max_pages = _parse_maz_page_window(context.args, default_pages=5)
-
 
     # 1) NBA (해외 농구)
     await crawl_maz_analysis_common(
@@ -7898,8 +7832,7 @@ async def bvcrawl_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sport_label="농구",          # 시트에는 NBA/KBL/WKBL 등으로 나뉨
         league_default="NBA",
         day_key="tomorrow",
-        start_page=start_page,
-        max_pages=max_pages,
+        max_pages=5,
         board_type=2,                # ⚠️ 실제 boardType 값으로 수정 필요
         category=5,                  # ⚠️ 실제 category 값으로 수정 필요
         # target_ymd=None → 자동으로 '내일' 날짜 사용
@@ -7914,15 +7847,14 @@ async def bvcrawl_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sport_label="농구/배구",     # 분류 함수에서 KBL/WKBL/V리그/배구 등으로 세분화
         league_default="국내농구/배구",
         day_key="tomorrow",
-        start_page=start_page,
-        max_pages=max_pages,
+        max_pages=5,
         board_type=2,                # ⚠️ 실제 boardType 값으로 수정 필요
         category=7,                  # ⚠️ 실제 category 값으로 수정 필요
         export_site=True,
     )
 
     await update.message.reply_text(
-        f"NBA + 국내 농구/배구(내일 경기) 분석 크롤링을 모두 실행했습니다. ({_format_maz_page_window(start_page, max_pages)})\n"
+        "NBA + 국내 농구/배구(내일 경기) 분석 크롤링을 모두 실행했습니다.\n"
         "/syncsheet 로 텔레그램 메뉴 데이터를 갱신할 수 있습니다.",
         reply_markup=_build_export_comment_zip_markup_bv("tomorrow"),
     )
@@ -7932,8 +7864,6 @@ async def crawlmazsoccer_today(update: Update, context: ContextTypes.DEFAULT_TYP
     mazgtv 해외축구 + K리그/J리그 분석 중
     '오늘 날짜' 경기를 크롤링해서 today 시트에 저장.
     """
-    start_page, max_pages = _parse_maz_page_window(context.args, default_pages=5)
-
 
     # 1) 해외축구 탭
     await crawl_maz_analysis_common(
@@ -7943,8 +7873,7 @@ async def crawlmazsoccer_today(update: Update, context: ContextTypes.DEFAULT_TYP
         sport_label="축구",          # 안에서 '해외축구/K리그/J리그'로 다시 분류됨
         league_default="해외축구",
         day_key="today",            # ✅ today
-        start_page=start_page,
-        max_pages=max_pages,
+        max_pages=5,
         board_type=2,
         category=1,                 # 해외축구
         export_site=True,
@@ -7958,15 +7887,14 @@ async def crawlmazsoccer_today(update: Update, context: ContextTypes.DEFAULT_TYP
         sport_label="축구",
         league_default="K리그/J리그",
         day_key="today",            # ✅ today
-        start_page=start_page,
-        max_pages=max_pages,
+        max_pages=5,
         board_type=2,
         category=2,                 # K리그/J리그
         export_site=True,
     )
 
     await update.message.reply_text(
-        f"⚽ 해외축구 + K리그/J리그 오늘 경기 분석 크롤링을 모두 실행했습니다. ({_format_maz_page_window(start_page, max_pages)})",
+        "⚽ 해외축구 + K리그/J리그 오늘 경기 분석 크롤링을 모두 실행했습니다.",
         reply_markup=_build_export_comment_zip_markup("today", "soccer"),
     )
 
@@ -7975,8 +7903,6 @@ async def crawlmazbaseball_today(update: Update, context: ContextTypes.DEFAULT_T
     mazgtv 야구 분석(MLB + KBO + NPB) 중
     '오늘 날짜' 경기를 크롤링해서 today 시트에 저장.
     """
-    start_page, max_pages = _parse_maz_page_window(context.args, default_pages=5)
-
 
     # 1) 해외야구 (MLB)
     await crawl_maz_analysis_common(
@@ -7986,8 +7912,7 @@ async def crawlmazbaseball_today(update: Update, context: ContextTypes.DEFAULT_T
         sport_label="야구",          # 시트에서는 해외야구/KBO/NPB로 분리됨
         league_default="해외야구",
         day_key="today",            # 🔴 오늘
-        start_page=start_page,
-        max_pages=max_pages,
+        max_pages=5,
         board_type=2,               # 기존 /crawlmazbaseball_tomorrow 와 동일
         category=3,                 # MLB 쪽 category 값 (지금 쓰는 값 그대로)
         export_site=True,
@@ -8001,15 +7926,14 @@ async def crawlmazbaseball_today(update: Update, context: ContextTypes.DEFAULT_T
         sport_label="야구",
         league_default="KBO/NPB",
         day_key="today",            # 🔴 오늘
-        start_page=start_page,
-        max_pages=max_pages,
+        max_pages=5,
         board_type=2,               # 동일 boardType
         category=4,                 # KBO/NPB 쪽 category 값 (지금 쓰는 값 그대로)
         export_site=True,
     )
 
     await update.message.reply_text(
-        f"⚾ mazgtv 야구(MLB · KBO · NPB) '오늘 경기' 분석 크롤링을 완료했습니다. ({_format_maz_page_window(start_page, max_pages)})\n"
+        "⚾ mazgtv 야구(MLB · KBO · NPB) '오늘 경기' 분석 크롤링을 완료했습니다.\n"
         "today 시트에서 내용을 확인할 수 있습니다.",
         reply_markup=_build_export_comment_zip_markup("today", "baseball"),
     )
@@ -8022,8 +7946,6 @@ async def bvcrawl_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     - 국내 농구/배구: https://mazgtv1.com/analyze/volleyball
     두 곳에서 '오늘 경기' 분석글을 크롤링해서 today 시트에 저장한다.
     """
-    start_page, max_pages = _parse_maz_page_window(context.args, default_pages=5)
-
 
     # 1) NBA (해외 농구)
     await crawl_maz_analysis_common(
@@ -8033,8 +7955,7 @@ async def bvcrawl_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sport_label="농구",
         league_default="NBA",
         day_key="today",             # ✅ 오늘
-        start_page=start_page,
-        max_pages=max_pages,
+        max_pages=5,
         board_type=2,                # 👉 tomorrow와 동일 값 유지
         category=5,
         export_site=True,
@@ -8048,15 +7969,14 @@ async def bvcrawl_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sport_label="농구/배구",
         league_default="국내농구/배구",
         day_key="today",             # ✅ 오늘
-        start_page=start_page,
-        max_pages=max_pages,
+        max_pages=5,
         board_type=2,                # 👉 tomorrow와 동일 값 유지
         category=7,
         export_site=True,
     )
 
     await update.message.reply_text(
-        f"NBA + 국내 농구/배구(오늘 경기) 분석 크롤링을 모두 실행했습니다. ({_format_maz_page_window(start_page, max_pages)})\n"
+        "NBA + 국내 농구/배구(오늘 경기) 분석 크롤링을 모두 실행했습니다.\n"
         "today 시트에서 내용을 확인할 수 있습니다.",
         reply_markup=_build_export_comment_zip_markup_bv("today"),
     )
@@ -9990,105 +9910,6 @@ async def _ensure_quiz_schema(ws) -> None:
     """
     return
 
-def _quiz_norm_compact(s: str) -> str:
-    s = str(s or "").strip().lower()
-    if not s:
-        return ""
-    s = s.replace("\u200b", "")
-    s = re.sub(r"<[^>]+>", " ", s)
-    s = s.replace("&nbsp;", " ")
-    s = re.sub(r"[\s\r\n\t]+", "", s)
-    return re.sub(r"[^0-9a-z가-힣]+", "", s)
-
-
-def _quiz_clean_choice_text(s: str) -> str:
-    s = str(s or "").strip()
-    if not s:
-        return ""
-    s = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", s)
-    s = re.split(r"\s+(?:이벤트|마감|퀴즈|정답|댓글|참여|응모)\b", s, maxsplit=1)[0]
-    s = re.sub(r"\s+", " ", s).strip(" -_/|")
-    return s
-
-
-def _build_quiz_subject_choice_map(subject: str) -> dict[str, str]:
-    out: dict[str, str] = {}
-    subj = str(subject or "").strip()
-    if not subj:
-        return out
-
-    compact_subj = _quiz_norm_compact(subj)
-    if ("홀짝" in compact_subj) or ("oddeven" in compact_subj) or ("oddseven" in compact_subj):
-        for alias in ("홀", "홀수", "odd"):
-            out[_quiz_norm_compact(alias)] = "홀"
-        for alias in ("짝", "짝수", "even"):
-            out[_quiz_norm_compact(alias)] = "짝"
-
-    m = re.search(r"(.+?)\s*(?:vs\.?|v\.?|대)\s*(.+)", subj, flags=re.I)
-    if not m:
-        return out
-
-    for raw in (_quiz_clean_choice_text(m.group(1)), _quiz_clean_choice_text(m.group(2))):
-        if not raw:
-            continue
-        canonical = raw
-        aliases = {raw, raw.replace(" ", "")}
-        short = re.sub(r"\b(?:fc|bc|sc|afc|cf|utd|united)\b", "", raw, flags=re.I)
-        short = re.sub(r"\s+", " ", short).strip()
-        if short and len(short) >= 2:
-            aliases.add(short)
-            aliases.add(short.replace(" ", ""))
-        for alias in aliases:
-            key = _quiz_norm_compact(alias)
-            if key:
-                out[key] = canonical
-    return out
-
-
-def _parse_quiz_answer(text: str, subject_choice_map: dict[str, str] | None = None) -> str:
-    raw = str(text or "").strip()
-    if not raw:
-        return ""
-
-    compact = _quiz_norm_compact(raw)
-    if not compact:
-        return ""
-
-    if subject_choice_map:
-        direct = subject_choice_map.get(compact)
-        if direct:
-            return direct
-        for k, v in subject_choice_map.items():
-            if not k:
-                continue
-            if compact.startswith(k) or compact.endswith(k):
-                return v
-
-    if compact in {"홀짝", "oddeven", "oddseven"}:
-        return ""
-
-    has_hol = ("홀" in compact) or ("odd" in compact)
-    has_jjak = ("짝" in compact) or ("even" in compact)
-
-    if has_hol and not has_jjak:
-        if compact.startswith(("홀", "홀수", "odd")) or compact.endswith(("홀", "odd")):
-            return "홀"
-    if has_jjak and not has_hol:
-        if compact.startswith(("짝", "짝수", "even")) or compact.endswith(("짝", "even")):
-            return "짝"
-    if has_hol and has_jjak:
-        if compact.endswith(("홀", "odd")):
-            return "홀"
-        if compact.endswith(("짝", "even")):
-            return "짝"
-
-    m = re.search(r"\d+", compact)
-    if m:
-        return m.group(0)
-
-    return ""
-
-
 async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/quizcrawl M.DD : 해당 날짜(작성일 기준) 게시글 1개를 찾고 댓글 전체를 수집해 '퀴즈' 시트에 반영."""
     if not is_admin(update):
@@ -10260,23 +10081,21 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parsed.sort(key=lambda x: (x[0], x[1]))
 
     total_fetched = len(parsed)
-    valid_ans = 0
+    valid_num = 0
     dup_skip = 0
-    no_ans = 0
+    no_num = 0
 
     seen_nick: set[str] = set()
     nick_to_ans: dict[str, str] = {}
-    ignored_samples: list[str] = []
-    subject_choice_map = _build_quiz_subject_choice_map(found_subject)
 
+    num_re = re.compile(r"\d+")
     for ts, nick, text in parsed:
-        ans = _parse_quiz_answer(text, subject_choice_map=subject_choice_map)
-        if not ans:
-            no_ans += 1
-            if len(ignored_samples) < 5:
-                ignored_samples.append(str(text).strip().replace("\n", " ")[:60])
+        m = num_re.search(text)
+        if not m:
+            no_num += 1
             continue
-        valid_ans += 1
+        ans = m.group(0)
+        valid_num += 1
         if nick in seen_nick:
             dup_skip += 1
             continue
@@ -10350,15 +10169,13 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- 게시글: {found_subject or '(제목없음)'}\n"
         f"- URL: {article_url}\n"
         f"- 댓글(텍스트 파싱 대상): {total_fetched}개\n"
-        f"- 유효 답안 댓글: {valid_ans}개\n"
+        f"- 숫자 답안 포함 댓글: {valid_num}개\n"
         f"- 중복 닉네임 스킵: {dup_skip}개\n"
-        f"- 답안 인식 실패 무시: {no_ans}개\n"
+        f"- 숫자 없음 무시: {no_num}개\n"
         f"- 시트 반영: 신규 {inserted_cnt}명 / 업데이트 {updated_cnt}명\n"
         f"- 기존값 있어 스킵: {skipped_already}명\n"
         f"- 반영 컬럼: {day_col}(월~일 제출답)"
     )
-    if ignored_samples:
-        summary += "\n- 미인식 댓글 예시: " + " / ".join(ignored_samples[:3])
     await update.message.reply_text(summary)
 
 
