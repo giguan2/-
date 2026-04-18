@@ -4338,13 +4338,26 @@ def build_reply_keyboard() -> ReplyKeyboardMarkup:
 
 
 def build_main_inline_menu() -> InlineKeyboardMarkup:
-    """채널/DM 공통 메인 인라인 메뉴."""
+    """DM용 메인 인라인 메뉴."""
     today_str, tomorrow_str = get_date_labels()
     buttons = [
         [InlineKeyboardButton("📺 실시간 무료 중계", url="https://goat-tv.com")],
         [InlineKeyboardButton(f"📌 {today_str} 경기 분석픽", callback_data="analysis_root:today")],
         [InlineKeyboardButton(f"📌 {tomorrow_str} 경기 분석픽", callback_data="analysis_root:tomorrow")],
         [InlineKeyboardButton("📰 스포츠 뉴스 요약", callback_data="news_root")],
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_channel_inline_menu(bot_username: str) -> InlineKeyboardMarkup:
+    """채널용 메인 메뉴. 공용 callback 대신 DM deep link만 사용."""
+    today_str, tomorrow_str = get_date_labels()
+    bot_username = (bot_username or "").lstrip("@")
+    buttons = [
+        [InlineKeyboardButton("📺 실시간 무료 중계", url="https://goat-tv.com")],
+        [InlineKeyboardButton(f"📌 {today_str} 경기 분석픽", url=f"https://t.me/{bot_username}?start=today")],
+        [InlineKeyboardButton(f"📌 {tomorrow_str} 경기 분석픽", url=f"https://t.me/{bot_username}?start=tomorrow")],
+        [InlineKeyboardButton("📰 스포츠 뉴스 요약", url=f"https://t.me/{bot_username}?start=news")],
     ]
     return InlineKeyboardMarkup(buttons)
 
@@ -4464,11 +4477,18 @@ def build_news_list_menu(sport: str, per_page: int = 10) -> InlineKeyboardMarkup
 async def send_main_menu(chat_id: int | str, context: ContextTypes.DEFAULT_TYPE, preview: bool = False):
     """
     채널/DM 공통으로 '텍스트 + 메인 메뉴 버튼' 전송.
+    - preview=True: DM용 callback 메뉴
+    - preview=False and CHANNEL_ID: 채널용 deep link 메뉴
     """
+    reply_markup = build_main_inline_menu()
+    if (not preview) and CHANNEL_ID and str(chat_id) == str(CHANNEL_ID):
+        me = await context.bot.get_me()
+        reply_markup = build_channel_inline_menu(getattr(me, "username", ""))
+
     msg = await context.bot.send_message(
         chat_id=chat_id,
         text=get_menu_caption(),
-        reply_markup=build_main_inline_menu(),
+        reply_markup=reply_markup,
     )
     return msg
 
@@ -7559,6 +7579,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             else:
                 raise
+
+        chat_type = getattr(getattr(q.message, "chat", None), "type", "")
+        if chat_type == "channel":
+            return
     data = q.data or ""
     # 아무 동작 안 하는 더미
     if data == "noop":
