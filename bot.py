@@ -4341,7 +4341,7 @@ def build_main_inline_menu() -> InlineKeyboardMarkup:
     """DM용 메인 인라인 메뉴."""
     today_str, tomorrow_str = get_date_labels()
     buttons = [
-        [InlineKeyboardButton("📺 실시간 무료 중계", url="https://goat-tv.com")],
+        [InlineKeyboardButton("📺 실시간 무료 중계", url="https://allblack1.com")],
         [InlineKeyboardButton(f"📌 {today_str} 경기 분석픽", callback_data="analysis_root:today")],
         [InlineKeyboardButton(f"📌 {tomorrow_str} 경기 분석픽", callback_data="analysis_root:tomorrow")],
         [InlineKeyboardButton("📰 스포츠 뉴스 요약", callback_data="news_root")],
@@ -4354,7 +4354,7 @@ def build_channel_inline_menu(bot_username: str) -> InlineKeyboardMarkup:
     today_str, tomorrow_str = get_date_labels()
     bot_username = (bot_username or "").lstrip("@")
     buttons = [
-        [InlineKeyboardButton("📺 실시간 무료 중계", url="https://goat-tv.com")],
+        [InlineKeyboardButton("📺 실시간 무료 중계", url="https://allblack1.com")],
         [InlineKeyboardButton(f"📌 {today_str} 경기 분석픽", url=f"https://t.me/{bot_username}?start=today")],
         [InlineKeyboardButton(f"📌 {tomorrow_str} 경기 분석픽", url=f"https://t.me/{bot_username}?start=tomorrow")],
         [InlineKeyboardButton("📰 스포츠 뉴스 요약", url=f"https://t.me/{bot_username}?start=news")],
