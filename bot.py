@@ -9587,15 +9587,88 @@ ACTIVITY_MAX_PAGES = max(1, min(100, int(os.getenv("ACTIVITY_MAX_PAGES", "20")))
 ACTIVITY_CONTENT_MAX_CHARS = max(100, int(os.getenv("ACTIVITY_CONTENT_MAX_CHARS", "3000")))
 ACTIVITY_MIN_CHARS = max(1, int(os.getenv("ACTIVITY_MIN_CHARS", "30")))
 
+# 활동 게시판 글 하단에 붙는 고정 양식 제거 기준.
+# 4개 게시판 모두 같은 문구로 시작하므로, 이 문구가 보이는 지점부터 끝까지 제거한다.
+# 필요 시 Render 환경변수 ACTIVITY_TEMPLATE_STARTS에 || 구분으로 추가 시작문구를 넣어 덮어쓸 수 있다.
+_ACTIVITY_DEFAULT_TEMPLATE_STARTS = [
+    "스포츠분석 커뮤니티 오분(오늘의분석)은",
+]
+
+
+def _activity_template_starts() -> list[str]:
+    raw = (os.getenv("ACTIVITY_TEMPLATE_STARTS") or "").strip()
+    if not raw:
+        return list(_ACTIVITY_DEFAULT_TEMPLATE_STARTS)
+    starts = [p.strip() for p in re.split(r"\|\||\n+", raw) if p.strip()]
+    return starts or list(_ACTIVITY_DEFAULT_TEMPLATE_STARTS)
+
+
+def _activity_remove_zero_width(text: str) -> str:
+    """네이버 본문에 섞이는 제로폭 공백/nbsp를 제거한다."""
+    s = str(text or "")
+    s = html.unescape(s)
+    s = s.replace("\u00a0", " ")
+    return re.sub(r"[\u200b\u200c\u200d\ufeff]", "", s)
+
+
+def _activity_strip_template_block(text: str) -> str:
+    """회원 작성글 뒤에 붙은 고정 양식 블록을 제거한다.
+
+    예)
+    회원이 쓴 내용\n\n스포츠분석 커뮤니티 오분(오늘의분석)은 ... #해시태그
+    -> 회원이 쓴 내용
+    """
+    s = _activity_remove_zero_width(text)
+    if not s:
+        return ""
+
+    cut_positions: list[int] = []
+
+    for marker in _activity_template_starts():
+        marker = _activity_remove_zero_width(marker).strip()
+        if not marker:
+            continue
+
+        idx = s.find(marker)
+        if idx >= 0:
+            cut_positions.append(idx)
+            continue
+
+        # 띄어쓰기/줄바꿈 변형에도 대응하기 위한 보수적 정규식.
+        # marker의 공백들은 \s*로 보고, 일반 문자는 그대로 이스케이프한다.
+        parts = [re.escape(p) for p in re.split(r"\s+", marker) if p]
+        if parts:
+            pat = r"\s*".join(parts)
+            m = re.search(pat, s)
+            if m:
+                cut_positions.append(m.start())
+
+    # 안전 폴백: 기본 문구 일부만 발견돼도 그 지점부터 제거
+    fallback_patterns = [
+        r"스포츠\s*분석\s*커뮤니티\s*오분",
+        r"오늘의\s*분석\)\s*은",
+    ]
+    for pat in fallback_patterns:
+        m = re.search(pat, s)
+        if m:
+            cut_positions.append(m.start())
+
+    if cut_positions:
+        s = s[: min(cut_positions)]
+
+    return s.strip()
+
 
 def _activity_effective_len(text: str) -> int:
     """활동 보상 판정용 글자수.
 
-    - 띄어쓰기/줄바꿈 제외
+    - 고정 양식 블록 제외
+    - 제로폭 공백/줄바꿈/띄어쓰기 제외
     - 같은 문자가 연속 반복되면 1자로 계산
       예: 'ㅋㅋㅋㅋ 오늘 좋네요' -> 'ㅋ오늘좋네요'
     """
-    s = unicodedata.normalize("NFKC", str(text or ""))
+    s = _activity_strip_template_block(text)
+    s = unicodedata.normalize("NFKC", _activity_remove_zero_width(s))
     s = re.sub(r"\s+", "", s)
     if not s:
         return 0
@@ -9604,7 +9677,12 @@ def _activity_effective_len(text: str) -> int:
 
 
 def _activity_trim_content(text: str) -> str:
-    s = str(text or "").replace("\r", "\n")
+    """시트에 저장할 활동 글 내용.
+
+    회원 작성글만 남기고, 하단 고정 양식/빈 줄/제로폭 공백을 제거한다.
+    """
+    s = _activity_strip_template_block(text)
+    s = _activity_remove_zero_width(s).replace("\r", "\n")
     lines: list[str] = []
     prev = None
     for raw in s.split("\n"):
