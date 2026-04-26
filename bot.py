@@ -9557,6 +9557,492 @@ async def youtoo_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Activity crawl (네이버 카페 4개 게시판 어제 글 수집 → 구글시트 '활동' 탭)
+#  - 기존 youtoo/카페 업로드/크롤링 로직과 분리된 추가 명령어
+# ─────────────────────────────────────────────────────────────────────────────
+
+ACTIVITY_SHEET_NAME = (os.getenv("ACTIVITY_SHEET_NAME") or "활동").strip()
+ACTIVITY_HEADER = ["src_id", "내용", "글자수", "게시판명", "게시 시간", "게시자"]
+ACTIVITY_SUMMARY_HEADER = ["닉네임", "지급포인트"]
+def _activity_menu_id(env_name: str, default: str) -> str:
+    """활동 게시판 menuId.
+
+    Render 환경변수는 선택사항입니다. 비워두면 아래 기본값을 그대로 사용합니다.
+    - ACTIVITY_MENU_ID_FREE: 자유게시판, 기본 16
+    - ACTIVITY_MENU_ID_CHEER: 응원중계방, 기본 18
+    - ACTIVITY_MENU_ID_TALK: 한풀이 소통방, 기본 30
+    - ACTIVITY_MENU_ID_PANTS: 소리벗고 빤쓰질러, 기본 19
+    """
+    return (os.getenv(env_name) or default).strip()
+
+
+ACTIVITY_MENUS: list[tuple[str, str]] = [
+    (_activity_menu_id("ACTIVITY_MENU_ID_FREE", "16"), "자유게시판"),
+    (_activity_menu_id("ACTIVITY_MENU_ID_CHEER", "18"), "응원중계방"),
+    (_activity_menu_id("ACTIVITY_MENU_ID_TALK", "30"), "한풀이 소통방"),
+    (_activity_menu_id("ACTIVITY_MENU_ID_PANTS", "19"), "소리벗고 빤쓰질러"),
+]
+ACTIVITY_PAGE_SIZE = max(1, min(50, int(os.getenv("ACTIVITY_PAGE_SIZE", "50"))))
+ACTIVITY_MAX_PAGES = max(1, min(100, int(os.getenv("ACTIVITY_MAX_PAGES", "20"))))
+ACTIVITY_CONTENT_MAX_CHARS = max(100, int(os.getenv("ACTIVITY_CONTENT_MAX_CHARS", "3000")))
+ACTIVITY_MIN_CHARS = max(1, int(os.getenv("ACTIVITY_MIN_CHARS", "30")))
+
+
+def _activity_effective_len(text: str) -> int:
+    """활동 보상 판정용 글자수.
+
+    - 띄어쓰기/줄바꿈 제외
+    - 같은 문자가 연속 반복되면 1자로 계산
+      예: 'ㅋㅋㅋㅋ 오늘 좋네요' -> 'ㅋ오늘좋네요'
+    """
+    s = unicodedata.normalize("NFKC", str(text or ""))
+    s = re.sub(r"\s+", "", s)
+    if not s:
+        return 0
+    s = re.sub(r"(.)\1+", r"\1", s)
+    return len(s)
+
+
+def _activity_trim_content(text: str) -> str:
+    s = str(text or "").replace("\r", "\n")
+    lines: list[str] = []
+    prev = None
+    for raw in s.split("\n"):
+        line = re.sub(r"\s+", " ", raw or "").strip()
+        if not line:
+            continue
+        if line == prev:
+            continue
+        lines.append(line)
+        prev = line
+    out = "\n".join(lines).strip()
+    if len(out) > ACTIVITY_CONTENT_MAX_CHARS:
+        out = out[: ACTIVITY_CONTENT_MAX_CHARS - 3].rstrip() + "..."
+    return out
+
+
+def _activity_posted_date(posted_at: str) -> date | None:
+    try:
+        s = str(posted_at or "").strip()[:10]
+        if not s:
+            return None
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def _activity_target_yesterday() -> date:
+    return now_kst().date() - timedelta(days=1)
+
+
+def ensure_activity_header(ws) -> None:
+    """'활동' 시트 헤더를 A1:F1, G1:H1에만 세팅한다."""
+    try:
+        ws.update(range_name="A1:F1", values=[ACTIVITY_HEADER])
+    except Exception:
+        try:
+            ws.update("A1:F1", [ACTIVITY_HEADER])
+        except Exception as e:
+            print(f"[GSHEET][ACTIVITY] A:F 헤더 설정 실패: {e}")
+
+    try:
+        ws.update(range_name="G1:H1", values=[ACTIVITY_SUMMARY_HEADER])
+    except Exception:
+        try:
+            ws.update("G1:H1", [ACTIVITY_SUMMARY_HEADER])
+        except Exception as e:
+            print(f"[GSHEET][ACTIVITY] G:H 헤더 설정 실패: {e}")
+
+
+def get_activity_ws():
+    """활동 워크시트 반환(없으면 생성 + 헤더 세팅)."""
+    client_gs = get_gs_client()
+    spreadsheet_id = os.getenv("SPREADSHEET_ID")
+    if not (client_gs and spreadsheet_id):
+        return None
+
+    try:
+        sh = client_gs.open_by_key(spreadsheet_id)
+        ws = _get_ws_by_name(sh, ACTIVITY_SHEET_NAME)
+        if not ws:
+            ws = sh.add_worksheet(title=ACTIVITY_SHEET_NAME, rows=2000, cols=8)
+        try:
+            ws.resize(cols=max(8, len(ACTIVITY_HEADER) + len(ACTIVITY_SUMMARY_HEADER)))
+        except Exception:
+            pass
+        ensure_activity_header(ws)
+        return ws
+    except Exception as e:
+        print(f"[GSHEET][ACTIVITY] 워크시트 준비 실패: {e}")
+        return None
+
+
+async def _activity_insert_range_top(ws, rows: list[list[str]]) -> None:
+    """A:F 범위만 2행 아래로 밀고 신규 rows를 상단에 입력한다.
+
+    G:H 취합표는 밀리지 않도록 전체 행 삽입 대신 insertRange(A:F)만 사용한다.
+    """
+    if not rows:
+        return
+
+    sheet_id = getattr(ws, "id", None)
+    if sheet_id is None:
+        sheet_id = (getattr(ws, "_properties", {}) or {}).get("sheetId")
+    sheet_id = int(sheet_id)
+
+    sh = getattr(ws, "spreadsheet", None)
+    if sh is None:
+        raise RuntimeError("spreadsheet handle 없음")
+
+    n = len(rows)
+    await _youtoo_gsheet_call_with_backoff(
+        "activity.insert_range",
+        sh.batch_update,
+        {
+            "requests": [
+                {
+                    "insertRange": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": 1,
+                            "endRowIndex": 1 + n,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": len(ACTIVITY_HEADER),
+                        },
+                        "shiftDimension": "ROWS",
+                    }
+                }
+            ]
+        },
+    )
+
+    await _youtoo_gsheet_call_with_backoff(
+        "activity.new_rows.update",
+        ws.update,
+        range_name=f"A2:F{1 + n}",
+        values=rows,
+    )
+
+
+async def upsert_activity_rows_top(rows: list[list[str]]) -> tuple[bool, int, int]:
+    """활동 시트 A:F를 src_id 기준으로 upsert.
+
+    - 신규 글: A:F 범위만 상단에 삽입
+    - 기존 글: A:F만 업데이트
+    - G:H 취합표는 별도 재계산/재작성
+    """
+    if not rows:
+        return True, 0, 0
+
+    ws = get_activity_ws()
+    if not ws:
+        return False, 0, 0
+
+    try:
+        values = ws.get_all_values()
+    except Exception as e:
+        print(f"[GSHEET][ACTIVITY] 기존 값 로딩 실패: {e}")
+        values = []
+
+    existing: dict[str, tuple[int, list[str]]] = {}
+    if values:
+        for row_num, r in enumerate(values[1:], start=2):
+            sid = (r[0].strip() if len(r) > 0 else "")
+            if sid:
+                existing[sid] = (row_num, r[: len(ACTIVITY_HEADER)])
+
+    to_insert: list[list[str]] = []
+    update_data: list[dict] = []
+    updated = 0
+
+    for row in rows:
+        rr = list(row[: len(ACTIVITY_HEADER)])
+        while len(rr) < len(ACTIVITY_HEADER):
+            rr.append("")
+        sid = str(rr[0] or "").strip()
+        if not sid:
+            continue
+
+        if sid in existing:
+            row_num, old = existing[sid]
+            old_fixed = list(old[: len(ACTIVITY_HEADER)])
+            while len(old_fixed) < len(ACTIVITY_HEADER):
+                old_fixed.append("")
+            if old_fixed != rr:
+                update_data.append({"range": f"A{row_num}:F{row_num}", "values": [rr]})
+                updated += 1
+        else:
+            to_insert.append(rr)
+
+    try:
+        if update_data:
+            chunk = max(1, YOUTOO_GSHEET_BATCH_CHUNK)
+            for i in range(0, len(update_data), chunk):
+                await _youtoo_gsheet_call_with_backoff(
+                    "activity.batch_update",
+                    ws.batch_update,
+                    update_data[i:i + chunk],
+                    value_input_option="RAW",
+                )
+
+        if to_insert:
+            await _activity_insert_range_top(ws, to_insert)
+
+        return True, len(to_insert), updated
+    except Exception as e:
+        print(f"[GSHEET][ACTIVITY] upsert 실패: {e}")
+        return False, 0, 0
+
+
+async def rebuild_activity_summary(ws, *, target_day: date) -> int:
+    """G:H 취합표를 target_day 기준으로 재작성한다."""
+    try:
+        values = ws.get_all_values()
+    except Exception as e:
+        print(f"[GSHEET][ACTIVITY] 취합용 값 로딩 실패: {e}")
+        values = []
+
+    nick_boards: dict[str, set[str]] = {}
+    target_prefix = target_day.strftime("%Y-%m-%d")
+
+    for r in values[1:]:
+        try:
+            content_len = int(str(r[2]).strip()) if len(r) > 2 and str(r[2]).strip() else 0
+        except Exception:
+            content_len = 0
+        board_name = (r[3].strip() if len(r) > 3 else "")
+        posted_at = (r[4].strip() if len(r) > 4 else "")
+        nick = (r[5].strip() if len(r) > 5 else "")
+
+        if not nick or not board_name:
+            continue
+        if not posted_at.startswith(target_prefix):
+            continue
+        if content_len < ACTIVITY_MIN_CHARS:
+            continue
+        nick_boards.setdefault(nick, set()).add(board_name)
+
+    summary_rows: list[list[str]] = []
+    for nick, boards in nick_boards.items():
+        cnt = len(boards)
+        if cnt >= 4:
+            summary_rows.append([nick, "2000"])
+        elif cnt == 3:
+            summary_rows.append([nick, "1500"])
+
+    summary_rows.sort(key=lambda r: (-int(r[1]), r[0]))
+
+    try:
+        await _youtoo_gsheet_call_with_backoff(
+            "activity.summary.clear",
+            ws.batch_clear,
+            ["G:H"],
+        )
+    except Exception:
+        pass
+
+    table = [ACTIVITY_SUMMARY_HEADER] + summary_rows
+    await _youtoo_gsheet_call_with_backoff(
+        "activity.summary.update",
+        ws.update,
+        range_name=f"G1:H{len(table)}",
+        values=table,
+    )
+    return len(summary_rows)
+
+
+async def activitycrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/activitycrawl
+
+    자유게시판(16), 응원중계방(18), 한풀이 소통방(30), 소리벗고 빤쓰질러(19)의
+    어제 게시글을 수집해 '활동' 시트에 저장하고 G:H 취합표를 갱신한다.
+    """
+    if not is_admin(update):
+        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+
+    cookie = _get_naver_web_cookie()
+    if not cookie:
+        await update.message.reply_text(
+            "NAVER_COOKIE 환경변수가 비어있습니다.\n"
+            "Render 환경변수에 브라우저 쿠키 문자열을 넣어주세요."
+        )
+        return
+
+    cafe_id = NAVER_CAFE_WEB_CAFE_ID
+    target_day = _activity_target_yesterday()
+    target_label = target_day.strftime("%Y-%m-%d")
+
+    await update.message.reply_text(
+        f"네이버 카페 활동 게시글을 가져옵니다.\n"
+        f"- 대상 날짜: {target_label}\n"
+        f"- 게시판: {len(ACTIVITY_MENUS)}개\n"
+        f"잠시만 기다려 주세요..."
+    )
+
+    ws = get_activity_ws()
+    if not ws:
+        await update.message.reply_text("구글시트(활동 탭) 준비에 실패했습니다. SPREADSHEET_ID/권한을 확인하세요.")
+        return
+
+    rows: list[list[str]] = []
+    seen: set[str] = set()
+    scanned = 0
+    body_fail = 0
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            for menu_id, board_name in ACTIVITY_MENUS:
+                for page in range(1, ACTIVITY_MAX_PAGES + 1):
+                    status, data, snippet = await _fetch_cafe_boardlist_page(
+                        client,
+                        cafe_id=cafe_id,
+                        menu_id=menu_id,
+                        page=page,
+                        page_size=ACTIVITY_PAGE_SIZE,
+                        sort_by=NAVER_CAFE_WEB_SORT_BY,
+                        view_type=NAVER_CAFE_WEB_VIEW_TYPE,
+                    )
+
+                    if status in (401, 403):
+                        await update.message.reply_text(
+                            f"접근이 거부되었습니다. (HTTP {status}, menuId={menu_id})\n"
+                            "쿠키가 만료되었거나 해당 게시판 읽기 권한이 없을 수 있습니다."
+                        )
+                        return
+
+                    if not data:
+                        await update.message.reply_text(
+                            f"게시판 '{board_name}' page={page} 응답 파싱에 실패했습니다.\n"
+                            f"(HTTP {status}) 응답 일부: {snippet}"
+                        )
+                        return
+
+                    result = data.get("result") if isinstance(data, dict) else None
+                    article_list = (result or {}).get("articleList") if isinstance(result, dict) else None
+                    if not isinstance(article_list, list) or not article_list:
+                        break
+
+                    page_dates: list[date] = []
+                    for entry in article_list:
+                        if not isinstance(entry, dict):
+                            continue
+                        item = entry.get("item")
+                        if not isinstance(item, dict):
+                            continue
+
+                        article_id = item.get("articleId")
+                        if not article_id:
+                            continue
+
+                        posted_at = _ms_to_kst_str(item.get("writeDateTimestamp"))
+                        posted_day = _activity_posted_date(posted_at)
+                        if posted_day:
+                            page_dates.append(posted_day)
+
+                        # 어제 글만 수집
+                        if posted_day != target_day:
+                            continue
+
+                        src_id = f"activity:{cafe_id}:{menu_id}:{article_id}"
+                        if src_id in seen:
+                            continue
+                        seen.add(src_id)
+                        scanned += 1
+
+                        writer = item.get("writerInfo") if isinstance(item.get("writerInfo"), dict) else {}
+                        nick = str((writer or {}).get("nickName") or "").strip()
+                        subject = str(item.get("subject") or "").strip()
+
+                        body_text = ""
+                        body_ok = False
+                        try:
+                            body_text, body_ok = await _fetch_article_body_text(
+                                client,
+                                cafe_id=cafe_id,
+                                menu_id=menu_id,
+                                article_id=str(article_id),
+                            )
+                        except Exception as e:
+                            print(f"[ACTIVITY] 본문 추출 실패(article_id={article_id}): {e}")
+                            body_ok = False
+
+                        if not body_ok:
+                            body_fail += 1
+
+                        content = _activity_trim_content(body_text or subject)
+                        char_count = _activity_effective_len(content)
+
+                        rows.append([
+                            src_id,
+                            content,
+                            str(char_count),
+                            board_name,
+                            posted_at,
+                            nick,
+                        ])
+
+                    # TIME 정렬 기준으로 한 페이지가 전부 대상일보다 과거면 이후 페이지는 중단
+                    if page_dates and all(d < target_day for d in page_dates):
+                        break
+
+        rows.sort(key=lambda r: (r[4] or ""), reverse=True)
+        ok, inserted, updated = await upsert_activity_rows_top(rows)
+        if not ok:
+            await update.message.reply_text("구글시트(활동)에 저장하지 못했습니다. 권한/시트 상태를 확인하세요.")
+            return
+
+        summary_count = await rebuild_activity_summary(ws, target_day=target_day)
+
+        await update.message.reply_text(
+            f"✅ 활동 수집 완료\n"
+            f"- 대상 날짜: {target_label}\n"
+            f"- 신규 추가(상단): {inserted}건\n"
+            f"- 기존 업데이트: {updated}건\n"
+            f"- 수집 대상 글: {len(rows)}건\n"
+            f"- 본문 추출 실패(제목 대체): {body_fail}건\n"
+            f"- 취합표 반영: {summary_count}명"
+        )
+
+    except Exception as e:
+        await update.message.reply_text(f"요청 중 오류가 발생했습니다: {e}")
+        return
+
+
+async def activity_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/activity_reset 또는 /activityclean
+
+    '활동' 시트의 수집 데이터(A2:F)와 취합표(G2:H)를 초기화한다.
+    헤더(A1:F1, G1:H1)는 다시 세팅한다.
+    """
+    if not is_admin(update):
+        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+
+    ws = get_activity_ws()
+    if not ws:
+        await update.message.reply_text("구글시트(활동 탭) 준비에 실패했습니다. SPREADSHEET_ID/권한을 확인하세요.")
+        return
+
+    try:
+        # 헤더 1행은 유지하고, 데이터/취합표만 삭제한다.
+        await _youtoo_gsheet_call_with_backoff(
+            "activity.reset.clear",
+            ws.batch_clear,
+            ["A2:H"],
+        )
+        ensure_activity_header(ws)
+        await update.message.reply_text(
+            "✅ 활동 시트 초기화 완료\n"
+            "- A:F 수집 데이터 삭제\n"
+            "- G:H 취합표 삭제\n"
+            "- 헤더는 유지/재세팅 완료"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"활동 시트 초기화 중 오류가 발생했습니다: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Quiz crawl (네이버 카페 퀴즈 이벤트 댓글 수집 → 구글시트 '퀴즈' 탭 적재)
 #  - 기존 기능 영향 최소화를 위해 별도 쿠키/헤더/시트 스키마를 사용한다.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -10393,6 +10879,9 @@ def main():
     app.add_handler(CommandHandler("export_comment_zip", export_comment_zip))
     app.add_handler(CommandHandler("export_comment_zip_buttons", export_comment_zip_buttons))
     app.add_handler(CommandHandler("youtoo", youtoo))  # 네이버 카페 메뉴 글 수집 → youtoo 시트
+    app.add_handler(CommandHandler("activitycrawl", activitycrawl))  # 네이버 카페 4개 활동 게시판 어제 글 수집 → 활동 시트
+    app.add_handler(CommandHandler("activity_reset", activity_reset))  # 활동 시트 초기화
+    app.add_handler(CommandHandler("activityclean", activity_reset))  # 활동 시트 초기화 alias
     app.add_handler(CommandHandler("quizcrawl", quizcrawl))
     app.add_handler(CommandHandler("quiz_reset", quiz_reset))
 
