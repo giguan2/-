@@ -10140,13 +10140,29 @@ QUIZ_GSHEET_BACKOFF_MAX_SEC = float(os.getenv("QUIZ_GSHEET_BACKOFF_MAX_SEC", "35
 QUIZ_COMMENT_MAX_PAGES = int(os.getenv("QUIZ_COMMENT_MAX_PAGES", "200"))
 QUIZ_COMMENT_TIMEOUT_SEC = float(os.getenv("QUIZ_COMMENT_TIMEOUT_SEC", "18"))
 
+# 퀴즈 마감시간 기준
+# - B2:H2에는 시간만 입력한다. 예: 14:00
+# - 기본값 1: 게시글 작성일 다음날 해당 시간까지 댓글 허용
+# - 마감 정각 댓글은 포함, 마감 이후 댓글은 제외
+QUIZ_DEADLINE_DAY_OFFSET = int(os.getenv("QUIZ_DEADLINE_DAY_OFFSET", "1"))
+
 # 퀴즈 지급 정렬뷰 / 포인트 설정
-# - 지급뷰는 /quizcrawl 실행 때마다 W3:Z 영역을 최신 결과로 덮어쓴다.
+# - 지급뷰는 /quizcrawl 실행 때마다 W3:AA 영역을 최신 결과로 덮어쓴다.
 # - B1:H1 정답, B2:H2 마감시간은 건드리지 않는다.
-QUIZ_PAYMENT_VIEW_RANGE = (os.getenv("QUIZ_PAYMENT_VIEW_RANGE") or "W3:Z").strip()
+QUIZ_PAYMENT_VIEW_RANGE = (os.getenv("QUIZ_PAYMENT_VIEW_RANGE") or "W3:AA").strip()
+# 구버전 환경변수(W3:Z)가 남아 있으면 새 지급뷰 5컬럼(W:AA)에 맞춰 자동 확장한다.
+if (QUIZ_PAYMENT_VIEW_RANGE or "").strip().upper() == "W3:Z":
+    QUIZ_PAYMENT_VIEW_RANGE = "W3:AA"
 QUIZ_POINT_1 = int(os.getenv("QUIZ_POINT_1", "30000"))
 QUIZ_POINT_2 = int(os.getenv("QUIZ_POINT_2", "50000"))
 QUIZ_POINT_3 = int(os.getenv("QUIZ_POINT_3", "100000"))
+
+# 지급뷰 닉네임 매칭 DB 설정
+# - 올블랙DB: C열 닉네임, E열 연락처
+# - 벳라이즈DB: B열 닉네임, P열 연락처
+QUIZ_ALLBLACK_DB_SHEET_NAME = (os.getenv("QUIZ_ALLBLACK_DB_SHEET_NAME") or "올블랙DB").strip()
+QUIZ_BETRISE_DB_SHEET_NAME = (os.getenv("QUIZ_BETRISE_DB_SHEET_NAME") or "벳라이즈DB").strip()
+QUIZ_UNMATCHED_BETRISE_NICK = (os.getenv("QUIZ_UNMATCHED_BETRISE_NICK") or "미매칭").strip()
 
 # 요일 컬럼(월~일)
 _QUIZ_DOW_COLS = ["B", "C", "D", "E", "F", "G", "H"]
@@ -10246,6 +10262,120 @@ def _parse_md_arg(s: str) -> tuple[int, int] | None:
     if not (1 <= mm <= 12 and 1 <= dd <= 31):
         return None
     return (mm, dd)
+
+
+def _quiz_ts_ms_to_kst_datetime(ts_ms) -> datetime | None:
+    """댓글 timestamp(ms 또는 sec)를 KST datetime으로 변환."""
+    try:
+        n = int(ts_ms)
+    except Exception:
+        return None
+    if n <= 0:
+        return None
+    sec = (n / 1000.0) if n > 10**11 else float(n)
+    try:
+        return datetime.fromtimestamp(sec, tz=timezone.utc).astimezone(KST)
+    except Exception:
+        return None
+
+
+def _quiz_parse_deadline_time(raw: str) -> tuple[int, int] | None:
+    """B2:H2 마감시간 문자열에서 (hour, minute) 추출.
+
+    지원 예:
+    - 14:00, 14시, 14시 30분
+    - 오후 2:00, 오후 2시, 오전 9시 30분
+    """
+    s = str(raw or "").strip()
+    if not s:
+        return None
+
+    is_pm = bool(re.search(r"오후|PM", s, flags=re.I))
+    is_am = bool(re.search(r"오전|AM", s, flags=re.I))
+
+    m = re.search(r"(\d{1,2})\s*[:：]\s*(\d{1,2})", s)
+    if m:
+        hh = int(m.group(1))
+        mi = int(m.group(2))
+    else:
+        m = re.search(r"(\d{1,2})\s*시(?:\s*(\d{1,2})\s*분?)?", s)
+        if not m:
+            return None
+        hh = int(m.group(1))
+        mi = int(m.group(2) or 0)
+
+    if is_pm and 1 <= hh <= 11:
+        hh += 12
+    if is_am and hh == 12:
+        hh = 0
+
+    if not (0 <= hh <= 23 and 0 <= mi <= 59):
+        return None
+    return hh, mi
+
+
+def _quiz_build_deadline_dt(target_dt: datetime, raw_deadline: str) -> datetime | None:
+    """게시글 기준 날짜 + QUIZ_DEADLINE_DAY_OFFSET + B2:H2 시간으로 마감 datetime 생성.
+
+    원칙:
+    - B2:H2에 시간만 있으면 target_dt 날짜에서 offset일 뒤를 마감일로 사용
+    - 혹시 셀에 날짜까지 포함되어 있으면 그 날짜를 우선 사용
+    - 비교는 comment_dt <= deadline_dt 이면 포함
+    """
+    s = str(raw_deadline or "").strip()
+    hm = _quiz_parse_deadline_time(s)
+    if not hm:
+        return None
+
+    base_date = target_dt.astimezone(KST).date() + timedelta(days=QUIZ_DEADLINE_DAY_OFFSET)
+
+    # 셀에 명시 날짜가 있으면 우선 사용: 2026-05-03 14:00 / 5.3 14:00 등
+    m_full = re.search(r"(20\d{2})\s*[.\-/년]\s*(\d{1,2})\s*[.\-/월]\s*(\d{1,2})", s)
+    if m_full:
+        try:
+            base_date = date(int(m_full.group(1)), int(m_full.group(2)), int(m_full.group(3)))
+        except Exception:
+            pass
+    else:
+        # 시간의 ':' 앞 숫자를 날짜로 오인하지 않도록, 날짜 뒤에 .-/월 이 있는 경우만 인식
+        m_md = re.search(r"(?<!\d)(\d{1,2})\s*[.\-/월]\s*(\d{1,2})(?:\s*일)?", s)
+        if m_md:
+            try:
+                base_date = date(target_dt.year, int(m_md.group(1)), int(m_md.group(2)))
+            except Exception:
+                pass
+
+    hh, mi = hm
+    return datetime(base_date.year, base_date.month, base_date.day, hh, mi, tzinfo=KST)
+
+
+async def _quiz_get_deadline_dt_for_dow(ws, target_dt: datetime, dow: int) -> tuple[datetime | None, str]:
+    """해당 요일의 B2:H2 마감시간을 읽어 deadline_dt를 반환.
+    반환: (deadline_dt_or_none, raw_cell_value)
+    """
+    try:
+        col = _QUIZ_DOW_COLS[int(dow)]
+    except Exception:
+        return None, ""
+
+    try:
+        cell = await _gsheet_call_with_backoff("quiz.deadline.acell", ws.acell, f"{col}2")
+        raw = str(getattr(cell, "value", "") or "").strip()
+    except Exception as e:
+        print(f"[QUIZ] deadline read failed: {e}")
+        return None, ""
+
+    if not raw:
+        return None, ""
+    return _quiz_build_deadline_dt(target_dt, raw), raw
+
+
+def _quiz_deadline_label(deadline_dt: datetime | None, raw_deadline: str) -> str:
+    if deadline_dt:
+        return f"{deadline_dt.strftime('%Y-%m-%d %H:%M')} (셀값: {raw_deadline})"
+    if raw_deadline:
+        return f"마감시간 형식 인식 실패(셀값: {raw_deadline})"
+    return "미입력"
 
 
 async def _http_get_json_with_retry(
@@ -10622,10 +10752,10 @@ def get_quiz_ws():
         sh = client_gs.open_by_key(spreadsheet_id)
         ws = _get_ws_by_name(sh, QUIZ_SHEET_NAME)
         if not ws:
-            ws = sh.add_worksheet(title=QUIZ_SHEET_NAME, rows=2000, cols=25)
-        # 최소 컬럼 확보(L~U 정렬뷰 대비)
+            ws = sh.add_worksheet(title=QUIZ_SHEET_NAME, rows=2000, cols=27)
+        # 최소 컬럼 확보(W~AA 지급뷰 대비)
         try:
-            ws.resize(cols=max(26, 21))
+            ws.resize(cols=max(27, 21))
         except Exception:
             pass
         return ws
@@ -10792,7 +10922,7 @@ def _quiz_points_for_score(score: int) -> int:
 
 
 def _quiz_payment_start_cell() -> str:
-    m = re.match(r"^\s*([A-Z]+[0-9]+)", (QUIZ_PAYMENT_VIEW_RANGE or "W3:Z").upper())
+    m = re.match(r"^\s*([A-Z]+[0-9]+)", (QUIZ_PAYMENT_VIEW_RANGE or "W3:AA").upper())
     return m.group(1) if m else "W3"
 
 
@@ -10927,8 +11057,70 @@ async def _quiz_update_score_columns(ws) -> tuple[int, int]:
     return len(out), winner_cnt
 
 
+def _quiz_db_nick_key(nick: str) -> str:
+    """DB 닉네임 매칭용 key. 공백/제로폭/대소문자 차이를 최소화한다."""
+    s = unicodedata.normalize("NFKC", str(nick or ""))
+    s = s.replace("​", "").replace("‌", "").replace("‍", "").replace("﻿", "")
+    s = re.sub(r"\s+", "", s).strip().casefold()
+    return s
+
+
+def _quiz_db_phone_key(phone: str) -> str:
+    """DB 연락처 매칭용 key. 숫자만 남겨 비교한다."""
+    return re.sub(r"\D+", "", str(phone or ""))
+
+
+async def _quiz_load_betrise_nick_by_allblack_nick() -> dict[str, str]:
+    """올블랙닉네임 → 벳라이즈닉네임 매핑을 생성한다.
+
+    매칭 경로:
+    1) 퀴즈 지급뷰 닉네임 = 올블랙닉네임
+    2) 올블랙DB C열 닉네임에서 찾고, 같은 행 E열 연락처 추출
+    3) 벳라이즈DB P열 연락처와 비교해, 같은 행 B열 닉네임 반환
+    """
+    client_gs = get_gs_client()
+    spreadsheet_id = os.getenv("SPREADSHEET_ID")
+    if not (client_gs and spreadsheet_id):
+        return {}
+
+    try:
+        sh = await _gsheet_call_with_backoff("quiz.db.open", client_gs.open_by_key, spreadsheet_id)
+        ws_allblack = _get_ws_by_name(sh, QUIZ_ALLBLACK_DB_SHEET_NAME)
+        ws_betrise = _get_ws_by_name(sh, QUIZ_BETRISE_DB_SHEET_NAME)
+        if not ws_allblack or not ws_betrise:
+            print(f"[QUIZ][DB] sheet missing: allblack={bool(ws_allblack)} betrise={bool(ws_betrise)}")
+            return {}
+
+        allblack_rows = await _gsheet_call_with_backoff("quiz.db.allblack.get", ws_allblack.get_all_values)
+        betrise_rows = await _gsheet_call_with_backoff("quiz.db.betrise.get", ws_betrise.get_all_values)
+    except Exception as e:
+        print(f"[QUIZ][DB] load failed: {e}")
+        return {}
+
+    # 벳라이즈DB: P열 연락처 -> B열 닉네임
+    phone_to_betrise_nick: dict[str, str] = {}
+    for row in (betrise_rows or [])[1:]:
+        bet_nick = str(row[1] if len(row) > 1 else "").strip()       # B열
+        phone = _quiz_db_phone_key(row[15] if len(row) > 15 else "") # P열
+        if phone and bet_nick and phone not in phone_to_betrise_nick:
+            phone_to_betrise_nick[phone] = bet_nick
+
+    # 올블랙DB: C열 닉네임 -> E열 연락처 -> 벳라이즈닉네임
+    out: dict[str, str] = {}
+    for row in (allblack_rows or [])[1:]:
+        allblack_nick = str(row[2] if len(row) > 2 else "").strip()  # C열
+        phone = _quiz_db_phone_key(row[4] if len(row) > 4 else "")   # E열
+        key = _quiz_db_nick_key(allblack_nick)
+        if not key:
+            continue
+        bet_nick = phone_to_betrise_nick.get(phone, "") if phone else ""
+        out[key] = bet_nick or QUIZ_UNMATCHED_BETRISE_NICK
+
+    return out
+
+
 async def _quiz_update_daily_payment_view(ws, *, dow: int, answer_key: str) -> tuple[int, int]:
-    """W3:Z 지급 정렬뷰를 최신 결과로 덮어쓴다.
+    """W3:AA 지급 정렬뷰를 최신 결과로 덮어쓴다.
 
     반환: (지급대상자 수, 총 지급금액)
     """
@@ -10937,6 +11129,7 @@ async def _quiz_update_daily_payment_view(ws, *, dow: int, answer_key: str) -> t
     answer_key = (answer_key or "").strip()
 
     payment_rows: list[list[str | int]] = []
+    betrise_by_allblack = await _quiz_load_betrise_nick_by_allblack_nick()
     if answer_key:
         rows = await _quiz_read_rows_a_to_h(ws)
         for row in rows:
@@ -10950,11 +11143,12 @@ async def _quiz_update_daily_payment_view(ws, *, dow: int, answer_key: str) -> t
             points = _quiz_points_for_score(score)
             if points <= 0:
                 continue
-            payment_rows.append([nick, day_label, score, points])
+            betrise_nick = betrise_by_allblack.get(_quiz_db_nick_key(nick), QUIZ_UNMATCHED_BETRISE_NICK)
+            payment_rows.append([nick, betrise_nick, day_label, score, points])
 
-    payment_rows.sort(key=lambda r: (-int(r[3]), str(r[0])))
+    payment_rows.sort(key=lambda r: (-int(r[4]), str(r[0])))
 
-    header = [["닉네임", "요일", "정답수", "지급금액"]]
+    header = [["올블랙닉네임", "벳라이즈닉네임", "요일", "정답수", "지급금액"]]
     values = header + payment_rows
 
     # 지급뷰는 누적하지 않고 매번 고정 영역을 덮어쓴다.
@@ -10968,7 +11162,7 @@ async def _quiz_update_daily_payment_view(ws, *, dow: int, answer_key: str) -> t
     except TypeError:
         await _gsheet_call_with_backoff("quiz.payment.update_legacy", ws.update, _quiz_payment_start_cell(), values)
 
-    total_points = sum(int(r[3]) for r in payment_rows)
+    total_points = sum(int(r[4]) for r in payment_rows)
     return len(payment_rows), total_points
 
 
@@ -11024,6 +11218,8 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ws:
         await update.message.reply_text("구글시트(퀴즈 탭) 준비에 실패했습니다. SPREADSHEET_ID/권한을 확인하세요.")
         return
+
+    deadline_dt, deadline_raw = await _quiz_get_deadline_dt_for_dow(ws, target_dt, dow)
 
     # 네이버 쿠키
     cookie = _get_naver_quiz_cookie()
@@ -11134,10 +11330,24 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 3) 댓글 → (닉네임, 답안) 추출 + 중복 제거(첫 답안만)
     # 작성시간 오름차순
     parsed = []
+    deadline_excluded = 0
+    deadline_unknown_ts = 0
     for it in items:
         nick, text, ts = _extract_comment_nick_and_text(it)
         if not nick or not text:
             continue
+
+        # B2:H2 마감시간 기준 필터
+        # - 기본: 게시글 작성일 다음날(QUIZ_DEADLINE_DAY_OFFSET=1) 해당 시간
+        # - 마감 정각 댓글은 포함, 마감 이후 댓글은 제외
+        if deadline_dt:
+            cdt = _quiz_ts_ms_to_kst_datetime(ts)
+            if cdt is None:
+                deadline_unknown_ts += 1
+            elif cdt > deadline_dt:
+                deadline_excluded += 1
+                continue
+
         parsed.append((ts, nick, text))
 
     parsed.sort(key=lambda x: (x[0], x[1]))
@@ -11227,7 +11437,7 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"구글시트 반영 중 오류가 발생했습니다: {e}")
         return
 
-    # 5) 해당 요일 정답(B1:H1) 기준 지급 정렬뷰(W3:Z) 생성
+    # 5) 해당 요일 정답(B1:H1) 기준 지급 정렬뷰(W3:AA) 생성
     answer_key_raw = await _quiz_get_answer_key_for_dow(ws, dow)
     answer_key_parts = _quiz_split_slash_answer(answer_key_raw)
     answer_key_display = _quiz_format_answer(answer_key_parts) if answer_key_parts else (answer_key_raw or "")
@@ -11256,7 +11466,9 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ /quizcrawl 완료 ({mm}.{dd:02d} / {['월','화','수','목','금','토','일'][dow]})\n"
         f"- 게시글: {found_subject or '(제목없음)'}\n"
         f"- URL: {article_url}\n"
-        f"- 댓글(텍스트 파싱 대상): {total_fetched}개\n"
+        f"- 마감 기준: {_quiz_deadline_label(deadline_dt, deadline_raw)}\n"
+        f"- 마감 이후 제외: {deadline_excluded}개 / 시간정보 없음 포함: {deadline_unknown_ts}개\n"
+        f"- 댓글(마감 필터 후 텍스트 파싱 대상): {total_fetched}개\n"
         f"- / 형식 답안 댓글: {valid_ans}개\n"
         f"- 중복 닉네임 스킵: {dup_skip}개\n"
         f"- 답안 형식 불일치 무시: {no_ans}개\n"
@@ -11264,7 +11476,7 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- 기존값 있어 스킵: {skipped_already}명\n"
         f"- 반영 컬럼: {day_col}(월~일 제출답)\n"
         f"- 해당 요일 정답(B1:H1): {answer_key_display or '(정답 미입력/형식 불일치)'}\n"
-        f"- 지급 정렬뷰(W3:Z): {payment_cnt}명 / 총 {total_payment:,}원"
+        f"- 지급 정렬뷰(W3:AA): {payment_cnt}명 / 총 {total_payment:,}원"
     )
     await update.message.reply_text(summary)
 
@@ -11338,6 +11550,8 @@ async def quizcrawl_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("구글시트(퀴즈 탭) 준비에 실패했습니다. SPREADSHEET_ID/권한을 확인하세요.")
         return
 
+    deadline_dt, deadline_raw = await _quiz_get_deadline_dt_for_dow(ws, target_dt, dow)
+
     cookie = _get_naver_quiz_cookie()
     if not cookie:
         await update.message.reply_text(
@@ -11376,10 +11590,24 @@ async def quizcrawl_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 댓글 → (닉네임, 답안) 추출 + 중복 제거(첫 답안만)
     parsed = []
+    deadline_excluded = 0
+    deadline_unknown_ts = 0
     for it in items:
         nick, text, ts = _extract_comment_nick_and_text(it)
         if not nick or not text:
             continue
+
+        # B2:H2 마감시간 기준 필터
+        # - 기본: 게시글 작성일 다음날(QUIZ_DEADLINE_DAY_OFFSET=1) 해당 시간
+        # - 마감 정각 댓글은 포함, 마감 이후 댓글은 제외
+        if deadline_dt:
+            cdt = _quiz_ts_ms_to_kst_datetime(ts)
+            if cdt is None:
+                deadline_unknown_ts += 1
+            elif cdt > deadline_dt:
+                deadline_excluded += 1
+                continue
+
         parsed.append((ts, nick, text))
 
     parsed.sort(key=lambda x: (x[0], x[1]))
@@ -11457,7 +11685,7 @@ async def quizcrawl_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"구글시트 반영 중 오류가 발생했습니다: {e}")
         return
 
-    # 해당 요일 정답(B1:H1) 기준 지급 정렬뷰(W3:Z) 생성
+    # 해당 요일 정답(B1:H1) 기준 지급 정렬뷰(W3:AA) 생성
     answer_key_raw = await _quiz_get_answer_key_for_dow(ws, dow)
     answer_key_parts = _quiz_split_slash_answer(answer_key_raw)
     answer_key_display = _quiz_format_answer(answer_key_parts) if answer_key_parts else (answer_key_raw or "")
@@ -11483,7 +11711,9 @@ async def quizcrawl_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
     summary = (
         f"✅ /quizcrawl_article 완료 (articleId={article_id} / {mm}.{dd:02d} / {day_label})\n"
         f"- URL: {article_url}\n"
-        f"- 댓글(텍스트 파싱 대상): {total_fetched}개\n"
+        f"- 마감 기준: {_quiz_deadline_label(deadline_dt, deadline_raw)}\n"
+        f"- 마감 이후 제외: {deadline_excluded}개 / 시간정보 없음 포함: {deadline_unknown_ts}개\n"
+        f"- 댓글(마감 필터 후 텍스트 파싱 대상): {total_fetched}개\n"
         f"- / 형식 답안 댓글: {valid_ans}개\n"
         f"- 중복 닉네임 스킵: {dup_skip}개\n"
         f"- 답안 형식 불일치 무시: {no_ans}개\n"
@@ -11491,7 +11721,7 @@ async def quizcrawl_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- 기존값 있어 스킵: {skipped_already}명\n"
         f"- 반영 컬럼: {day_col}(월~일 제출답)\n"
         f"- 해당 요일 정답(B1:H1): {answer_key_display or '(정답 미입력/형식 불일치)'}\n"
-        f"- 지급 정렬뷰(W3:Z): {payment_cnt}명 / 총 {total_payment:,}원"
+        f"- 지급 정렬뷰(W3:AA): {payment_cnt}명 / 총 {total_payment:,}원"
     )
     await update.message.reply_text(summary)
 
@@ -11519,10 +11749,10 @@ async def quiz_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "quiz_reset.payment_header",
                 ws.update,
                 range_name=_quiz_payment_start_cell(),
-                values=[["닉네임", "요일", "정답수", "지급금액"]],
+                values=[["올블랙닉네임", "벳라이즈닉네임", "요일", "정답수", "지급금액"]],
             )
         except TypeError:
-            await _gsheet_call_with_backoff("quiz_reset.payment_header_legacy", ws.update, _quiz_payment_start_cell(), [["닉네임", "요일", "정답수", "지급금액"]])
+            await _gsheet_call_with_backoff("quiz_reset.payment_header_legacy", ws.update, _quiz_payment_start_cell(), [["올블랙닉네임", "벳라이즈닉네임", "요일", "정답수", "지급금액"]])
         await update.message.reply_text(f"✅ 퀴즈 데이터 초기화 완료: {rng} / 지급뷰 {QUIZ_PAYMENT_VIEW_RANGE}")
     except Exception as e:
         await update.message.reply_text(f"초기화 중 오류가 발생했습니다: {e}")
