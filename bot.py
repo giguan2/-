@@ -10797,14 +10797,134 @@ def _quiz_payment_start_cell() -> str:
 
 
 async def _quiz_get_answer_key_for_dow(ws, dow: int) -> str:
-    """B1:H1 중 해당 요일 정답을 읽는다. B2:H2 마감시간은 건드리지 않는다."""
+    """B1:H1 중 해당 요일 정답을 읽는다. B2:H2 마감시간은 건드리지 않는다.
+
+    gspread/Sheets API는 범위 앞쪽이 비어 있으면 반환 배열 길이가 짧아지는 경우가 있어,
+    해당 요일 셀(B1~H1)을 직접 읽는 방식을 우선 사용한다.
+    """
+    if not (0 <= int(dow) <= 6):
+        return ""
+    col = _QUIZ_DOW_COLS[int(dow)]
+
+    # 1) 가장 안전한 방법: 해당 요일 정답 셀 직접 읽기
     try:
-        vals = await _gsheet_call_with_backoff("quiz.answer_key.get", ws.get, "B1:H1")
-        if vals and isinstance(vals, list) and vals[0] and len(vals[0]) > dow:
-            return str(vals[0][dow] or "").strip()
+        cell = await _gsheet_call_with_backoff("quiz.answer_key.acell", ws.acell, f"{col}1")
+        val = getattr(cell, "value", "")
+        if val is not None:
+            return str(val or "").strip()
     except Exception as e:
-        print(f"[QUIZ] answer key read failed: {e}")
+        print(f"[QUIZ] answer key acell read failed: {e}")
+
+    # 2) 폴백: row_values는 중간 빈 칸을 보존하는 경우가 많아 한 번 더 시도
+    try:
+        row = await _gsheet_call_with_backoff("quiz.answer_key.row_values", ws.row_values, 1)
+        idx = 1 + int(dow)  # A=0, B=1 ... H=7
+        if isinstance(row, list) and len(row) > idx:
+            return str(row[idx] or "").strip()
+    except Exception as e:
+        print(f"[QUIZ] answer key row read failed: {e}")
+
     return ""
+
+
+def _quiz_pad_row(row: list, n: int) -> list[str]:
+    """Sheets에서 읽은 행을 n칸까지 빈 문자열로 패딩한다."""
+    out = [str(x or "").strip() for x in (row or [])]
+    if len(out) < n:
+        out.extend([""] * (n - len(out)))
+    return out[:n]
+
+
+async def _quiz_get_answer_keys_all(ws) -> list[str]:
+    """B1:H1 전체 정답을 안전하게 읽는다. 빈 칸은 빈 문자열."""
+    answers = [""] * 7
+
+    # row_values 우선: A열 포함해서 읽은 뒤 B~H 매핑
+    try:
+        row = await _gsheet_call_with_backoff("quiz.answer_keys.row_values", ws.row_values, 1)
+        row = _quiz_pad_row(row if isinstance(row, list) else [], 8)
+        for i in range(7):
+            answers[i] = str(row[1 + i] or "").strip()
+    except Exception as e:
+        print(f"[QUIZ] answer keys row read failed: {e}")
+
+    # 비어 있는 칸은 acell로 개별 보강
+    for i, col in enumerate(_QUIZ_DOW_COLS):
+        if answers[i]:
+            continue
+        try:
+            cell = await _gsheet_call_with_backoff("quiz.answer_keys.acell", ws.acell, f"{col}1")
+            answers[i] = str(getattr(cell, "value", "") or "").strip()
+        except Exception:
+            pass
+
+    return answers
+
+
+async def _quiz_read_rows_a_to_h(ws) -> list[list[str]]:
+    """퀴즈 데이터 A4:H를 읽는다. 중간 빈 칸이 있어도 항상 8칸으로 패딩한다."""
+    try:
+        vals = await _gsheet_call_with_backoff("quiz.rows.get_all_values", ws.get_all_values)
+    except Exception as e:
+        print(f"[QUIZ] rows get_all_values failed: {e}")
+        try:
+            vals = await _gsheet_call_with_backoff("quiz.rows.get_range", ws.get, "A4:H")
+        except Exception as e2:
+            print(f"[QUIZ] rows range read failed: {e2}")
+            vals = []
+
+    # get_all_values면 0-based row 4는 index 3부터, ws.get('A4:H')면 이미 data-only일 수 있음
+    rows_src = vals[3:] if vals and len(vals) >= 4 and any(str(x or "").strip() for x in vals[0]) else (vals or [])
+    rows: list[list[str]] = []
+    for row in rows_src:
+        rr = _quiz_pad_row(row if isinstance(row, list) else [], 8)
+        if not any(rr):
+            continue
+        rows.append(rr)
+    return rows
+
+
+async def _quiz_update_score_columns(ws) -> tuple[int, int]:
+    """I:J 영역을 / 기준 채점 결과로 갱신한다.
+
+    - I열: B~H 요일별 정답 수 합계
+    - J열: 정답자 여부(Y/공백)
+    - B1:H1 정답칸과 A4:H 제출 영역만 읽고 계산한다.
+    """
+    answers = await _quiz_get_answer_keys_all(ws)
+    rows = await _quiz_read_rows_a_to_h(ws)
+
+    out: list[list[str | int]] = []
+    for row in rows:
+        nick = str(row[0] or "").strip()
+        if not nick:
+            continue
+        total = 0
+        for dow, answer in enumerate(answers):
+            if not answer:
+                continue
+            submitted = str(row[1 + dow] or "").strip()
+            if not submitted:
+                continue
+            total += _quiz_score_slash_answer(submitted, answer)
+        out.append([total, "Y" if total > 0 else ""])
+
+    # 기존 I:J 잔여값이 남지 않도록 충분히 지운 뒤 현재 데이터 수만큼 다시 쓴다.
+    try:
+        last = int(getattr(ws, "row_count", 2000) or 2000)
+        last = max(4, last)
+        await _gsheet_call_with_backoff("quiz.score_cols.clear", ws.batch_clear, [f"I4:J{last}"])
+    except Exception as e:
+        print(f"[QUIZ] score cols clear failed: {e}")
+
+    if out:
+        try:
+            await _gsheet_call_with_backoff("quiz.score_cols.update", ws.update, range_name="I4", values=out)
+        except TypeError:
+            await _gsheet_call_with_backoff("quiz.score_cols.update_legacy", ws.update, "I4", out)
+
+    winner_cnt = sum(1 for r in out if len(r) > 1 and str(r[1]).strip())
+    return len(out), winner_cnt
 
 
 async def _quiz_update_daily_payment_view(ws, *, dow: int, answer_key: str) -> tuple[int, int]:
@@ -10818,16 +10938,9 @@ async def _quiz_update_daily_payment_view(ws, *, dow: int, answer_key: str) -> t
 
     payment_rows: list[list[str | int]] = []
     if answer_key:
-        try:
-            vals = await _gsheet_call_with_backoff("quiz.payment.read_rows", ws.get, "A4:H")
-        except Exception as e:
-            print(f"[QUIZ] payment rows read failed: {e}")
-            vals = []
-
-        for row in (vals or []):
-            if not row:
-                continue
-            nick = str(row[0] if len(row) > 0 else "").strip()
+        rows = await _quiz_read_rows_a_to_h(ws)
+        for row in rows:
+            nick = str(row[0] or "").strip()
             if not nick:
                 continue
             submitted = str(row[1 + dow] if len(row) > (1 + dow) else "").strip()
@@ -11118,6 +11231,11 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     answer_key_raw = await _quiz_get_answer_key_for_dow(ws, dow)
     answer_key_parts = _quiz_split_slash_answer(answer_key_raw)
     answer_key_display = _quiz_format_answer(answer_key_parts) if answer_key_parts else (answer_key_raw or "")
+    try:
+        await _quiz_update_score_columns(ws)
+    except Exception as e:
+        print(f"[QUIZ] score columns update failed: {e}")
+
     payment_cnt = 0
     total_payment = 0
     if answer_key_parts:
@@ -11343,6 +11461,11 @@ async def quizcrawl_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
     answer_key_raw = await _quiz_get_answer_key_for_dow(ws, dow)
     answer_key_parts = _quiz_split_slash_answer(answer_key_raw)
     answer_key_display = _quiz_format_answer(answer_key_parts) if answer_key_parts else (answer_key_raw or "")
+    try:
+        await _quiz_update_score_columns(ws)
+    except Exception as e:
+        print(f"[QUIZ] score columns update failed: {e}")
+
     payment_cnt = 0
     total_payment = 0
     if answer_key_parts:
@@ -11390,7 +11513,7 @@ async def quiz_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         last = int(getattr(ws, "row_count", 2000) or 2000)
         last = max(4, last)
         rng = f"A4:H{last}"
-        await _gsheet_call_with_backoff("quiz_reset.batch_clear", ws.batch_clear, [rng, QUIZ_PAYMENT_VIEW_RANGE])
+        await _gsheet_call_with_backoff("quiz_reset.batch_clear", ws.batch_clear, [rng, "I4:J", QUIZ_PAYMENT_VIEW_RANGE])
         try:
             await _gsheet_call_with_backoff(
                 "quiz_reset.payment_header",
