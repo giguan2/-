@@ -11151,6 +11151,228 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(summary)
 
 
+async def quizcrawl_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/quizcrawl_article ARTICLE_ID [M.DD] : 특정 articleId 1개의 댓글만 수집해 '퀴즈' 시트에 반영.
+
+    - 날짜 인자를 생략하면 오늘(KST) 요일 컬럼에 반영
+    - 날짜 인자를 넣으면 해당 날짜의 요일 컬럼에 반영
+      예) /quizcrawl_article 31175
+          /quizcrawl_article 31175 5.2
+    """
+    if not is_admin(update):
+        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+
+    args = getattr(context, "args", None) or []
+    if not args:
+        await update.message.reply_text("사용법: /quizcrawl_article ARTICLE_ID [M.DD]\n예) /quizcrawl_article 31175\n예) /quizcrawl_article 31175 5.2")
+        return
+
+    raw_article = (args[0] or "").strip()
+    m_article = re.search(r"(?:articleid=|articleId=)?(\d{3,})", raw_article)
+    if not m_article:
+        await update.message.reply_text("articleId 형식이 올바르지 않습니다. 예) /quizcrawl_article 31175")
+        return
+    article_id = m_article.group(1)
+
+    # 날짜 인자가 있으면 그 날짜의 요일 컬럼에 반영, 없으면 오늘(KST) 기준.
+    if len(args) >= 2:
+        md = _parse_md_arg(args[1])
+        if not md:
+            await update.message.reply_text("날짜 형식이 올바르지 않습니다. 예) /quizcrawl_article 31175 5.2")
+            return
+        mm, dd = md
+        year = now_kst().year
+        try:
+            target_dt = datetime(year, mm, dd, tzinfo=KST)
+        except Exception:
+            await update.message.reply_text("존재하지 않는 날짜입니다. (예: 2.30 같은 입력)")
+            return
+    else:
+        target_dt = now_kst()
+        mm, dd = target_dt.month, target_dt.day
+
+    dow = target_dt.weekday()  # Mon=0..Sun=6
+    if not (0 <= dow <= 6):
+        await update.message.reply_text("요일 계산에 실패했습니다.")
+        return
+    day_col = _QUIZ_DOW_COLS[dow]
+    day_label = ['월','화','수','목','금','토','일'][dow]
+
+    # 중복 실행 방지(같은 메시지 재전송 방어)
+    try:
+        chat_id = int(update.effective_chat.id) if update.effective_chat else 0
+        msg_id = int(update.message.message_id) if update.message else 0
+        key = (chat_id, msg_id, f"quizcrawl_article:{article_id}:{mm}.{dd}")
+        now_ts = time.time()
+        async with _QUIZ_RECENT_REQ_LOCK:
+            for k in list(_QUIZ_RECENT_REQ.keys()):
+                if (now_ts - _QUIZ_RECENT_REQ[k]) > QUIZ_REQ_DEDUP_TTL_SEC:
+                    _QUIZ_RECENT_REQ.pop(k, None)
+            if key in _QUIZ_RECENT_REQ:
+                return
+            _QUIZ_RECENT_REQ[key] = now_ts
+    except Exception:
+        pass
+
+    ws = get_quiz_ws()
+    if not ws:
+        await update.message.reply_text("구글시트(퀴즈 탭) 준비에 실패했습니다. SPREADSHEET_ID/권한을 확인하세요.")
+        return
+
+    cookie = _get_naver_quiz_cookie()
+    if not cookie:
+        await update.message.reply_text(
+            "NAVER_QUIZ_COOKIE(또는 기존 NAVER_COOKIE)가 비어있습니다.\n"
+            "브라우저에서 로그인 후 쿠키를 Render 환경변수에 넣어주세요."
+        )
+        return
+
+    cafe_id = QUIZ_CAFE_ID
+    menu_id = QUIZ_MENU_ID
+    article_url = f"https://cafe.naver.com/ArticleRead.nhn?clubid={cafe_id}&articleid={article_id}"
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            st_c, items, err = await _fetch_all_comments_for_article(
+                client,
+                cafe_id=cafe_id,
+                menu_id=menu_id,
+                article_id=article_id,
+            )
+
+            if st_c in (401, 403):
+                await update.message.reply_text(
+                    f"댓글 접근이 거부되었습니다. (HTTP {st_c})\n"
+                    "쿠키가 만료되었거나 댓글 읽기 권한이 없는 계정일 수 있습니다.\n"
+                    "NAVER_QUIZ_COOKIE를 갱신해 주세요."
+                )
+                return
+
+            if st_c != 200 and not items:
+                await update.message.reply_text(f"댓글 수집 실패 (HTTP {st_c})\n{err}")
+                return
+    except Exception as e:
+        await update.message.reply_text(f"요청 중 오류가 발생했습니다: {e}")
+        return
+
+    # 댓글 → (닉네임, 답안) 추출 + 중복 제거(첫 답안만)
+    parsed = []
+    for it in items:
+        nick, text, ts = _extract_comment_nick_and_text(it)
+        if not nick or not text:
+            continue
+        parsed.append((ts, nick, text))
+
+    parsed.sort(key=lambda x: (x[0], x[1]))
+
+    total_fetched = len(parsed)
+    valid_ans = 0
+    dup_skip = 0
+    no_ans = 0
+
+    seen_nick: set[str] = set()
+    nick_to_ans: dict[str, str] = {}
+
+    for ts, nick, text in parsed:
+        parts = _quiz_split_slash_answer(text)
+        if not parts:
+            no_ans += 1
+            continue
+        ans = _quiz_format_answer(parts)
+        valid_ans += 1
+        if nick in seen_nick:
+            dup_skip += 1
+            continue
+        seen_nick.add(nick)
+        nick_to_ans[nick] = ans
+
+    # 시트 upsert (해당 요일 컬럼만)
+    try:
+        existing_nicks_raw = ws.get("A4:A")
+        existing_nicks = []
+        for r in (existing_nicks_raw or []):
+            if not r:
+                continue
+            v = str(r[0]).strip()
+            if v:
+                existing_nicks.append(v)
+
+        nick_to_row = {nick: 4 + i for i, nick in enumerate(existing_nicks)}
+        last_existing = 3 + len(existing_nicks)
+
+        day_vals_raw = ws.get(f"{day_col}4:{day_col}{max(4, last_existing)}")
+        day_vals = []
+        for r in (day_vals_raw or []):
+            day_vals.append(str(r[0]).strip() if r else "")
+        if len(day_vals) < len(existing_nicks):
+            day_vals.extend([""] * (len(existing_nicks) - len(day_vals)))
+
+        updates = []
+        new_rows = []
+        skipped_already = 0
+
+        for nick, ans in nick_to_ans.items():
+            if nick in nick_to_row:
+                row_num = nick_to_row[nick]
+                idx0 = row_num - 4
+                cur = day_vals[idx0] if (0 <= idx0 < len(day_vals)) else ""
+                if cur:
+                    skipped_already += 1
+                    continue
+                updates.append({"range": f"{day_col}{row_num}", "values": [[ans]]})
+            else:
+                row = [""] * 8
+                row[0] = nick
+                row[1 + dow] = ans
+                new_rows.append(row)
+
+        if updates:
+            await _gsheet_call_with_backoff("quiz_article_upsert.batch_update", ws.batch_update, updates, value_input_option="RAW")
+        if new_rows:
+            await _gsheet_call_with_backoff("quiz_article_upsert.append_rows", ws.append_rows, new_rows, value_input_option="RAW", table_range="A4")
+
+        updated_cnt = len(updates)
+        inserted_cnt = len(new_rows)
+
+    except Exception as e:
+        await update.message.reply_text(f"구글시트 반영 중 오류가 발생했습니다: {e}")
+        return
+
+    # 해당 요일 정답(B1:H1) 기준 지급 정렬뷰(W3:Z) 생성
+    answer_key_raw = await _quiz_get_answer_key_for_dow(ws, dow)
+    answer_key_parts = _quiz_split_slash_answer(answer_key_raw)
+    answer_key_display = _quiz_format_answer(answer_key_parts) if answer_key_parts else (answer_key_raw or "")
+    payment_cnt = 0
+    total_payment = 0
+    if answer_key_parts:
+        try:
+            payment_cnt, total_payment = await _quiz_update_daily_payment_view(ws, dow=dow, answer_key=answer_key_raw)
+        except Exception as e:
+            await update.message.reply_text(f"지급 정렬뷰 생성 중 오류가 발생했습니다: {e}")
+            return
+    else:
+        try:
+            await _quiz_update_daily_payment_view(ws, dow=dow, answer_key="")
+        except Exception:
+            pass
+
+    summary = (
+        f"✅ /quizcrawl_article 완료 (articleId={article_id} / {mm}.{dd:02d} / {day_label})\n"
+        f"- URL: {article_url}\n"
+        f"- 댓글(텍스트 파싱 대상): {total_fetched}개\n"
+        f"- / 형식 답안 댓글: {valid_ans}개\n"
+        f"- 중복 닉네임 스킵: {dup_skip}개\n"
+        f"- 답안 형식 불일치 무시: {no_ans}개\n"
+        f"- 시트 반영: 신규 {inserted_cnt}명 / 업데이트 {updated_cnt}명\n"
+        f"- 기존값 있어 스킵: {skipped_already}명\n"
+        f"- 반영 컬럼: {day_col}(월~일 제출답)\n"
+        f"- 해당 요일 정답(B1:H1): {answer_key_display or '(정답 미입력/형식 불일치)'}\n"
+        f"- 지급 정렬뷰(W3:Z): {payment_cnt}명 / 총 {total_payment:,}원"
+    )
+    await update.message.reply_text(summary)
+
+
 async def quiz_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/quiz_reset : '퀴즈' 탭의 닉네임(A열) + 제출답(B~H) 데이터를 초기화."""
     if not is_admin(update):
@@ -11217,6 +11439,7 @@ def main():
     app.add_handler(CommandHandler("activity_reset", activity_reset))  # 활동 시트 초기화
     app.add_handler(CommandHandler("activityclean", activity_reset))  # 활동 시트 초기화 alias
     app.add_handler(CommandHandler("quizcrawl", quizcrawl))
+    app.add_handler(CommandHandler("quizcrawl_article", quizcrawl_article))
     app.add_handler(CommandHandler("quiz_reset", quiz_reset))
 
     # 네이버 카페 자동 글쓰기(종목별 게시판)  ※ /cafe_soccer [tomorrow] 처럼 사용
