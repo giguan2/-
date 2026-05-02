@@ -10140,6 +10140,14 @@ QUIZ_GSHEET_BACKOFF_MAX_SEC = float(os.getenv("QUIZ_GSHEET_BACKOFF_MAX_SEC", "35
 QUIZ_COMMENT_MAX_PAGES = int(os.getenv("QUIZ_COMMENT_MAX_PAGES", "200"))
 QUIZ_COMMENT_TIMEOUT_SEC = float(os.getenv("QUIZ_COMMENT_TIMEOUT_SEC", "18"))
 
+# 퀴즈 지급 정렬뷰 / 포인트 설정
+# - 지급뷰는 /quizcrawl 실행 때마다 W3:Z 영역을 최신 결과로 덮어쓴다.
+# - B1:H1 정답, B2:H2 마감시간은 건드리지 않는다.
+QUIZ_PAYMENT_VIEW_RANGE = (os.getenv("QUIZ_PAYMENT_VIEW_RANGE") or "W3:Z").strip()
+QUIZ_POINT_1 = int(os.getenv("QUIZ_POINT_1", "30000"))
+QUIZ_POINT_2 = int(os.getenv("QUIZ_POINT_2", "50000"))
+QUIZ_POINT_3 = int(os.getenv("QUIZ_POINT_3", "100000"))
+
 # 요일 컬럼(월~일)
 _QUIZ_DOW_COLS = ["B", "C", "D", "E", "F", "G", "H"]
 
@@ -10617,7 +10625,7 @@ def get_quiz_ws():
             ws = sh.add_worksheet(title=QUIZ_SHEET_NAME, rows=2000, cols=25)
         # 최소 컬럼 확보(L~U 정렬뷰 대비)
         try:
-            ws.resize(cols=max(25, 21))
+            ws.resize(cols=max(26, 21))
         except Exception:
             pass
         return ws
@@ -10635,6 +10643,221 @@ async def _ensure_quiz_schema(ws) -> None:
     필요하면 구글시트에서 직접 수식/헤더/정렬뷰를 작성하세요.
     """
     return
+
+
+def _quiz_alias_pairs() -> dict[str, str]:
+    """퀴즈 답안 비교용 동의어 매핑.
+
+    기본값은 KBO 팀명 표기 차이를 흡수한다.
+    추가/수정이 필요하면 Render 환경변수 QUIZ_ANSWER_ALIASES_JSON에 아래 형태로 넣을 수 있다.
+    예: {"KT":["케이티","케이티위즈"],"KIA":["기아","기아타이거즈"]}
+    """
+    default = {
+        "KT": ["KT", "kt", "케이티", "케티", "KT위즈", "케이티위즈"],
+        "KIA": ["KIA", "kia", "기아", "KIA타이거즈", "기아타이거즈"],
+        "LG": ["LG", "lg", "엘지", "LG트윈스", "엘지트윈스"],
+        "SSG": ["SSG", "ssg", "쓱", "SSG랜더스", "쓱랜더스"],
+        "NC": ["NC", "nc", "엔씨", "NC다이노스", "엔씨다이노스"],
+        "삼성": ["삼성", "SAMSUNG", "samsung", "삼성라이온즈", "라이온즈"],
+        "한화": ["한화", "HANWHA", "hanwha", "한화이글스", "이글스"],
+        "롯데": ["롯데", "LOTTE", "lotte", "롯데자이언츠", "자이언츠"],
+        "두산": ["두산", "DOOSAN", "doosan", "두산베어스", "베어스"],
+        "키움": ["키움", "KIWOOM", "kiwoom", "키움히어로즈", "히어로즈"],
+    }
+
+    raw = (os.getenv("QUIZ_ANSWER_ALIASES_JSON") or "").strip()
+    if raw:
+        try:
+            custom = json.loads(raw)
+            if isinstance(custom, dict):
+                for canonical, aliases in custom.items():
+                    c = str(canonical or "").strip()
+                    if not c:
+                        continue
+                    if isinstance(aliases, str):
+                        aliases = [aliases]
+                    if isinstance(aliases, list):
+                        default.setdefault(c, [])
+                        default[c].extend([str(x) for x in aliases if str(x or "").strip()])
+        except Exception as e:
+            print(f"[QUIZ] QUIZ_ANSWER_ALIASES_JSON parse failed: {e}")
+
+    mp: dict[str, str] = {}
+    for canonical, aliases in default.items():
+        can = str(canonical or "").strip()
+        if not can:
+            continue
+        mp[_quiz_answer_key(can)] = can
+        for a in aliases:
+            k = _quiz_answer_key(a)
+            if k:
+                mp[k] = can
+    return mp
+
+
+def _quiz_text_clean(s: str) -> str:
+    """퀴즈 답안 문자열 기본 정리: 제로폭/HTML 공백/연속 공백 정리."""
+    t = unicodedata.normalize("NFKC", str(s or ""))
+    t = t.replace("\u200b", "").replace("\u200c", "").replace("\u200d", "").replace("\ufeff", "")
+    t = t.replace("\xa0", " ").replace("&nbsp;", " ")
+    t = re.sub(r"[\r\n\t]+", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def _quiz_answer_key(s: str) -> str:
+    """비교용 key: 공백/특수문자 제거 + 영문 대문자화."""
+    t = _quiz_text_clean(s).upper()
+    t = re.sub(r"\s+", "", t)
+    t = re.sub(r"[^0-9A-Z가-힣]", "", t)
+    return t
+
+
+def _quiz_normalize_answer_part(part: str) -> str:
+    """슬래시로 나눈 답안 1칸을 비교용 canonical 값으로 변환."""
+    p = _quiz_text_clean(part)
+    if not p:
+        return ""
+
+    # 앞뒤 설명/존댓말/번호 단위 최소 제거
+    p = re.sub(r"^\s*(정답|답|제출|제출답)\s*[:：\-]?\s*", "", p, flags=re.I)
+    p = re.sub(r"\s*(입니다|이에요|예요|요|임|입니다요)\s*$", "", p, flags=re.I).strip()
+    p = re.sub(r"\s*번\s*$", "", p).strip()
+
+    # 숫자형 답안: '4', '4번', '4입니다' 등은 4로 통일
+    if re.fullmatch(r"\D*\d+\D*", p):
+        m = re.search(r"\d+", p)
+        if m:
+            return m.group(0)
+
+    key = _quiz_answer_key(p)
+    alias_map = _quiz_alias_pairs()
+    if key in alias_map:
+        return alias_map[key]
+
+    # 별도 매핑이 없는 팀/단어는 공백/특수문자 제거한 형태로 비교
+    return key
+
+
+def _quiz_split_slash_answer(text: str, *, max_parts: int = 3) -> list[str]:
+    """'4 / KT / 2', '4/케이티/2' 형태의 답안을 / 기준으로 분리하고 정규화."""
+    t = _quiz_text_clean(text)
+    if not t:
+        return []
+    # 전각 슬래시/역슬래시도 허용
+    t = t.replace("／", "/").replace("\\", "/")
+    if "/" not in t:
+        return []
+
+    raw_parts = [x.strip() for x in t.split("/") if x.strip()]
+    if not raw_parts:
+        return []
+
+    out: list[str] = []
+    for raw in raw_parts[:max_parts]:
+        v = _quiz_normalize_answer_part(raw)
+        if v:
+            out.append(v)
+    return out
+
+
+def _quiz_format_answer(parts: list[str]) -> str:
+    return " / ".join([str(x).strip() for x in (parts or []) if str(x).strip()])
+
+
+def _quiz_score_slash_answer(submitted: str, answer_key: str) -> int:
+    """정답/제출답을 / 기준으로 위치별 비교해 맞은 개수를 반환."""
+    ans_parts = _quiz_split_slash_answer(answer_key)
+    sub_parts = _quiz_split_slash_answer(submitted)
+    if not ans_parts or not sub_parts:
+        return 0
+
+    score = 0
+    for i, ans in enumerate(ans_parts):
+        if i >= len(sub_parts):
+            break
+        if sub_parts[i] == ans:
+            score += 1
+    return score
+
+
+def _quiz_points_for_score(score: int) -> int:
+    if score >= 3:
+        return QUIZ_POINT_3
+    if score == 2:
+        return QUIZ_POINT_2
+    if score == 1:
+        return QUIZ_POINT_1
+    return 0
+
+
+def _quiz_payment_start_cell() -> str:
+    m = re.match(r"^\s*([A-Z]+[0-9]+)", (QUIZ_PAYMENT_VIEW_RANGE or "W3:Z").upper())
+    return m.group(1) if m else "W3"
+
+
+async def _quiz_get_answer_key_for_dow(ws, dow: int) -> str:
+    """B1:H1 중 해당 요일 정답을 읽는다. B2:H2 마감시간은 건드리지 않는다."""
+    try:
+        vals = await _gsheet_call_with_backoff("quiz.answer_key.get", ws.get, "B1:H1")
+        if vals and isinstance(vals, list) and vals[0] and len(vals[0]) > dow:
+            return str(vals[0][dow] or "").strip()
+    except Exception as e:
+        print(f"[QUIZ] answer key read failed: {e}")
+    return ""
+
+
+async def _quiz_update_daily_payment_view(ws, *, dow: int, answer_key: str) -> tuple[int, int]:
+    """W3:Z 지급 정렬뷰를 최신 결과로 덮어쓴다.
+
+    반환: (지급대상자 수, 총 지급금액)
+    """
+    days = ["월", "화", "수", "목", "금", "토", "일"]
+    day_label = days[dow] if 0 <= dow < len(days) else ""
+    answer_key = (answer_key or "").strip()
+
+    payment_rows: list[list[str | int]] = []
+    if answer_key:
+        try:
+            vals = await _gsheet_call_with_backoff("quiz.payment.read_rows", ws.get, "A4:H")
+        except Exception as e:
+            print(f"[QUIZ] payment rows read failed: {e}")
+            vals = []
+
+        for row in (vals or []):
+            if not row:
+                continue
+            nick = str(row[0] if len(row) > 0 else "").strip()
+            if not nick:
+                continue
+            submitted = str(row[1 + dow] if len(row) > (1 + dow) else "").strip()
+            if not submitted:
+                continue
+            score = _quiz_score_slash_answer(submitted, answer_key)
+            points = _quiz_points_for_score(score)
+            if points <= 0:
+                continue
+            payment_rows.append([nick, day_label, score, points])
+
+    payment_rows.sort(key=lambda r: (-int(r[3]), str(r[0])))
+
+    header = [["닉네임", "요일", "정답수", "지급금액"]]
+    values = header + payment_rows
+
+    # 지급뷰는 누적하지 않고 매번 고정 영역을 덮어쓴다.
+    try:
+        await _gsheet_call_with_backoff("quiz.payment.clear", ws.batch_clear, [QUIZ_PAYMENT_VIEW_RANGE])
+    except Exception as e:
+        print(f"[QUIZ] payment view clear failed: {e}")
+
+    try:
+        await _gsheet_call_with_backoff("quiz.payment.update", ws.update, range_name=_quiz_payment_start_cell(), values=values)
+    except TypeError:
+        await _gsheet_call_with_backoff("quiz.payment.update_legacy", ws.update, _quiz_payment_start_cell(), values)
+
+    total_points = sum(int(r[3]) for r in payment_rows)
+    return len(payment_rows), total_points
+
 
 async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/quizcrawl M.DD : 해당 날짜(작성일 기준) 게시글 1개를 찾고 댓글 전체를 수집해 '퀴즈' 시트에 반영."""
@@ -10807,21 +11030,23 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parsed.sort(key=lambda x: (x[0], x[1]))
 
     total_fetched = len(parsed)
-    valid_num = 0
+    valid_ans = 0
     dup_skip = 0
-    no_num = 0
+    no_ans = 0
 
     seen_nick: set[str] = set()
     nick_to_ans: dict[str, str] = {}
 
-    num_re = re.compile(r"\d+")
+    # 새 이벤트 답안 형식: '4 / KT / 2' 또는 '4/케이티/2'
+    # - / 기준 3개 항목으로 분리
+    # - KT/케이티, KIA/기아 등 동의어는 같은 값으로 정규화
     for ts, nick, text in parsed:
-        m = num_re.search(text)
-        if not m:
-            no_num += 1
+        parts = _quiz_split_slash_answer(text)
+        if not parts:
+            no_ans += 1
             continue
-        ans = m.group(0)
-        valid_num += 1
+        ans = _quiz_format_answer(parts)
+        valid_ans += 1
         if nick in seen_nick:
             dup_skip += 1
             continue
@@ -10889,18 +11114,39 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"구글시트 반영 중 오류가 발생했습니다: {e}")
         return
 
-    # 5) 요약 응답
+    # 5) 해당 요일 정답(B1:H1) 기준 지급 정렬뷰(W3:Z) 생성
+    answer_key_raw = await _quiz_get_answer_key_for_dow(ws, dow)
+    answer_key_parts = _quiz_split_slash_answer(answer_key_raw)
+    answer_key_display = _quiz_format_answer(answer_key_parts) if answer_key_parts else (answer_key_raw or "")
+    payment_cnt = 0
+    total_payment = 0
+    if answer_key_parts:
+        try:
+            payment_cnt, total_payment = await _quiz_update_daily_payment_view(ws, dow=dow, answer_key=answer_key_raw)
+        except Exception as e:
+            await update.message.reply_text(f"지급 정렬뷰 생성 중 오류가 발생했습니다: {e}")
+            return
+    else:
+        # 정답칸이 비어있거나 / 형식이 아니면 오래된 지급뷰가 남지 않도록 헤더만 갱신
+        try:
+            await _quiz_update_daily_payment_view(ws, dow=dow, answer_key="")
+        except Exception:
+            pass
+
+    # 6) 요약 응답
     summary = (
         f"✅ /quizcrawl 완료 ({mm}.{dd:02d} / {['월','화','수','목','금','토','일'][dow]})\n"
         f"- 게시글: {found_subject or '(제목없음)'}\n"
         f"- URL: {article_url}\n"
         f"- 댓글(텍스트 파싱 대상): {total_fetched}개\n"
-        f"- 숫자 답안 포함 댓글: {valid_num}개\n"
+        f"- / 형식 답안 댓글: {valid_ans}개\n"
         f"- 중복 닉네임 스킵: {dup_skip}개\n"
-        f"- 숫자 없음 무시: {no_num}개\n"
+        f"- 답안 형식 불일치 무시: {no_ans}개\n"
         f"- 시트 반영: 신규 {inserted_cnt}명 / 업데이트 {updated_cnt}명\n"
         f"- 기존값 있어 스킵: {skipped_already}명\n"
-        f"- 반영 컬럼: {day_col}(월~일 제출답)"
+        f"- 반영 컬럼: {day_col}(월~일 제출답)\n"
+        f"- 해당 요일 정답(B1:H1): {answer_key_display or '(정답 미입력/형식 불일치)'}\n"
+        f"- 지급 정렬뷰(W3:Z): {payment_cnt}명 / 총 {total_payment:,}원"
     )
     await update.message.reply_text(summary)
 
@@ -10917,12 +11163,22 @@ async def quiz_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        # 데이터 영역 전체 초기화 (A4~H) — 닉네임도 함께 초기화
+        # 데이터 영역 전체 초기화 (A4~H) — 닉네임/제출답만 초기화
+        # B1:H1 정답, B2:H2 마감시간, 기존 수식 영역은 건드리지 않는다.
         last = int(getattr(ws, "row_count", 2000) or 2000)
         last = max(4, last)
         rng = f"A4:H{last}"
-        await _gsheet_call_with_backoff("quiz_reset.batch_clear", ws.batch_clear, [rng])
-        await update.message.reply_text(f"✅ 퀴즈 데이터 초기화 완료: {rng}")
+        await _gsheet_call_with_backoff("quiz_reset.batch_clear", ws.batch_clear, [rng, QUIZ_PAYMENT_VIEW_RANGE])
+        try:
+            await _gsheet_call_with_backoff(
+                "quiz_reset.payment_header",
+                ws.update,
+                range_name=_quiz_payment_start_cell(),
+                values=[["닉네임", "요일", "정답수", "지급금액"]],
+            )
+        except TypeError:
+            await _gsheet_call_with_backoff("quiz_reset.payment_header_legacy", ws.update, _quiz_payment_start_cell(), [["닉네임", "요일", "정답수", "지급금액"]])
+        await update.message.reply_text(f"✅ 퀴즈 데이터 초기화 완료: {rng} / 지급뷰 {QUIZ_PAYMENT_VIEW_RANGE}")
     except Exception as e:
         await update.message.reply_text(f"초기화 중 오류가 발생했습니다: {e}")
 
