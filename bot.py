@@ -10796,7 +10796,7 @@ def _quiz_alias_pairs() -> dict[str, str]:
         # 언오버 답안 동의어
         "언더": ["언더", "언", "UNDER", "under"],
         "오버": ["오버", "옵", "오바", "OVER", "over"],
-        "O": ["0", "o"],
+        "O": ["0", "o", "O"],
     }
 
     raw = (os.getenv("QUIZ_ANSWER_ALIASES_JSON") or "").strip()
@@ -10858,16 +10858,19 @@ def _quiz_normalize_answer_part(part: str) -> str:
     p = re.sub(r"\s*(입니다|이에요|예요|요|임|입니다요)\s*$", "", p, flags=re.I).strip()
     p = re.sub(r"\s*번\s*$", "", p).strip()
 
+    key = _quiz_answer_key(p)
+    alias_map = _quiz_alias_pairs()
+
+    # 별칭 매핑을 숫자 처리보다 먼저 적용
+    # 예: 0 → O, o → O
+    if key in alias_map:
+        return alias_map[key]
+
     # 숫자형 답안: '4', '4번', '4입니다' 등은 4로 통일
     if re.fullmatch(r"\D*\d+\D*", p):
         m = re.search(r"\d+", p)
         if m:
             return m.group(0)
-
-    key = _quiz_answer_key(p)
-    alias_map = _quiz_alias_pairs()
-    if key in alias_map:
-        return alias_map[key]
 
     # 별도 매핑이 없는 팀/단어는 공백/특수문자 제거한 형태로 비교
     return key
