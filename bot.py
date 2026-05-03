@@ -10796,6 +10796,7 @@ def _quiz_alias_pairs() -> dict[str, str]:
         # 언오버 답안 동의어
         "언더": ["언더", "언", "UNDER", "under"],
         "오버": ["오버", "옵", "오바", "OVER", "over"],
+        "0": ["o", "O"],
     }
 
     raw = (os.getenv("QUIZ_ANSWER_ALIASES_JSON") or "").strip()
