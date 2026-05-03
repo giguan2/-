@@ -10793,6 +10793,9 @@ def _quiz_alias_pairs() -> dict[str, str]:
         "롯데": ["롯데", "LOTTE", "lotte", "롯데자이언츠", "자이언츠"],
         "두산": ["두산", "DOOSAN", "doosan", "두산베어스", "베어스"],
         "키움": ["키움", "KIWOOM", "kiwoom", "키움히어로즈", "히어로즈"],
+        # 언오버 답안 동의어
+        "언더": ["언더", "언", "UNDER", "under", "U", "u"],
+        "오버": ["오버", "옵", "오바", "OVER", "over", "O", "o"],
     }
 
     raw = (os.getenv("QUIZ_ANSWER_ALIASES_JSON") or "").strip()
