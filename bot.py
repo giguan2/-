@@ -10162,7 +10162,7 @@ QUIZ_POINT_3 = int(os.getenv("QUIZ_POINT_3", "100000"))
 # - 벳라이즈DB: B열 닉네임, P열 연락처
 QUIZ_ALLBLACK_DB_SHEET_NAME = (os.getenv("QUIZ_ALLBLACK_DB_SHEET_NAME") or "올블랙DB").strip()
 QUIZ_BETRISE_DB_SHEET_NAME = (os.getenv("QUIZ_BETRISE_DB_SHEET_NAME") or "벳라이즈DB").strip()
-QUIZ_UNMATCHED_BETRISE_NICK = (os.getenv("QUIZ_UNMATCHED_BETRISE_NICK") or "미매칭").strip()
+QUIZ_UNMATCHED_BETRISE_NICK = (os.getenv("QUIZ_UNMATCHED_BETRISE_NICK") or "미가입").strip()
 
 # 요일 컬럼(월~일)
 _QUIZ_DOW_COLS = ["B", "C", "D", "E", "F", "G", "H"]
