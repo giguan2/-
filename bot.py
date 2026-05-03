@@ -11173,6 +11173,98 @@ async def _quiz_update_daily_payment_view(ws, *, dow: int, answer_key: str) -> t
     return len(payment_rows), total_points
 
 
+
+
+async def _quiz_upsert_answers_for_day(ws, *, dow: int, nick_to_ans: dict[str, str], op_prefix: str = "quiz_upsert") -> tuple[int, int, int, int]:
+    """닉네임은 A열 고정, 해당 요일(B~H) 컬럼만 덮어쓴다.
+
+    동작 원칙:
+    - 기존 닉네임이 있으면 같은 행의 해당 요일 컬럼을 새 답안으로 덮어쓴다.
+    - 기존 닉네임이 없으면 새 행을 A~H 형태로 추가한다.
+    - 같은 날짜를 재크롤링해도 해당 날짜 컬럼만 갱신되고 다른 요일 컬럼은 건드리지 않는다.
+    반환: (inserted_cnt, updated_cnt, overwritten_cnt, unchanged_cnt)
+    """
+    if not nick_to_ans:
+        return 0, 0, 0, 0
+
+    if not (0 <= int(dow) <= 6):
+        raise ValueError("invalid dow")
+
+    day_col = _QUIZ_DOW_COLS[int(dow)]
+
+    existing_nicks_raw = await _gsheet_call_with_backoff(f"{op_prefix}.existing_nicks", ws.get, "A4:A")
+    existing_nicks: list[str] = []
+    for r in (existing_nicks_raw or []):
+        if not r:
+            continue
+        v = str(r[0]).strip()
+        if v:
+            existing_nicks.append(v)
+
+    # 닉네임은 최초로 생긴 행을 유지한다. 중복 닉네임 행이 있으면 첫 행만 사용.
+    nick_to_row: dict[str, int] = {}
+    for i, nick in enumerate(existing_nicks):
+        nick_to_row.setdefault(nick, 4 + i)
+
+    last_existing = 3 + len(existing_nicks)
+
+    day_vals_raw = await _gsheet_call_with_backoff(
+        f"{op_prefix}.day_vals",
+        ws.get,
+        f"{day_col}4:{day_col}{max(4, last_existing)}",
+    )
+    day_vals: list[str] = []
+    for r in (day_vals_raw or []):
+        day_vals.append(str(r[0]).strip() if r else "")
+    if len(day_vals) < len(existing_nicks):
+        day_vals.extend([""] * (len(existing_nicks) - len(day_vals)))
+
+    updates: list[dict] = []
+    new_rows: list[list[str]] = []
+    overwritten_cnt = 0
+    unchanged_cnt = 0
+
+    for nick, ans in nick_to_ans.items():
+        nick = str(nick or "").strip()
+        ans = str(ans or "").strip()
+        if not nick or not ans:
+            continue
+
+        if nick in nick_to_row:
+            row_num = nick_to_row[nick]
+            idx0 = row_num - 4
+            cur = day_vals[idx0] if (0 <= idx0 < len(day_vals)) else ""
+            if cur == ans:
+                unchanged_cnt += 1
+                continue
+            if cur:
+                overwritten_cnt += 1
+            updates.append({"range": f"{day_col}{row_num}", "values": [[ans]]})
+        else:
+            row = [""] * 8
+            row[0] = nick
+            row[1 + int(dow)] = ans
+            new_rows.append(row)
+
+    if updates:
+        await _gsheet_call_with_backoff(
+            f"{op_prefix}.batch_update",
+            ws.batch_update,
+            updates,
+            value_input_option="RAW",
+        )
+    if new_rows:
+        await _gsheet_call_with_backoff(
+            f"{op_prefix}.append_rows",
+            ws.append_rows,
+            new_rows,
+            value_input_option="RAW",
+            table_range="A4",
+        )
+
+    return len(new_rows), len(updates), overwritten_cnt, unchanged_cnt
+
+
 async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/quizcrawl M.DD : 해당 날짜(작성일 기준) 게시글 1개를 찾고 댓글 전체를 수집해 '퀴즈' 시트에 반영."""
     if not is_admin(update):
@@ -11384,62 +11476,16 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         nick_to_ans[nick] = ans
 
     # 4) 시트 upsert (해당 요일 컬럼만)
-    #    - 기존 닉네임: 해당 요일 셀이 비어있을 때만 채움
+    #    - 기존 닉네임: 같은 행의 해당 요일 컬럼을 새 답안으로 덮어씀
     #    - 신규 닉네임: 신규 행 append
+    #    - 다른 요일 컬럼은 건드리지 않음
     try:
-        # 기존 닉네임 목록(A4:A)
-        existing_nicks_raw = ws.get("A4:A")
-        existing_nicks = []
-        for r in (existing_nicks_raw or []):
-            if not r:
-                continue
-            v = str(r[0]).strip()
-            if v:
-                existing_nicks.append(v)
-
-        nick_to_row = {nick: 4 + i for i, nick in enumerate(existing_nicks)}
-        last_existing = 3 + len(existing_nicks)
-
-        # 해당 요일 컬럼 값 읽기(한 번)
-        day_vals_raw = ws.get(f"{day_col}4:{day_col}{max(4, last_existing)}")
-        day_vals = []
-        for r in (day_vals_raw or []):
-            day_vals.append(str(r[0]).strip() if r else "")
-        # pad
-        if len(day_vals) < len(existing_nicks):
-            day_vals.extend([""] * (len(existing_nicks) - len(day_vals)))
-
-        updates = []
-        new_rows = []
-
-        skipped_already = 0
-
-        for nick, ans in nick_to_ans.items():
-            if nick in nick_to_row:
-                row_num = nick_to_row[nick]
-                idx0 = row_num - 4
-                cur = day_vals[idx0] if (0 <= idx0 < len(day_vals)) else ""
-                if cur:
-                    skipped_already += 1
-                    continue
-                updates.append({"range": f"{day_col}{row_num}", "values": [[ans]]})
-            else:
-                # A~H(8컬럼)만 채움
-                row = [""] * 8
-                row[0] = nick
-                # B~H 중 target 요일 위치
-                row[1 + dow] = ans
-                new_rows.append(row)
-
-        # 실제 반영(Write quota 절약)
-        if updates:
-            await _gsheet_call_with_backoff("quiz_upsert.batch_update", ws.batch_update, updates, value_input_option="RAW")
-        if new_rows:
-            await _gsheet_call_with_backoff("quiz_upsert.append_rows", ws.append_rows, new_rows, value_input_option="RAW", table_range="A4")
-
-        updated_cnt = len(updates)
-        inserted_cnt = len(new_rows)
-
+        inserted_cnt, updated_cnt, overwritten_cnt, unchanged_cnt = await _quiz_upsert_answers_for_day(
+            ws,
+            dow=dow,
+            nick_to_ans=nick_to_ans,
+            op_prefix="quiz_upsert",
+        )
     except Exception as e:
         await update.message.reply_text(f"구글시트 반영 중 오류가 발생했습니다: {e}")
         return
@@ -11479,8 +11525,8 @@ async def quizcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- / 형식 답안 댓글: {valid_ans}개\n"
         f"- 중복 닉네임 스킵: {dup_skip}개\n"
         f"- 답안 형식 불일치 무시: {no_ans}개\n"
-        f"- 시트 반영: 신규 {inserted_cnt}명 / 업데이트 {updated_cnt}명\n"
-        f"- 기존값 있어 스킵: {skipped_already}명\n"
+        f"- 시트 반영: 신규 {inserted_cnt}명 / 기존행 업데이트 {updated_cnt}명\n"
+        f"- 기존값 덮어쓰기: {overwritten_cnt}명 / 변경없음: {unchanged_cnt}명\n"
         f"- 반영 컬럼: {day_col}(월~일 제출답)\n"
         f"- 해당 요일 정답(B1:H1): {answer_key_display or '(정답 미입력/형식 불일치)'}\n"
         f"- 지급 정렬뷰(W3:AA): {payment_cnt}명 / 총 {total_payment:,}원"
@@ -11641,53 +11687,14 @@ async def quizcrawl_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
         nick_to_ans[nick] = ans
 
     # 시트 upsert (해당 요일 컬럼만)
+    # - 기존 닉네임은 같은 행을 유지하고 해당 요일 컬럼만 덮어쓴다.
     try:
-        existing_nicks_raw = ws.get("A4:A")
-        existing_nicks = []
-        for r in (existing_nicks_raw or []):
-            if not r:
-                continue
-            v = str(r[0]).strip()
-            if v:
-                existing_nicks.append(v)
-
-        nick_to_row = {nick: 4 + i for i, nick in enumerate(existing_nicks)}
-        last_existing = 3 + len(existing_nicks)
-
-        day_vals_raw = ws.get(f"{day_col}4:{day_col}{max(4, last_existing)}")
-        day_vals = []
-        for r in (day_vals_raw or []):
-            day_vals.append(str(r[0]).strip() if r else "")
-        if len(day_vals) < len(existing_nicks):
-            day_vals.extend([""] * (len(existing_nicks) - len(day_vals)))
-
-        updates = []
-        new_rows = []
-        skipped_already = 0
-
-        for nick, ans in nick_to_ans.items():
-            if nick in nick_to_row:
-                row_num = nick_to_row[nick]
-                idx0 = row_num - 4
-                cur = day_vals[idx0] if (0 <= idx0 < len(day_vals)) else ""
-                if cur:
-                    skipped_already += 1
-                    continue
-                updates.append({"range": f"{day_col}{row_num}", "values": [[ans]]})
-            else:
-                row = [""] * 8
-                row[0] = nick
-                row[1 + dow] = ans
-                new_rows.append(row)
-
-        if updates:
-            await _gsheet_call_with_backoff("quiz_article_upsert.batch_update", ws.batch_update, updates, value_input_option="RAW")
-        if new_rows:
-            await _gsheet_call_with_backoff("quiz_article_upsert.append_rows", ws.append_rows, new_rows, value_input_option="RAW", table_range="A4")
-
-        updated_cnt = len(updates)
-        inserted_cnt = len(new_rows)
-
+        inserted_cnt, updated_cnt, overwritten_cnt, unchanged_cnt = await _quiz_upsert_answers_for_day(
+            ws,
+            dow=dow,
+            nick_to_ans=nick_to_ans,
+            op_prefix="quiz_article_upsert",
+        )
     except Exception as e:
         await update.message.reply_text(f"구글시트 반영 중 오류가 발생했습니다: {e}")
         return
@@ -11724,10 +11731,127 @@ async def quizcrawl_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- / 형식 답안 댓글: {valid_ans}개\n"
         f"- 중복 닉네임 스킵: {dup_skip}개\n"
         f"- 답안 형식 불일치 무시: {no_ans}개\n"
-        f"- 시트 반영: 신규 {inserted_cnt}명 / 업데이트 {updated_cnt}명\n"
-        f"- 기존값 있어 스킵: {skipped_already}명\n"
+        f"- 시트 반영: 신규 {inserted_cnt}명 / 기존행 업데이트 {updated_cnt}명\n"
+        f"- 기존값 덮어쓰기: {overwritten_cnt}명 / 변경없음: {unchanged_cnt}명\n"
         f"- 반영 컬럼: {day_col}(월~일 제출답)\n"
         f"- 해당 요일 정답(B1:H1): {answer_key_display or '(정답 미입력/형식 불일치)'}\n"
+        f"- 지급 정렬뷰(W3:AA): {payment_cnt}명 / 총 {total_payment:,}원"
+    )
+    await update.message.reply_text(summary)
+
+
+
+
+def _quiz_parse_recalc_target(raw: str) -> tuple[int, str, str] | None:
+    """재채점 대상 파싱.
+
+    입력 예:
+    - 5.3 / 05.03 / 5-3: 해당 날짜의 요일
+    - 월, 화, 수, 목, 금, 토, 일 / 월요일 등
+    반환: (dow, day_label, target_label)
+    """
+    s = str(raw or "").strip()
+    if not s:
+        return None
+
+    md = _parse_md_arg(s)
+    if md:
+        mm, dd = md
+        try:
+            target_dt = datetime(now_kst().year, mm, dd, tzinfo=KST)
+        except Exception:
+            return None
+        dow = target_dt.weekday()
+        day_label = ["월", "화", "수", "목", "금", "토", "일"][dow]
+        return dow, day_label, f"{mm}.{dd:02d}"
+
+    key = re.sub(r"\s+", "", s).lower()
+    key = key.replace("요일", "")
+    mp = {
+        "월": 0, "월요": 0, "mon": 0, "monday": 0,
+        "화": 1, "화요": 1, "tue": 1, "tuesday": 1,
+        "수": 2, "수요": 2, "wed": 2, "wednesday": 2,
+        "목": 3, "목요": 3, "thu": 3, "thursday": 3,
+        "금": 4, "금요": 4, "fri": 4, "friday": 4,
+        "토": 5, "토요": 5, "sat": 5, "saturday": 5,
+        "일": 6, "일요": 6, "sun": 6, "sunday": 6,
+    }
+    if key not in mp:
+        return None
+    dow = mp[key]
+    day_label = ["월", "화", "수", "목", "금", "토", "일"][dow]
+    return dow, day_label, f"{day_label}요일"
+
+
+async def quiz_recalc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/quiz_recalc M.DD|요일 : 크롤링 없이 해당 요일 제출답을 현재 B1:H1 정답 기준으로 재채점."""
+    if not is_admin(update):
+        await update.message.reply_text("이 명령어는 관리자만 사용할 수 있습니다.")
+        return
+
+    args = getattr(context, "args", None) or []
+    if not args:
+        await update.message.reply_text("사용법: /quiz_recalc 5.3 또는 /quiz_recalc 토")
+        return
+
+    target = _quiz_parse_recalc_target(args[0])
+    if not target:
+        await update.message.reply_text("재채점 대상 형식이 올바르지 않습니다. 예) /quiz_recalc 5.3 또는 /quiz_recalc 토")
+        return
+
+    dow, day_label, target_label = target
+    day_col = _QUIZ_DOW_COLS[dow]
+
+    ws = get_quiz_ws()
+    if not ws:
+        await update.message.reply_text("구글시트(퀴즈 탭) 준비에 실패했습니다. SPREADSHEET_ID/권한을 확인하세요.")
+        return
+
+    try:
+        answer_key_raw = await _quiz_get_answer_key_for_dow(ws, dow)
+        answer_key_parts = _quiz_split_slash_answer(answer_key_raw)
+        answer_key_display = _quiz_format_answer(answer_key_parts) if answer_key_parts else (answer_key_raw or "")
+
+        score_rows, winner_cnt = await _quiz_update_score_columns(ws)
+
+        payment_cnt = 0
+        total_payment = 0
+        if answer_key_parts:
+            payment_cnt, total_payment = await _quiz_update_daily_payment_view(ws, dow=dow, answer_key=answer_key_raw)
+        else:
+            # 정답이 없거나 / 형식이 아니면 오래된 지급뷰가 남지 않도록 헤더만 갱신
+            await _quiz_update_daily_payment_view(ws, dow=dow, answer_key="")
+
+        rows = await _quiz_read_rows_a_to_h(ws)
+        submitted_cnt = 0
+        scored_cnt = 0
+        if answer_key_parts:
+            for row in rows:
+                nick = str(row[0] or "").strip()
+                submitted = str(row[1 + dow] if len(row) > (1 + dow) else "").strip()
+                if not nick or not submitted:
+                    continue
+                submitted_cnt += 1
+                if _quiz_score_slash_answer(submitted, answer_key_raw) > 0:
+                    scored_cnt += 1
+        else:
+            for row in rows:
+                nick = str(row[0] or "").strip()
+                submitted = str(row[1 + dow] if len(row) > (1 + dow) else "").strip()
+                if nick and submitted:
+                    submitted_cnt += 1
+
+    except Exception as e:
+        await update.message.reply_text(f"재채점 중 오류가 발생했습니다: {e}")
+        return
+
+    summary = (
+        f"✅ /quiz_recalc 완료 ({target_label} / {day_label})\n"
+        f"- 대상 컬럼: {day_col}(월~일 제출답)\n"
+        f"- 현재 정답(B1:H1): {answer_key_display or '(정답 미입력/형식 불일치)'}\n"
+        f"- 제출답 있는 행: {submitted_cnt}명\n"
+        f"- 해당 요일 1개 이상 적중: {scored_cnt}명\n"
+        f"- I:J 주간 정답 재계산: {score_rows}명 / 주간 정답자 {winner_cnt}명\n"
         f"- 지급 정렬뷰(W3:AA): {payment_cnt}명 / 총 {total_payment:,}원"
     )
     await update.message.reply_text(summary)
@@ -11800,6 +11924,7 @@ def main():
     app.add_handler(CommandHandler("activityclean", activity_reset))  # 활동 시트 초기화 alias
     app.add_handler(CommandHandler("quizcrawl", quizcrawl))
     app.add_handler(CommandHandler("quizcrawl_article", quizcrawl_article))
+    app.add_handler(CommandHandler("quiz_recalc", quiz_recalc))
     app.add_handler(CommandHandler("quiz_reset", quiz_reset))
 
     # 네이버 카페 자동 글쓰기(종목별 게시판)  ※ /cafe_soccer [tomorrow] 처럼 사용
