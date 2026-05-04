@@ -10162,7 +10162,10 @@ QUIZ_POINT_3 = int(os.getenv("QUIZ_POINT_3", "100000"))
 # - 벳라이즈DB: B열 닉네임, P열 연락처
 QUIZ_ALLBLACK_DB_SHEET_NAME = (os.getenv("QUIZ_ALLBLACK_DB_SHEET_NAME") or "올블랙DB").strip()
 QUIZ_BETRISE_DB_SHEET_NAME = (os.getenv("QUIZ_BETRISE_DB_SHEET_NAME") or "벳라이즈DB").strip()
+# 탈퇴DB: 연락처가 어느 열에 있어도 숫자만 추출해 비교한다.
+QUIZ_WITHDRAW_DB_SHEET_NAME = (os.getenv("QUIZ_WITHDRAW_DB_SHEET_NAME") or "탈퇴DB").strip()
 QUIZ_UNMATCHED_BETRISE_NICK = (os.getenv("QUIZ_UNMATCHED_BETRISE_NICK") or "미가입").strip()
+QUIZ_WITHDRAWN_BETRISE_NICK = (os.getenv("QUIZ_WITHDRAWN_BETRISE_NICK") or "탈퇴회원").strip()
 
 # 요일 컬럼(월~일)
 _QUIZ_DOW_COLS = ["B", "C", "D", "E", "F", "G", "H"]
@@ -11083,7 +11086,8 @@ async def _quiz_load_betrise_nick_by_allblack_nick() -> dict[str, str]:
     매칭 경로:
     1) 퀴즈 지급뷰 닉네임 = 올블랙닉네임
     2) 올블랙DB C열 닉네임에서 찾고, 같은 행 E열 연락처 추출
-    3) 벳라이즈DB P열 연락처와 비교해, 같은 행 B열 닉네임 반환
+    3) 탈퇴DB에 같은 연락처가 있으면 '탈퇴회원' 반환
+    4) 벳라이즈DB P열 연락처와 비교해, 같은 행 B열 닉네임 반환
     """
     client_gs = get_gs_client()
     spreadsheet_id = os.getenv("SPREADSHEET_ID")
@@ -11094,15 +11098,30 @@ async def _quiz_load_betrise_nick_by_allblack_nick() -> dict[str, str]:
         sh = await _gsheet_call_with_backoff("quiz.db.open", client_gs.open_by_key, spreadsheet_id)
         ws_allblack = _get_ws_by_name(sh, QUIZ_ALLBLACK_DB_SHEET_NAME)
         ws_betrise = _get_ws_by_name(sh, QUIZ_BETRISE_DB_SHEET_NAME)
+        ws_withdraw = _get_ws_by_name(sh, QUIZ_WITHDRAW_DB_SHEET_NAME)
         if not ws_allblack or not ws_betrise:
             print(f"[QUIZ][DB] sheet missing: allblack={bool(ws_allblack)} betrise={bool(ws_betrise)}")
             return {}
 
         allblack_rows = await _gsheet_call_with_backoff("quiz.db.allblack.get", ws_allblack.get_all_values)
         betrise_rows = await _gsheet_call_with_backoff("quiz.db.betrise.get", ws_betrise.get_all_values)
+        withdraw_rows = []
+        if ws_withdraw:
+            try:
+                withdraw_rows = await _gsheet_call_with_backoff("quiz.db.withdraw.get", ws_withdraw.get_all_values)
+            except Exception as e:
+                print(f"[QUIZ][DB] withdraw load failed: {e}")
     except Exception as e:
         print(f"[QUIZ][DB] load failed: {e}")
         return {}
+
+    # 탈퇴DB: 연락처가 어느 열에 있어도 숫자만 추출해 비교한다.
+    withdrawn_phones: set[str] = set()
+    for row in (withdraw_rows or [])[1:]:
+        for cell in row:
+            phone = _quiz_db_phone_key(cell)
+            if len(phone) >= 8:
+                withdrawn_phones.add(phone)
 
     # 벳라이즈DB: P열 연락처 -> B열 닉네임
     phone_to_betrise_nick: dict[str, str] = {}
@@ -11119,6 +11138,9 @@ async def _quiz_load_betrise_nick_by_allblack_nick() -> dict[str, str]:
         phone = _quiz_db_phone_key(row[4] if len(row) > 4 else "")   # E열
         key = _quiz_db_nick_key(allblack_nick)
         if not key:
+            continue
+        if phone and phone in withdrawn_phones:
+            out[key] = QUIZ_WITHDRAWN_BETRISE_NICK
             continue
         bet_nick = phone_to_betrise_nick.get(phone, "") if phone else ""
         out[key] = bet_nick or QUIZ_UNMATCHED_BETRISE_NICK
