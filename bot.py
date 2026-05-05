@@ -11127,7 +11127,7 @@ async def _quiz_load_betrise_nick_by_allblack_nick() -> dict[str, str]:
     phone_to_betrise_nick: dict[str, str] = {}
     for row in (betrise_rows or [])[1:]:
         bet_nick = str(row[1] if len(row) > 1 else "").strip()       # B열
-        phone = _quiz_db_phone_key(row[15] if len(row) > 15 else "") # P열
+        phone = _quiz_db_phone_key(row[13] if len(row) > 13 else "") # P열
         if phone and bet_nick and phone not in phone_to_betrise_nick:
             phone_to_betrise_nick[phone] = bet_nick
 
