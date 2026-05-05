@@ -10159,10 +10159,10 @@ QUIZ_POINT_3 = int(os.getenv("QUIZ_POINT_3", "100000"))
 
 # 지급뷰 닉네임 매칭 DB 설정
 # - 올블랙DB: C열 닉네임, E열 연락처
-# - 벳라이즈DB: B열 닉네임, P열 연락처
+# - 벳라이즈DB: A열 닉네임, B열 연락처
+# - 탈퇴DB: A열 닉네임, B열 연락처
 QUIZ_ALLBLACK_DB_SHEET_NAME = (os.getenv("QUIZ_ALLBLACK_DB_SHEET_NAME") or "올블랙DB").strip()
 QUIZ_BETRISE_DB_SHEET_NAME = (os.getenv("QUIZ_BETRISE_DB_SHEET_NAME") or "벳라이즈DB").strip()
-# 탈퇴DB: 연락처가 어느 열에 있어도 숫자만 추출해 비교한다.
 QUIZ_WITHDRAW_DB_SHEET_NAME = (os.getenv("QUIZ_WITHDRAW_DB_SHEET_NAME") or "탈퇴DB").strip()
 QUIZ_UNMATCHED_BETRISE_NICK = (os.getenv("QUIZ_UNMATCHED_BETRISE_NICK") or "미가입").strip()
 QUIZ_WITHDRAWN_BETRISE_NICK = (os.getenv("QUIZ_WITHDRAWN_BETRISE_NICK") or "탈퇴회원").strip()
@@ -10799,7 +10799,10 @@ def _quiz_alias_pairs() -> dict[str, str]:
         # 언오버 답안 동의어
         "언더": ["언더", "언", "UNDER", "under"],
         "오버": ["오버", "옵", "오바", "OVER", "over"],
-        "O": ["0", "o", "O"],
+        # O/X 문제용 문자 O 동의어.
+        # 숫자 0은 일반 숫자 정답으로도 쓰일 수 있으므로 전역 alias에 넣지 않는다.
+        # 0 -> O 인정은 정답칸이 O/X인 경우에만 _quiz_score_slash_answer()에서 처리한다.
+        "O": ["o", "O"],
     }
 
     raw = (os.getenv("QUIZ_ANSWER_ALIASES_JSON") or "").strip()
@@ -10850,8 +10853,13 @@ def _quiz_answer_key(s: str) -> str:
     return t
 
 
-def _quiz_normalize_answer_part(part: str) -> str:
-    """슬래시로 나눈 답안 1칸을 비교용 canonical 값으로 변환."""
+def _quiz_normalize_answer_part(part: str, *, ox_mode: bool = False) -> str:
+    """슬래시로 나눈 답안 1칸을 비교용 canonical 값으로 변환.
+
+    ox_mode=True는 해당 위치의 정답이 O/X일 때만 사용한다.
+    이때만 회원이 숫자 0을 입력해도 문자 O로 인정한다.
+    일반 숫자 문제에서는 0을 절대 O로 바꾸지 않는다.
+    """
     p = _quiz_text_clean(part)
     if not p:
         return ""
@@ -10862,11 +10870,21 @@ def _quiz_normalize_answer_part(part: str) -> str:
     p = re.sub(r"\s*번\s*$", "", p).strip()
 
     key = _quiz_answer_key(p)
+
+    # O/X 정답 위치에서만 0을 O로 인정한다.
+    # 예: 정답 O, 제출 0/o/O -> O
+    # 일반 정답 0에서는 이 분기를 타지 않으므로 0은 숫자 0으로 유지된다.
+    if ox_mode:
+        if key in {"0", "O"}:
+            return "O"
+        if key == "X":
+            return "X"
+
     alias_map = _quiz_alias_pairs()
 
-    # 별칭 매핑을 숫자 처리보다 먼저 적용
-    # 예: 0 → O, o → O
-    if key in alias_map:
+    # 별칭 매핑을 숫자 처리보다 먼저 적용하되,
+    # 숫자 0은 실제 숫자 정답일 수 있으므로 전역 alias로 O가 지정되어 있어도 보호한다.
+    if key in alias_map and not (key == "0" and alias_map.get(key) == "O"):
         return alias_map[key]
 
     # 숫자형 답안: '4', '4번', '4입니다' 등은 4로 통일
@@ -10879,23 +10897,40 @@ def _quiz_normalize_answer_part(part: str) -> str:
     return key
 
 
-def _quiz_split_slash_answer(text: str, *, max_parts: int = 3) -> list[str]:
-    """'4 / KT / 2', '4/케이티/2' 형태의 답안을 / 기준으로 분리하고 정규화."""
+def _quiz_raw_slash_parts(text: str, *, max_parts: int = 3) -> list[str]:
+    """슬래시 답안을 원문 기준으로 분리한다. 정답칸의 O/X 위치 판별에 사용."""
     t = _quiz_text_clean(text)
     if not t:
         return []
-    # 전각 슬래시/역슬래시도 허용
     t = t.replace("／", "/").replace("\\", "/")
     if "/" not in t:
         return []
+    return [x.strip() for x in t.split("/") if x.strip()][:max_parts]
 
-    raw_parts = [x.strip() for x in t.split("/") if x.strip()]
+
+def _quiz_ox_flags_for_answer_key(answer_key: str, *, max_parts: int = 3) -> list[bool]:
+    """정답칸의 각 위치가 O/X 문제인지 판단한다.
+
+    - 정답 원문이 O 또는 X인 위치만 O/X로 본다.
+    - 정답 원문이 숫자 0인 위치는 숫자 문제로 보고 O/X 처리하지 않는다.
+    """
+    flags: list[bool] = []
+    for raw in _quiz_raw_slash_parts(answer_key, max_parts=max_parts):
+        key = _quiz_answer_key(raw)
+        flags.append(key in {"O", "X"})
+    return flags
+
+
+def _quiz_split_slash_answer(text: str, *, max_parts: int = 3, ox_flags: list[bool] | None = None) -> list[str]:
+    """'4 / KT / 2', '4/케이티/2' 형태의 답안을 / 기준으로 분리하고 정규화."""
+    raw_parts = _quiz_raw_slash_parts(text, max_parts=max_parts)
     if not raw_parts:
         return []
 
     out: list[str] = []
-    for raw in raw_parts[:max_parts]:
-        v = _quiz_normalize_answer_part(raw)
+    ox_flags = ox_flags or []
+    for idx, raw in enumerate(raw_parts):
+        v = _quiz_normalize_answer_part(raw, ox_mode=(idx < len(ox_flags) and bool(ox_flags[idx])))
         if v:
             out.append(v)
     return out
@@ -10907,8 +10942,9 @@ def _quiz_format_answer(parts: list[str]) -> str:
 
 def _quiz_score_slash_answer(submitted: str, answer_key: str) -> int:
     """정답/제출답을 / 기준으로 위치별 비교해 맞은 개수를 반환."""
+    ox_flags = _quiz_ox_flags_for_answer_key(answer_key)
     ans_parts = _quiz_split_slash_answer(answer_key)
-    sub_parts = _quiz_split_slash_answer(submitted)
+    sub_parts = _quiz_split_slash_answer(submitted, ox_flags=ox_flags)
     if not ans_parts or not sub_parts:
         return 0
 
@@ -11086,8 +11122,8 @@ async def _quiz_load_betrise_nick_by_allblack_nick() -> dict[str, str]:
     매칭 경로:
     1) 퀴즈 지급뷰 닉네임 = 올블랙닉네임
     2) 올블랙DB C열 닉네임에서 찾고, 같은 행 E열 연락처 추출
-    3) 탈퇴DB에 같은 연락처가 있으면 '탈퇴회원' 반환
-    4) 벳라이즈DB P열 연락처와 비교해, 같은 행 B열 닉네임 반환
+    3) 탈퇴DB B열 연락처와 일치하면 '탈퇴회원' 반환
+    4) 벳라이즈DB B열 연락처와 비교해, 같은 행 A열 닉네임 반환
     """
     client_gs = get_gs_client()
     spreadsheet_id = os.getenv("SPREADSHEET_ID")
@@ -11115,19 +11151,18 @@ async def _quiz_load_betrise_nick_by_allblack_nick() -> dict[str, str]:
         print(f"[QUIZ][DB] load failed: {e}")
         return {}
 
-    # 탈퇴DB: 연락처가 어느 열에 있어도 숫자만 추출해 비교한다.
+    # 탈퇴DB: B열 연락처만 사용한다. (A열=닉네임, B열=연락처)
     withdrawn_phones: set[str] = set()
     for row in (withdraw_rows or [])[1:]:
-        for cell in row:
-            phone = _quiz_db_phone_key(cell)
-            if len(phone) >= 8:
-                withdrawn_phones.add(phone)
+        phone = _quiz_db_phone_key(row[1] if len(row) > 1 else "")  # B열
+        if len(phone) >= 8:
+            withdrawn_phones.add(phone)
 
-    # 벳라이즈DB: P열 연락처 -> B열 닉네임
+    # 벳라이즈DB: B열 연락처 -> A열 닉네임
     phone_to_betrise_nick: dict[str, str] = {}
     for row in (betrise_rows or [])[1:]:
-        bet_nick = str(row[1] if len(row) > 1 else "").strip()       # B열
-        phone = _quiz_db_phone_key(row[13] if len(row) > 13 else "") # P열
+        bet_nick = str(row[0] if len(row) > 0 else "").strip()      # A열
+        phone = _quiz_db_phone_key(row[1] if len(row) > 1 else "")  # B열
         if phone and bet_nick and phone not in phone_to_betrise_nick:
             phone_to_betrise_nick[phone] = bet_nick
 
