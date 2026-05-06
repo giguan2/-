@@ -11212,7 +11212,7 @@ async def _quiz_update_daily_payment_view(ws, *, dow: int, answer_key: str) -> t
 
     payment_rows.sort(key=lambda r: (-int(r[4]), str(r[0])))
 
-    header = [["올블랙닉네임", "벳라이즈닉네임", "요일", "정답수", "지급금액"]]
+    header = [["올블랙닉네임", "벳라이즈닉네임", "출제요일", "정답수", "지급금액"]]
     values = header + payment_rows
 
     # 지급뷰는 누적하지 않고 매번 고정 영역을 덮어쓴다.
