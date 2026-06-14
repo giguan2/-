@@ -6057,9 +6057,9 @@ async def crawl_maz_analysis_common(
                 )
 
                 r = await client.get(list_url, headers=BROWSER_HEADERS, timeout=10.0)
-                print("MZG STATUS:", r.status_code)
-                print("MZG BODY:", r.text[:500])
-                print("MZG HEADERS:", dict(r.headers))
+                print("MZG STATUS:", r.status_code, flush=True)
+                print("MZG BODY:", r.text[:500], flush=True)
+                print("MZG HEADERS:", dict(r.headers), flush=True)
                 r.raise_for_status()
 
                 try:
