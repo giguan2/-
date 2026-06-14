@@ -6056,7 +6056,7 @@ async def crawl_maz_analysis_common(
                     f"&sort=b.game_start_at+DESC,+b.created_at+DESC"
                 )
 
-                r = await client.get(list_url, timeout=10.0)
+                r = await client.get(list_url, headers=BROWSER_HEADERS, timeout=10.0)
                 r.raise_for_status()
 
                 try:
