@@ -2250,14 +2250,19 @@ def _log_httpx_exception(prefix: str, e: Exception) -> None:
 # ----------------------------
 # HTTP helpers (Mazgtv anti-bot 대응: 브라우저 헤더 + 쿠키 워밍업)
 # ----------------------------
-MAZ_BASE_URL = os.getenv("MAZ_BASE_URL", "https://mazgtv3.com").rstrip("/")
-MAZ_LIST_API = os.getenv("MAZ_LIST_API", f"{MAZ_BASE_URL}/api/board/list")
+MAZ_BASE_URL = os.getenv("MAZ_BASE_URL", "https://mzgtv01.com").rstrip("/")
+MAZ_LIST_API = os.getenv("MAZ_LIST_API", f"{MAZ_BASE_URL}/api/board/list").rstrip("/")
+MAZ_BASE_URLS_RAW = (os.getenv("MAZ_BASE_URLS") or "").strip()
 
 
-def build_maz_list_params(*, page: int = 1, perpage: int = 15, type_: str = "event",
-                          boardType: int = 4, category: int = 0,
+def build_maz_list_params(*, page: int = 1, perpage: int = 20, type_: str = "event",
+                          boardType: int = 2, category: int = 0,
                           secretFlag: int = 0, fixFlag: bool = True) -> dict:
-    """mazgtv2 list API 파라미터를 표준화한다."""
+    """mazgtv list API 파라미터를 표준화한다.
+
+    2026-06 현재 일부 도메인은 sort 파라미터가 붙으면 418을 반환하는 경우가 있어
+    기본 요청에는 sort를 넣지 않는다. 정렬이 꼭 필요할 때만 별도 fallback에서 시도한다.
+    """
     return {
         "page": page,
         "perpage": perpage,
@@ -2265,28 +2270,105 @@ def build_maz_list_params(*, page: int = 1, perpage: int = 15, type_: str = "eve
         "boardType": boardType,
         "category": category,
         "secretFlag": secretFlag,
-        "fixFlag": str(fixFlag).lower(),  # maz는 true/false 문자열을 쓰는 경우가 있음
+        "fixFlag": str(fixFlag).lower(),
     }
 
 
-BROWSER_HEADERS = {
-    "User-Agent": os.getenv(
-        "MAZ_USER_AGENT",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    ),
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Referer": f"{MAZ_BASE_URL}/",
-    "Origin": MAZ_BASE_URL,
-    "Connection": "keep-alive",
-}
-
-async def _maz_warmup(client: httpx.AsyncClient) -> None:
-    """API 호출 전 1회 워밍업으로 쿠키/세션 세팅을 유도한다.
-    403이 계속이면 사이트 측(WAF/차단)에서 서버 IP를 막았을 가능성이 큼.
-    """
+def _maz_origin_from_url(url: str) -> str:
+    """https://domain/path -> https://domain"""
+    u = (url or "").strip()
     try:
-        await client.get(f"{MAZ_BASE_URL}/", headers=BROWSER_HEADERS, timeout=15.0)
+        parsed = urlparse(u)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+    except Exception:
+        pass
+    return (MAZ_BASE_URL or "https://mzgtv01.com").rstrip("/")
+
+
+def _browser_headers_for(url_or_base: str = "", *, accept_json: bool = True) -> dict:
+    """요청 URL별 Referer/Origin을 맞춘 브라우저형 헤더."""
+    origin = _maz_origin_from_url(url_or_base or MAZ_BASE_URL)
+    return {
+        "User-Agent": os.getenv(
+            "MAZ_USER_AGENT",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/126.0.0.0 Safari/537.36",
+        ),
+        "Accept": "application/json, text/plain, */*" if accept_json else "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": f"{origin}/",
+        "Origin": origin,
+        "Connection": "keep-alive",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+
+
+BROWSER_HEADERS = _browser_headers_for(MAZ_BASE_URL)
+
+
+def _maz_base_candidates(extra_base_url: str = "") -> list[str]:
+    """환경변수 + 코드에 남아있는 예전 base_url + 자주 바뀌는 후보 도메인."""
+    raw: list[str] = []
+    if MAZ_BASE_URL:
+        raw.append(MAZ_BASE_URL)
+    if extra_base_url:
+        raw.append(_maz_origin_from_url(extra_base_url))
+    if MAZ_BASE_URLS_RAW:
+        raw.extend([x.strip() for x in re.split(r"[,\s]+", MAZ_BASE_URLS_RAW) if x.strip()])
+
+    # 최신주소가 자주 바뀌어도 env 없이 1차 복구되도록 후보를 둔다.
+    raw.extend([
+        "https://mzgtv01.com",
+        "https://mazgtv1.com",
+        "https://mazgtv3.com",
+    ])
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for x in raw:
+        b = (x or "").strip().rstrip("/")
+        if not b:
+            continue
+        if not b.startswith(("http://", "https://")):
+            b = "https://" + b
+        key = b.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(b)
+    return out
+
+
+def _maz_list_api_candidates(extra_base_url: str = "") -> list[str]:
+    apis: list[str] = []
+    if MAZ_LIST_API:
+        apis.append(MAZ_LIST_API)
+    for base in _maz_base_candidates(extra_base_url):
+        apis.append(f"{base}/api/board/list")
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for u in apis:
+        uu = (u or "").strip().rstrip("/")
+        if not uu:
+            continue
+        key = uu.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(uu)
+    return out
+
+
+async def _maz_warmup(client: httpx.AsyncClient, base_url: str | None = None) -> None:
+    """API 호출 전 1회 워밍업으로 쿠키/세션 세팅을 유도한다."""
+    base = _maz_origin_from_url(base_url or MAZ_BASE_URL)
+    try:
+        await client.get(f"{base}/", headers=_browser_headers_for(base, accept_json=False), timeout=15.0)
     except Exception:
         return
 
@@ -2294,7 +2376,7 @@ import math
 import io
 import zipfile
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, quote_plus, unquote_plus
+from urllib.parse import urljoin, quote_plus, unquote_plus, urlparse
 from openai import OpenAI
 
 from telegram import (
@@ -5803,7 +5885,7 @@ async def crawl_daum_news_common(
 # ───────────────── mazgtv 분석 공통 (내일 경기 → today/tomorrow 시트, JSON/API 버전) ─────────────────
 
 # 상세 API 실제 경로에 맞게 여기만 수정하면 됨
-MAZ_DETAIL_API_TEMPLATE = f"{MAZ_BASE_URL}/api/board/{{board_id}}"
+MAZ_DETAIL_API_TEMPLATE = os.getenv("MAZ_DETAIL_API_TEMPLATE", f"{MAZ_BASE_URL}/api/board/{{board_id}}")
 
 
 def _parse_game_start_date(game_start_at: str) -> date | None:
@@ -5974,6 +6056,268 @@ def classify_basketball_volleyball_sport(league: str) -> str:
     # 정말 정보가 없으면 농구로
     return "농구"
 
+
+def _short_log_text(text: str, limit: int = 300) -> str:
+    s = (text or "").replace("\r", " ").replace("\n", " ").strip()
+    s = re.sub(r"\s+", " ", s)
+    return s[:limit]
+
+
+def _dict_path(obj: dict, path: tuple[str, ...]):
+    cur = obj
+    for key in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+    return cur
+
+
+def _extract_maz_items(data) -> list[dict] | None:
+    """maz 목록 JSON 구조가 바뀌어도 list[dict]를 찾아낸다."""
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+    if not isinstance(data, dict):
+        return None
+
+    paths = [
+        ("rows",), ("list",), ("items",), ("boards",),
+        ("data",), ("data", "rows"), ("data", "list"), ("data", "items"), ("data", "boards"),
+        ("result",), ("result", "rows"), ("result", "list"), ("result", "items"),
+        ("message", "result", "rows"), ("message", "result", "list"), ("message", "result", "items"),
+    ]
+    for path in paths:
+        val = _dict_path(data, path)
+        if isinstance(val, list):
+            return [x for x in val if isinstance(x, dict)]
+        if isinstance(val, dict):
+            for k in ("rows", "list", "items", "boards"):
+                vv = val.get(k)
+                if isinstance(vv, list):
+                    return [x for x in vv if isinstance(x, dict)]
+    return None
+
+
+def _first_nonempty(d: dict, keys: list[str]) -> str:
+    if not isinstance(d, dict):
+        return ""
+    for k in keys:
+        v = d.get(k)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
+            return s
+    return ""
+
+
+def _maz_item_id(item: dict) -> str:
+    return _first_nonempty(item, [
+        "id", "boardId", "board_id", "idx", "articleId", "article_id", "seq", "no",
+    ])
+
+
+def _maz_list_param_variants(*, page: int, board_type: int, category: int) -> list[dict]:
+    """418 회피를 위해 sort 없는 요청을 먼저 쓰고, 실패할 때만 sort 포함 요청을 시도."""
+    base_min = {
+        "page": page,
+        "perpage": 20,
+        "boardType": board_type,
+        "category": category,
+    }
+    base_full = build_maz_list_params(
+        page=page,
+        perpage=20,
+        boardType=board_type,
+        category=category,
+        type_="event",
+        secretFlag=0,
+        fixFlag=True,
+    )
+    sort_expr = "b.game_start_at DESC, b.created_at DESC"
+
+    variants = [
+        base_full,
+        base_min,
+        {**base_full, "sort": sort_expr},
+    ]
+
+    out: list[dict] = []
+    seen: set[str] = set()
+    for v in variants:
+        key = json.dumps(v, ensure_ascii=False, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(v)
+    return out
+
+
+async def fetch_maz_list_items(
+    client: httpx.AsyncClient,
+    *,
+    page: int,
+    board_type: int,
+    category: int,
+    base_url: str = "",
+) -> tuple[list[dict], str, str]:
+    """목록 API를 여러 도메인/파라미터 조합으로 시도한다.
+
+    return: (items, working_list_url, error_message)
+      - 성공/빈 목록: error_message == ""
+      - 완전 실패: items == [] and error_message != ""
+    """
+    last_err = ""
+    best_empty: tuple[list[dict], str] | None = None
+
+    for list_api in _maz_list_api_candidates(base_url):
+        await _maz_warmup(client, _maz_origin_from_url(list_api))
+        for params in _maz_list_param_variants(page=page, board_type=board_type, category=category):
+            try:
+                headers = _browser_headers_for(list_api, accept_json=True)
+                r = await client.get(list_api, params=params, headers=headers, timeout=15.0)
+                print(f"[MAZ][LIST] page={page} status={r.status_code} url={r.url}", flush=True)
+
+                if r.status_code in (401, 403, 418, 429):
+                    last_err = f"HTTP_{r.status_code}: {r.url} body={_short_log_text(r.text, 180)}"
+                    continue
+
+                if not (200 <= r.status_code < 300):
+                    last_err = f"HTTP_{r.status_code}: {r.url} body={_short_log_text(r.text, 180)}"
+                    continue
+
+                head = (r.text or "").lstrip()[:120].lower()
+                if head.startswith("<!doctype") or head.startswith("<html"):
+                    last_err = f"HTML_RESPONSE: {r.url} body={_short_log_text(r.text, 180)}"
+                    continue
+
+                try:
+                    data = r.json()
+                except Exception as e:
+                    last_err = f"JSON_PARSE_FAIL: {r.url} err={e} body={_short_log_text(r.text, 180)}"
+                    continue
+
+                items = _extract_maz_items(data)
+                if isinstance(items, list):
+                    if items:
+                        return items, str(r.url), ""
+                    if best_empty is None:
+                        best_empty = ([], str(r.url))
+                    continue
+
+                last_err = f"UNKNOWN_JSON_SHAPE: {r.url} keys={list(data.keys()) if isinstance(data, dict) else type(data)}"
+            except Exception as e:
+                last_err = f"EXC:{type(e).__name__}: {e}"
+                continue
+
+    if best_empty is not None:
+        return best_empty[0], best_empty[1], ""
+    return [], "", (last_err or "NO_MAZ_LIST_RESPONSE")
+
+
+def _maz_detail_api_candidates(board_id: str, *, list_api_url: str = "") -> list[str]:
+    apis: list[str] = []
+    if MAZ_DETAIL_API_TEMPLATE:
+        try:
+            apis.append(MAZ_DETAIL_API_TEMPLATE.format(board_id=board_id))
+        except Exception:
+            pass
+
+    base = _maz_origin_from_url(list_api_url or MAZ_BASE_URL)
+    apis.extend([
+        f"{base}/api/board/{board_id}",
+        f"{base}/api/board/detail/{board_id}",
+        f"{base}/api/board/view/{board_id}",
+        f"{base}/api/board/read/{board_id}",
+    ])
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for u in apis:
+        uu = (u or "").strip()
+        if not uu:
+            continue
+        key = uu.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(uu)
+    return out
+
+
+def _iter_dict_nodes(x, depth: int = 0):
+    if depth > 4:
+        return
+    if isinstance(x, dict):
+        yield x
+        for v in x.values():
+            yield from _iter_dict_nodes(v, depth + 1)
+    elif isinstance(x, list):
+        for v in x:
+            yield from _iter_dict_nodes(v, depth + 1)
+
+
+def _extract_maz_detail_payload(data) -> dict:
+    if not isinstance(data, dict):
+        return {}
+
+    content_keys = {"content", "body", "html", "contents", "description", "text"}
+    for node in _iter_dict_nodes(data):
+        if any(str(node.get(k) or "").strip() for k in content_keys):
+            return node
+    return data
+
+
+def _extract_maz_detail_content(detail: dict) -> str:
+    payload = _extract_maz_detail_payload(detail)
+    return _first_nonempty(payload, ["content", "body", "html", "contents", "description", "text"])
+
+
+async def fetch_maz_detail_payload(
+    client: httpx.AsyncClient,
+    board_id: str,
+    *,
+    list_api_url: str = "",
+) -> tuple[dict, str, str]:
+    """상세 API도 여러 후보 URL로 시도한다."""
+    last_err = ""
+    for detail_url in _maz_detail_api_candidates(board_id, list_api_url=list_api_url):
+        try:
+            headers = _browser_headers_for(detail_url, accept_json=True)
+            r = await client.get(detail_url, headers=headers, timeout=15.0)
+            print(f"[MAZ][DETAIL] id={board_id} status={r.status_code} url={r.url}", flush=True)
+
+            if r.status_code in (401, 403, 418, 429):
+                last_err = f"HTTP_{r.status_code}: {r.url} body={_short_log_text(r.text, 180)}"
+                continue
+            if not (200 <= r.status_code < 300):
+                last_err = f"HTTP_{r.status_code}: {r.url} body={_short_log_text(r.text, 180)}"
+                continue
+
+            head = (r.text or "").lstrip()[:120].lower()
+            if head.startswith("<!doctype") or head.startswith("<html"):
+                soup = BeautifulSoup(r.text, "html.parser")
+                text = clean_maz_text(extract_main_text_from_html(soup))
+                if text:
+                    return {"content": text}, str(r.url), ""
+                last_err = f"HTML_NO_CONTENT: {r.url} body={_short_log_text(r.text, 180)}"
+                continue
+
+            try:
+                data = r.json()
+            except Exception as e:
+                last_err = f"JSON_PARSE_FAIL: {r.url} err={e} body={_short_log_text(r.text, 180)}"
+                continue
+
+            payload = _extract_maz_detail_payload(data)
+            if _extract_maz_detail_content(payload):
+                return payload, str(r.url), ""
+            last_err = f"NO_CONTENT_IN_JSON: {r.url}"
+        except Exception as e:
+            last_err = f"EXC:{type(e).__name__}: {e}"
+            continue
+
+    return {}, "", (last_err or "NO_MAZ_DETAIL_RESPONSE")
+
 async def crawl_maz_analysis_common(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -6049,54 +6393,29 @@ async def crawl_maz_analysis_common(
 
             end_page = start_page + max_pages - 1
             for page in range(start_page, end_page + 1):
-                list_url = (
-                    f"{MAZ_LIST_API}"
-                    f"?page={page}&perpage=20"
-                    f"&boardType={board_type}&category={category}"
-                    f"&sort=b.game_start_at+DESC,+b.created_at+DESC"
+                items, list_api_used, list_err = await fetch_maz_list_items(
+                    client,
+                    page=page,
+                    board_type=board_type,
+                    category=category,
+                    base_url=base_url,
                 )
 
-                r = await client.get(list_url, headers=BROWSER_HEADERS, timeout=10.0)
-                print("MZG STATUS:", r.status_code, flush=True)
-                print("MZG BODY:", r.text[:500], flush=True)
-                print("MZG HEADERS:", dict(r.headers), flush=True)
-                r.raise_for_status()
+                if list_err:
+                    print(f"[MAZ][LIST] page={page} 목록 요청 실패: {list_err}")
+                    if page == start_page:
+                        await update.message.reply_text(
+                            "⚠️ mazgtv 목록 API가 차단되었거나 응답 구조가 바뀌었습니다.\n"
+                            f"- 마지막 오류: {list_err[:350]}\n"
+                            "- Render 환경변수 MAZ_BASE_URLS에 현재 접속 가능한 도메인을 콤마로 넣어주세요.\n"
+                            "  예: https://mzgtv01.com,https://mazgtv1.com\n"
+                            "- 그래도 418이면 해당 서버 IP가 마징가 보안검사에 걸린 상태라, "
+                            "브라우저에서 열리는 최신 API 도메인을 MAZ_LIST_API로 지정해야 합니다."
+                        )
+                        return
+                    break
 
-                try:
-                    data = r.json()
-                except Exception as e:
-                    print(f"[MAZ][LIST] JSON 파싱 실패(page={page}): {e}")
-                    print("  응답 일부:", r.text[:200])
-
-                    # 응답이 HTML이면(<!doctype ...>) API 경로/권한/헤더 변화 가능성이 큽니다.
-                    head = (r.text or "").lstrip()[:200].lower()
-                    if head.startswith("<!doctype") or head.startswith("<html"):
-                        try:
-                            await update.message.reply_text(
-                                "⚠️ mazgtv 목록 API가 JSON이 아니라 HTML을 반환합니다.\n"
-                                "도메인 변경(mazgtv3) 이후 API 경로/요청 방식이 바뀌었을 가능성이 큽니다.\n\n"
-                                f"- 현재 MAZ_LIST_API: {MAZ_LIST_API}\n"
-                                "브라우저 개발자도구(Network → Fetch/XHR)에서 '목록'을 불러오는 JSON 요청 URL을 확인해서\n"
-                                "그 URL을 MAZ_LIST_API 환경변수로 지정한 뒤 다시 시도해 주세요."
-                            )
-                        except Exception:
-                            pass
-                        break
-
-                    # HTML이 아니면 일시적 오류일 수 있으니 다음 페이지로 진행
-                    continue
-
-                if isinstance(data, dict):
-                    items = (
-                        data.get("rows")
-                        or (data.get("data") or {}).get("rows")
-                        or data.get("list")
-                        or data.get("items")
-                    )
-                else:
-                    items = data
-
-                if not isinstance(items, list) or not items:
+                if not items:
                     print(f"[MAZ][LIST] page={page} 항목 없음 → 반복 종료")
                     break
 
@@ -6104,7 +6423,7 @@ async def crawl_maz_analysis_common(
                     if not isinstance(item, dict):
                         continue
 
-                    board_id = item.get("id")
+                    board_id = _maz_item_id(item)
                     if not board_id:
                         continue
 
@@ -6119,14 +6438,16 @@ async def crawl_maz_analysis_common(
                     if (not needs_analysis) and needs_export:
                         print(f"[MAZ][BACKFILL] analysis exists but export missing: {row_id}")
 
-                    game_start_at = (
-                        item.get("gameStartAt")
-                        or item.get("game_start_at")
-                        or ""
-                    )
-                    game_start_at = str(game_start_at).strip()
+                    game_start_at = _first_nonempty(item, [
+                        "gameStartAt", "game_start_at", "gameDate", "game_date",
+                        "startAt", "start_at", "kickoff", "kickoffAt", "kickoff_at",
+                    ])
 
-                    game_start_at_text = str(item.get("gameStartAtText") or "").strip()
+                    game_start_at_text = _first_nonempty(item, [
+                        "gameStartAtText", "game_start_at_text", "gameTime", "game_time",
+                        "startText", "dateText", "date_text", "kickoffText",
+                    ])
+
                     print(
                         f"[MAZ][DEBUG] page={page} id={board_id} "
                         f"gameStartAt='{game_start_at}' gameStartAtText='{game_start_at_text}'"
@@ -6154,20 +6475,33 @@ async def crawl_maz_analysis_common(
                         )
                         continue
 
-                    league = item.get("leagueName") or league_default
-                    home = item.get("homeTeamName") or ""
-                    away = item.get("awayTeamName") or ""
+                    league = _first_nonempty(item, [
+                        "leagueName", "league_name", "league", "competition", "categoryName", "category_name",
+                    ]) or league_default
+                    home = _first_nonempty(item, [
+                        "homeTeamName", "home_team_name", "homeTeam", "home_team", "home", "homeName",
+                    ])
+                    away = _first_nonempty(item, [
+                        "awayTeamName", "away_team_name", "awayTeam", "away_team", "away", "awayName",
+                    ])
 
-                    detail_url = MAZ_DETAIL_API_TEMPLATE.format(board_id=board_id)
-                    try:
-                        r2 = await client.get(detail_url, timeout=10.0)
-                        r2.raise_for_status()
-                        detail = r2.json()
-                    except Exception as e:
-                        print(f"[MAZ][DETAIL] id={board_id} 요청 실패: {e}")
+                    if (not home or not away):
+                        title_hint = _first_nonempty(item, ["title", "subject", "boardTitle", "name"])
+                        h2, a2, _m2 = _extract_matchup(title_hint)
+                        if h2 and a2:
+                            home = home or h2
+                            away = away or a2
+
+                    detail, detail_url, detail_err = await fetch_maz_detail_payload(
+                        client,
+                        str(board_id),
+                        list_api_url=list_api_used,
+                    )
+                    if detail_err:
+                        print(f"[MAZ][DETAIL] id={board_id} 요청 실패: {detail_err}")
                         continue
 
-                    content_html = detail.get("content") or ""
+                    content_html = _extract_maz_detail_content(detail)
                     if not str(content_html).strip():
                         print(f"[MAZ][DETAIL] id={board_id} content 없음")
                         continue
@@ -11110,7 +11444,7 @@ async def _quiz_update_score_columns(ws) -> tuple[int, int]:
 def _quiz_db_nick_key(nick: str) -> str:
     """DB 닉네임 매칭용 key. 공백/제로폭/대소문자 차이를 최소화한다."""
     s = unicodedata.normalize("NFKC", str(nick or ""))
-    s = s.replace("​", "").replace("‌", "").replace("‍", "").replace("﻿", "")
+    s = s.replace("", "").replace("", "").replace("", "").replace("", "")
     s = re.sub(r"\s+", "", s).strip().casefold()
     return s
 
